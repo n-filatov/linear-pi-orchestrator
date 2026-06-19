@@ -251,6 +251,13 @@ function issueLabels(issue: LinearIssue): string[] {
     .filter(Boolean);
 }
 
+function isIssueDoneOrCanceled(issue: LinearIssue): boolean {
+  return issue.statusType === "completed"
+    || issue.statusType === "canceled"
+    || issue.status === "Done"
+    || issue.status === "Canceled";
+}
+
 function parseMcpJson<T>(result: any): T {
   const text = (result?.content || [])
     .filter((part: any) => part?.type === "text")
@@ -428,6 +435,10 @@ class LinearPiOrchestrator {
           skipped.push(`${id}: already has running worker`);
           continue;
         }
+        if (isIssueDoneOrCanceled(issue)) {
+          skipped.push(`${id}: status is ${issue.status || issue.statusType || "done/canceled"}`);
+          continue;
+        }
         const blockingLabels = [config.runningLabel, config.doneLabel, config.blockedLabel].filter((blockedLabel) => labels.includes(blockedLabel));
         if (blockingLabels.length) {
           skipped.push(`${id}: has ${blockingLabels.join(", ")}`);
@@ -504,6 +515,15 @@ class LinearPiOrchestrator {
         continue;
       }
 
+      try {
+        await this.markLinearCleaned(worker, normalized, config);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx?.ui?.notify?.(`Cleaned local worker for ${worker.identifier}, but failed to update Linear labels: ${message}`, "warning");
+        skipped.push(`${worker.identifier} (Linear labels not updated; kept state to prevent restart: ${message})`);
+        continue;
+      }
+
       delete state.workers[worker.identifier];
       cleaned.push(worker.identifier);
     }
@@ -512,9 +532,11 @@ class LinearPiOrchestrator {
     if (!cleaned.length) {
       return normalized === "done"
         ? `No done workers found. Skipped: ${skipped.join(", ") || "none"}`
-        : `No matching workers found for "${normalized}".`;
+        : skipped.length
+          ? `No workers cleaned. Skipped: ${skipped.join(", ")}`
+          : `No matching workers found for "${normalized}".`;
     }
-    return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}`;
+    return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}${skipped.length ? `\nSkipped: ${skipped.join(", ")}` : ""}`;
   }
 
   private formatWorkerChoice(worker: WorkerState): string {
@@ -526,10 +548,19 @@ class LinearPiOrchestrator {
       const issue = await this.callLinear<LinearIssue>("get_issue", { id: worker.identifier }, config).catch(() => undefined);
       if (!issue) return false;
       const labels = issueLabels(issue);
-      return labels.includes(config.doneLabel) || issue.statusType === "completed" || issue.statusType === "canceled" || issue.status === "Done" || issue.status === "Canceled";
+      return labels.includes(config.doneLabel) || isIssueDoneOrCanceled(issue);
     }
     if (target === "all") return true;
     return worker.identifier.toLowerCase() === target.toLowerCase() || worker.tmuxWindow === target || worker.branch === target;
+  }
+
+  private async markLinearCleaned(worker: WorkerState, target: string, config: Config): Promise<void> {
+    const issue = await this.callLinear<LinearIssue>("get_issue", { id: worker.identifier }, config);
+    const labels = issueLabels(issue).filter((label) => label !== config.triggerLabel && label !== config.runningLabel);
+    if ((target === "done" || isIssueDoneOrCanceled(issue)) && !labels.includes(config.doneLabel)) {
+      labels.push(config.doneLabel);
+    }
+    await this.callLinear("save_issue", { id: worker.identifier, labels: Array.from(new Set(labels)) }, config);
   }
 
   private async killTmuxWindow(worker: WorkerState): Promise<void> {

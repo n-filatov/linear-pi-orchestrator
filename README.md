@@ -46,11 +46,11 @@ First use creates a global defaults file plus per-repository runtime files:
 
 `/linear-cleanup done` checks recorded workers for the current repository, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
 
-For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, and removes the worker from local state.
+For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, removes the trigger/running labels from Linear so the watcher does not immediately recreate it, and removes the worker from local state. When cleaning a done/canceled issue, it also ensures the `pi:done` label is present.
 
 ## Default behavior
 
-The watcher searches Linear MCP server `linear` for issues labeled with the current repository's `triggerLabel` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). All `/linear-watch`, `/linear-start`, `/linear-cleanup`, `/linear-status`, and footer status commands resolve the current Pi session's git repository root and use that repository's scoped config/state/log/pid files. This lets one window show/control only the frontend daemon and another window show/control only the backend daemon. The watcher skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
+The watcher searches Linear MCP server `linear` for issues labeled with the current repository's `triggerLabel` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). All `/linear-watch`, `/linear-start`, `/linear-cleanup`, `/linear-status`, and footer status commands resolve the current Pi session's git repository root and use that repository's scoped config/state/log/pid files. This lets one window show/control only the frontend daemon and another window show/control only the backend daemon. The watcher skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`, and issues whose Linear status is done/canceled.
 
 Security guard: workers only start for issues with the trigger label and, unless disabled, assigned to `watchAssignee` (`me` by default). This applies to both `/linear-watch` and manual `/linear-start`. The current Linear MCP tools do not expose who added a label, so the extension cannot verify the label actor; assignment-to-you is the enforceable guard.
 
