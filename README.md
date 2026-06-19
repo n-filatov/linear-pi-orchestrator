@@ -48,7 +48,9 @@ For every cleaned worker it kills the tmux window, runs `wt remove <branch> --fo
 
 ## Default behavior
 
-The watcher searches Linear MCP server `linear` for issues labeled with `triggerLabel` from `~/.pi/linear-pi/config.json` (default `pi:implement`), skipping issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
+The watcher searches Linear MCP server `linear` for issues labeled with `triggerLabel` from `~/.pi/linear-pi/config.json` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). It skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
+
+Security guard: workers only start for issues with the trigger label and, unless disabled, assigned to `watchAssignee` (`me` by default). This applies to both `/linear-watch` and manual `/linear-start`. The current Linear MCP tools do not expose who added a label, so the extension cannot verify the label actor; assignment-to-you is the enforceable guard.
 
 You can change the watched label from Pi:
 
@@ -57,7 +59,7 @@ You can change the watched label from Pi:
 /linear-watch once pi:backend
 ```
 
-`/linear-watch status` also prints the currently watched label, poll interval, config/state paths, and recent logs. While the watcher runs, it updates a `Linear watch` widget/status with the last polling events so you can see what it is doing.
+`/linear-watch status` also prints the currently watched label, required assignee, poll interval, config/state paths, and recent logs. While the watcher runs, it updates a `Linear watch` widget/status with the last polling events so you can see what it is doing.
 
 For each issue it:
 
@@ -77,6 +79,8 @@ For each issue it:
 - `LINEAR_PI_BRANCH_PREFIX=feat`
 - `LINEAR_PI_NODE_BIN_DIR=/Users/nikita.filatov/.local/share/nvm/v23.11.1/bin`
 - `LINEAR_PI_POLL_INTERVAL_MS=30000`
+- `LINEAR_PI_REQUIRE_ASSIGNEE_ME=true`
+- `LINEAR_PI_WATCH_ASSIGNEE=me`
 
 ## Notes
 

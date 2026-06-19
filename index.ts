@@ -19,6 +19,8 @@ type LinearIssue = {
   status?: string;
   statusType?: string;
   labels?: Array<string | { name?: string; id?: string }>;
+  assignee?: string | { id?: string; name?: string; email?: string; displayName?: string } | null;
+  assigneeId?: string | null;
   team?: string;
 };
 
@@ -51,6 +53,8 @@ type Config = {
   piCommand: string;
   nodeBinDir: string;
   issueLimit: number;
+  requireAssigneeMe: boolean;
+  watchAssignee: string;
   setInProgress: boolean;
   inProgressState: string;
 };
@@ -107,6 +111,8 @@ function defaultConfig(): Config {
     piCommand: process.env.LINEAR_PI_PI_COMMAND || "pi",
     nodeBinDir: findCompatibleNodeBinDir(),
     issueLimit: Number(process.env.LINEAR_PI_ISSUE_LIMIT || 50),
+    requireAssigneeMe: process.env.LINEAR_PI_REQUIRE_ASSIGNEE_ME !== "false",
+    watchAssignee: process.env.LINEAR_PI_WATCH_ASSIGNEE || "me",
     setInProgress: process.env.LINEAR_PI_SET_IN_PROGRESS !== "false",
     inProgressState: process.env.LINEAR_PI_IN_PROGRESS_STATE || "In Progress",
   };
@@ -237,13 +243,15 @@ class LinearPiOrchestrator {
     this.runningOnce = true;
     try {
       const config = readConfig();
-      this.log(ctx, `Polling Linear for label ${config.triggerLabel} (limit ${config.issueLimit})...`);
-      const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", {
+      this.log(ctx, `Polling Linear for label ${config.triggerLabel}${config.requireAssigneeMe ? ` assigned to ${config.watchAssignee}` : ""} (limit ${config.issueLimit})...`);
+      const listArgs: Record<string, unknown> = {
         label: config.triggerLabel,
         limit: config.issueLimit,
         orderBy: "updatedAt",
         includeArchived: false,
-      });
+      };
+      if (config.requireAssigneeMe) listArgs.assignee = config.watchAssignee;
+      const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", listArgs);
       const issues = Array.isArray(response) ? response : response.issues || [];
       this.log(ctx, `Linear returned ${issues.length} issue(s).`);
 
@@ -381,6 +389,7 @@ class LinearPiOrchestrator {
     const config = readConfig();
     const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() });
     const identifier = issue.id || issueId.trim();
+    await this.assertIssueCanStart(issue, config, ctx);
     const state = readState();
     if (state.workers[identifier]?.status === "running") return state.workers[identifier];
 
@@ -431,6 +440,29 @@ class LinearPiOrchestrator {
         body: `Pi worker failed to start.\n\n\`\`\`\n${worker.error}\n\`\`\``,
       }).catch(() => {});
       throw error;
+    }
+  }
+
+  private async assertIssueCanStart(issue: LinearIssue, config: Config, ctx?: ExtensionContext): Promise<void> {
+    const labels = issueLabels(issue);
+    if (!labels.includes(config.triggerLabel)) {
+      throw new Error(`Refusing to start ${issue.id}: missing required label ${config.triggerLabel}.`);
+    }
+
+    if (!config.requireAssigneeMe) return;
+
+    const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", {
+      label: config.triggerLabel,
+      assignee: config.watchAssignee,
+      limit: 250,
+      orderBy: "updatedAt",
+      includeArchived: false,
+    });
+    const assignedIssues = Array.isArray(response) ? response : response.issues || [];
+    const isAssignedToAllowedUser = assignedIssues.some((assignedIssue) => assignedIssue.id === issue.id);
+    if (!isAssignedToAllowedUser) {
+      this.log(ctx, `Security check blocked ${issue.id}: not assigned to ${config.watchAssignee}.`, "warning");
+      throw new Error(`Refusing to start ${issue.id}: issue must be assigned to ${config.watchAssignee}.`);
     }
   }
 
@@ -612,7 +644,7 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         return;
       }
       const config = readConfig();
-      ctx.ui.notify(`Linear watcher: ${orchestrator.isWatching() ? "running" : "stopped"}\nWatching label: \`${config.triggerLabel}\`\nPoll interval: ${config.pollIntervalMs}ms\nAdd label \`${config.triggerLabel}\` to a Linear issue to trigger it.\nConfig: ${CONFIG_PATH}\nState: ${STATE_PATH}\n\nRecent logs:\n${orchestrator.getLogs()}`, "info");
+      ctx.ui.notify(`Linear watcher: ${orchestrator.isWatching() ? "running" : "stopped"}\nWatching label: \`${config.triggerLabel}\`\nRequired assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}\nPoll interval: ${config.pollIntervalMs}ms\nAdd label \`${config.triggerLabel}\` to an issue assigned to ${config.watchAssignee} to trigger it.\nConfig: ${CONFIG_PATH}\nState: ${STATE_PATH}\n\nRecent logs:\n${orchestrator.getLogs()}`, "info");
     },
   });
 
