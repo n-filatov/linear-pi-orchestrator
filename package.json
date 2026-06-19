@@ -1,0 +1,21 @@
+{
+  "name": "linear-pi-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension that watches Linear issues and starts dedicated tmux/Pi workers in wt worktrees.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
