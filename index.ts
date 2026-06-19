@@ -184,6 +184,7 @@ class LinearPiOrchestrator {
   private manager = new McpServerManager();
   private timer: NodeJS.Timeout | undefined;
   private runningOnce = false;
+  private watchConfig: Config | undefined;
   private logs: string[] = [];
 
   private log(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") {
@@ -206,6 +207,7 @@ class LinearPiOrchestrator {
   stopWatch(ctx?: ExtensionContext) {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.watchConfig = undefined;
     this.log(ctx, "Watcher stopped.");
   }
 
@@ -220,7 +222,8 @@ class LinearPiOrchestrator {
       this.log(ctx, `Watcher already running. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`, "warning");
       return;
     }
-    this.log(ctx, `Watcher starting. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`);
+    this.watchConfig = config;
+    this.log(ctx, `Watcher starting. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}. Repo: ${config.repoRoot}.`);
     this.timer = setInterval(() => {
       void this.watchOnce(ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
@@ -236,7 +239,7 @@ class LinearPiOrchestrator {
       const config = setTriggerLabel(label);
       this.log(ctx, `Updated watched label to ${config.triggerLabel}.`);
     }
-    this.configForContext(ctx);
+    const tickConfig = label ? this.configForContext(ctx) : this.watchConfig ?? this.configForContext(ctx);
     if (this.runningOnce) {
       const message = "Watcher already running; skipped overlapping tick.";
       this.log(ctx, message, "warning");
@@ -244,8 +247,8 @@ class LinearPiOrchestrator {
     }
     this.runningOnce = true;
     try {
-      const config = readConfig();
-      this.log(ctx, `Polling Linear for label ${config.triggerLabel}${config.requireAssigneeMe ? ` assigned to ${config.watchAssignee}` : ""} (limit ${config.issueLimit})...`);
+      const config = tickConfig;
+      this.log(ctx, `Polling Linear for label ${config.triggerLabel}${config.requireAssigneeMe ? ` assigned to ${config.watchAssignee}` : ""} in ${config.repoRoot} (limit ${config.issueLimit})...`);
       const listArgs: Record<string, unknown> = {
         label: config.triggerLabel,
         limit: config.issueLimit,
@@ -253,7 +256,7 @@ class LinearPiOrchestrator {
         includeArchived: false,
       };
       if (config.requireAssigneeMe) listArgs.assignee = config.watchAssignee;
-      const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", listArgs);
+      const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", listArgs, config);
       const issues = Array.isArray(response) ? response : response.issues || [];
       this.log(ctx, `Linear returned ${issues.length} issue(s).`);
 
@@ -277,7 +280,7 @@ class LinearPiOrchestrator {
           continue;
         }
         this.log(ctx, `Starting worker for ${id} (${issue.title})...`);
-        const worker = await this.startIssue(id, ctx);
+        const worker = await this.startIssue(id, ctx, config);
         started.push(`${id} -> ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}`);
         this.log(ctx, `Started ${id}: ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}.`);
       }
@@ -387,9 +390,9 @@ class LinearPiOrchestrator {
     });
   }
 
-  async startIssue(issueId: string, ctx?: ExtensionContext): Promise<WorkerState> {
-    const config = this.configForContext(ctx);
-    const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() });
+  async startIssue(issueId: string, ctx?: ExtensionContext, providedConfig?: Config): Promise<WorkerState> {
+    const config = providedConfig ?? this.configForContext(ctx);
+    const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() }, config);
     const identifier = issue.id || issueId.trim();
     await this.assertIssueCanStart(issue, config, ctx);
     const state = readState();
@@ -440,7 +443,7 @@ class LinearPiOrchestrator {
       await this.callLinear("save_comment", {
         issueId: identifier,
         body: `Pi worker failed to start.\n\n\`\`\`\n${worker.error}\n\`\`\``,
-      }).catch(() => {});
+      }, config).catch(() => {});
       throw error;
     }
   }
@@ -479,7 +482,7 @@ class LinearPiOrchestrator {
       limit: 250,
       orderBy: "updatedAt",
       includeArchived: false,
-    });
+    }, config);
     const assignedIssues = Array.isArray(response) ? response : response.issues || [];
     const isAssignedToAllowedUser = assignedIssues.some((assignedIssue) => assignedIssue.id === issue.id);
     if (!isAssignedToAllowedUser) {
@@ -488,8 +491,8 @@ class LinearPiOrchestrator {
     }
   }
 
-  private async callLinear<T>(toolName: string, args: Record<string, unknown>): Promise<T> {
-    const config = readConfig();
+  private async callLinear<T>(toolName: string, args: Record<string, unknown>, providedConfig?: Config): Promise<T> {
+    const config = providedConfig ?? readConfig();
     const mcpConfig = loadMcpConfig(undefined, config.repoRoot);
     const definition = mcpConfig.mcpServers[config.mcpServer] as ServerEntry | undefined;
     if (!definition) throw new Error(`MCP server "${config.mcpServer}" not found in MCP config.`);
@@ -567,11 +570,11 @@ class LinearPiOrchestrator {
     const labels = Array.from(new Set([...issueLabels(issue), config.triggerLabel, config.runningLabel]));
     await (async () => {
       if (config.setInProgress) {
-        await this.callLinear("save_issue", { id: worker.identifier, state: config.inProgressState, labels }).catch(async () => {
-          await this.callLinear("save_issue", { id: worker.identifier, labels });
+        await this.callLinear("save_issue", { id: worker.identifier, state: config.inProgressState, labels }, config).catch(async () => {
+          await this.callLinear("save_issue", { id: worker.identifier, labels }, config);
         });
       } else {
-        await this.callLinear("save_issue", { id: worker.identifier, labels });
+        await this.callLinear("save_issue", { id: worker.identifier, labels }, config);
       }
     })().catch(() => {
       // Labels may not exist yet, or the workflow state name may differ. The startup
@@ -579,8 +582,8 @@ class LinearPiOrchestrator {
     });
     await this.callLinear("save_comment", {
       issueId: worker.identifier,
-      body: `Started Pi worker:\n\n- tmux: \`${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}\`\n- branch: \`${worker.branch}\`\n- worktree: \`${worker.worktree}\``,
-    });
+      body: `Started Pi worker:\n\n- repo: \`${config.repoRoot}\`\n- tmux: \`${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}\`\n- branch: \`${worker.branch}\`\n- worktree: \`${worker.worktree}\``,
+    }, config);
   }
 }
 
