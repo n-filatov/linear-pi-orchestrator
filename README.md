@@ -48,7 +48,7 @@ For every cleaned worker it kills the tmux window, runs `wt remove <branch> --fo
 
 ## Default behavior
 
-The watcher searches Linear MCP server `linear` for issues labeled with `triggerLabel` from `~/.pi/linear-pi/config.json` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). It skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
+The watcher searches Linear MCP server `linear` for issues labeled with `triggerLabel` from `~/.pi/linear-pi/config.json` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). It uses the current Pi session's git repository root as `repoRoot` when `/linear-watch`, `/linear-watch once`, or `/linear-start` runs, then skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
 
 Security guard: workers only start for issues with the trigger label and, unless disabled, assigned to `watchAssignee` (`me` by default). This applies to both `/linear-watch` and manual `/linear-start`. The current Linear MCP tools do not expose who added a label, so the extension cannot verify the label actor; assignment-to-you is the enforceable guard.
 
@@ -74,7 +74,7 @@ For each issue it:
 - `LINEAR_PI_MCP_SERVER=linear`
 - `LINEAR_PI_TRIGGER_LABEL=pi:implement`
 - `LINEAR_PI_TMUX_SESSION=linear-pi`
-- `LINEAR_PI_REPO_ROOT=/Users/nikita.filatov/Development/frontend`
+- `LINEAR_PI_REPO_ROOT=/Users/nikita.filatov/Development/frontend` (initial/default value; commands update this to the active Pi session's git root)
 - `LINEAR_PI_BASE_BRANCH=origin/main`
 - `LINEAR_PI_BRANCH_PREFIX=feat`
 - `LINEAR_PI_NODE_BIN_DIR=/Users/nikita.filatov/.local/share/nvm/v23.11.1/bin`

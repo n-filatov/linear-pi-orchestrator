@@ -214,7 +214,8 @@ class LinearPiOrchestrator {
   }
 
   startWatch(ctx: ExtensionContext, label?: string) {
-    const config = label ? setTriggerLabel(label) : readConfig();
+    if (label) setTriggerLabel(label);
+    const config = this.configForContext(ctx);
     if (this.timer) {
       this.log(ctx, `Watcher already running. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`, "warning");
       return;
@@ -235,6 +236,7 @@ class LinearPiOrchestrator {
       const config = setTriggerLabel(label);
       this.log(ctx, `Updated watched label to ${config.triggerLabel}.`);
     }
+    this.configForContext(ctx);
     if (this.runningOnce) {
       const message = "Watcher already running; skipped overlapping tick.";
       this.log(ctx, message, "warning");
@@ -386,7 +388,7 @@ class LinearPiOrchestrator {
   }
 
   async startIssue(issueId: string, ctx?: ExtensionContext): Promise<WorkerState> {
-    const config = readConfig();
+    const config = this.configForContext(ctx);
     const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() });
     const identifier = issue.id || issueId.trim();
     await this.assertIssueCanStart(issue, config, ctx);
@@ -440,6 +442,26 @@ class LinearPiOrchestrator {
         body: `Pi worker failed to start.\n\n\`\`\`\n${worker.error}\n\`\`\``,
       }).catch(() => {});
       throw error;
+    }
+  }
+
+  private configForContext(ctx?: ExtensionContext): Config {
+    const config = readConfig();
+    const repoRoot = this.resolveRepoRoot(ctx?.cwd);
+    if (repoRoot && config.repoRoot !== repoRoot) {
+      config.repoRoot = repoRoot;
+      writeConfig(config);
+      this.log(ctx, `Using repo root ${repoRoot}.`);
+    }
+    return config;
+  }
+
+  private resolveRepoRoot(cwd?: string): string | undefined {
+    if (!cwd) return undefined;
+    try {
+      return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+    } catch {
+      return cwd;
     }
   }
 
