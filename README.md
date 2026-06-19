@@ -23,7 +23,8 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 - `/linear-watch stop` — stop polling.
 - `/linear-watch once` — run one polling tick.
 - `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
-- `/linear-watch status` — show watcher state/config paths.
+- `/linear-watch status` — show watcher state/config paths and recent logs.
+- `/linear-watch logs` — show recent watcher logs.
 - `/linear-status` — show recorded workers.
 - `/linear-cleanup` — show a picker of running workers and clean the selected tmux window + worktree.
 - `/linear-cleanup done` — clean workers whose Linear issue is done/canceled or has `pi:done`.
@@ -56,7 +57,7 @@ You can change the watched label from Pi:
 /linear-watch once pi:backend
 ```
 
-`/linear-watch status` also prints the currently watched label and tells you which label to add in Linear.
+`/linear-watch status` also prints the currently watched label, poll interval, config/state paths, and recent logs. While the watcher runs, it updates a `Linear watch` widget/status with the last polling events so you can see what it is doing.
 
 For each issue it:
 

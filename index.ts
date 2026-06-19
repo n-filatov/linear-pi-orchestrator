@@ -178,15 +178,29 @@ class LinearPiOrchestrator {
   private manager = new McpServerManager();
   private timer: NodeJS.Timeout | undefined;
   private runningOnce = false;
+  private logs: string[] = [];
+
+  private log(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") {
+    const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+    this.logs.push(line);
+    this.logs = this.logs.slice(-50);
+    ctx?.ui?.setStatus?.("linear-watch", level === "error" ? "Linear watch: error" : this.timer ? "Linear watch: running" : "Linear watch: stopped");
+    ctx?.ui?.setWidget?.("linear-watch", ["Linear watch", ...this.logs.slice(-12)]);
+  }
+
+  getLogs(): string {
+    return this.logs.length ? this.logs.join("\n") : "No Linear watch logs yet.";
+  }
 
   async shutdown() {
     this.stopWatch();
     await this.manager.closeAll().catch(() => {});
   }
 
-  stopWatch() {
+  stopWatch(ctx?: ExtensionContext) {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.log(ctx, "Watcher stopped.");
   }
 
   isWatching() {
@@ -195,21 +209,35 @@ class LinearPiOrchestrator {
 
   startWatch(ctx: ExtensionContext, label?: string) {
     const config = label ? setTriggerLabel(label) : readConfig();
-    if (this.timer) return;
+    if (this.timer) {
+      this.log(ctx, `Watcher already running. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`, "warning");
+      return;
+    }
+    this.log(ctx, `Watcher starting. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`);
     this.timer = setInterval(() => {
       void this.watchOnce(ctx).catch((error) => {
-        ctx.ui?.notify?.(`Linear watch failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        const message = error instanceof Error ? error.message : String(error);
+        this.log(ctx, `Watch tick failed: ${message}`, "error");
+        ctx.ui?.notify?.(`Linear watch failed: ${message}`, "error");
       });
     }, config.pollIntervalMs);
     void this.watchOnce(ctx);
   }
 
   async watchOnce(ctx: ExtensionContext, label?: string): Promise<string> {
-    if (label) setTriggerLabel(label);
-    if (this.runningOnce) return "Watcher already running; skipped overlapping tick.";
+    if (label) {
+      const config = setTriggerLabel(label);
+      this.log(ctx, `Updated watched label to ${config.triggerLabel}.`);
+    }
+    if (this.runningOnce) {
+      const message = "Watcher already running; skipped overlapping tick.";
+      this.log(ctx, message, "warning");
+      return message;
+    }
     this.runningOnce = true;
     try {
       const config = readConfig();
+      this.log(ctx, `Polling Linear for label ${config.triggerLabel} (limit ${config.issueLimit})...`);
       const response = await this.callLinear<LinearIssue[] | { issues?: LinearIssue[] }>("list_issues", {
         label: config.triggerLabel,
         limit: config.issueLimit,
@@ -217,18 +245,39 @@ class LinearPiOrchestrator {
         includeArchived: false,
       });
       const issues = Array.isArray(response) ? response : response.issues || [];
+      this.log(ctx, `Linear returned ${issues.length} issue(s).`);
 
       const state = readState();
       const started: string[] = [];
+      const skipped: string[] = [];
       for (const issue of issues) {
         const id = issue.id;
         const labels = issueLabels(issue);
-        if (!id || state.workers[id]?.status === "running") continue;
-        if (labels.includes(config.runningLabel) || labels.includes(config.doneLabel) || labels.includes(config.blockedLabel)) continue;
+        if (!id) {
+          skipped.push("unknown issue: missing id");
+          continue;
+        }
+        if (state.workers[id]?.status === "running") {
+          skipped.push(`${id}: already has running worker`);
+          continue;
+        }
+        const blockingLabels = [config.runningLabel, config.doneLabel, config.blockedLabel].filter((blockedLabel) => labels.includes(blockedLabel));
+        if (blockingLabels.length) {
+          skipped.push(`${id}: has ${blockingLabels.join(", ")}`);
+          continue;
+        }
+        this.log(ctx, `Starting worker for ${id} (${issue.title})...`);
         const worker = await this.startIssue(id, ctx);
         started.push(`${id} -> ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}`);
+        this.log(ctx, `Started ${id}: ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}.`);
       }
-      return started.length ? `Started ${started.length} worker(s) for label \`${config.triggerLabel}\`:\n${started.join("\n")}` : `No Linear issues with label \`${config.triggerLabel}\` to start. Add label \`${config.triggerLabel}\` to a Linear issue to trigger this watcher.`;
+      if (skipped.length) this.log(ctx, `Skipped: ${skipped.join("; ")}.`);
+      const message = started.length ? `Started ${started.length} worker(s) for label \`${config.triggerLabel}\`:\n${started.join("\n")}` : `No Linear issues with label \`${config.triggerLabel}\` to start. Add label \`${config.triggerLabel}\` to a Linear issue to trigger this watcher.`;
+      this.log(ctx, started.length ? `Tick done. Started ${started.length}.` : "Tick done. Nothing to start.");
+      return message;
+    } catch (error) {
+      this.log(ctx, `Tick failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      throw error;
     } finally {
       this.runningOnce = false;
     }
@@ -535,8 +584,8 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("linear-watch", {
-    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | once [label] | stop | status",
-    getArgumentCompletions: (prefix) => ["start", "stop", "once", "status"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
+    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | once [label] | stop | status | logs",
+    getArgumentCompletions: (prefix) => ["start", "stop", "once", "status", "logs"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const [action = "status", maybeLabel] = args.trim().split(/\s+/).filter(Boolean);
       if (action === "start") {
@@ -550,7 +599,7 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         return;
       }
       if (action === "stop") {
-        orchestrator.stopWatch();
+        orchestrator.stopWatch(ctx);
         ctx.ui.notify("Linear watcher stopped.", "info");
         return;
       }
@@ -558,8 +607,12 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         ctx.ui.notify(await orchestrator.watchOnce(ctx, maybeLabel), "info");
         return;
       }
+      if (action === "logs") {
+        ctx.ui.notify(orchestrator.getLogs(), "info");
+        return;
+      }
       const config = readConfig();
-      ctx.ui.notify(`Linear watcher: ${orchestrator.isWatching() ? "running" : "stopped"}\nWatching label: \`${config.triggerLabel}\`\nAdd label \`${config.triggerLabel}\` to a Linear issue to trigger it.\nConfig: ${CONFIG_PATH}\nState: ${STATE_PATH}`, "info");
+      ctx.ui.notify(`Linear watcher: ${orchestrator.isWatching() ? "running" : "stopped"}\nWatching label: \`${config.triggerLabel}\`\nPoll interval: ${config.pollIntervalMs}ms\nAdd label \`${config.triggerLabel}\` to a Linear issue to trigger it.\nConfig: ${CONFIG_PATH}\nState: ${STATE_PATH}\n\nRecent logs:\n${orchestrator.getLogs()}`, "info");
     },
   });
 
