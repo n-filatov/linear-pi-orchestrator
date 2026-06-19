@@ -63,6 +63,7 @@ type Config = {
 const CONFIG_DIR = path.join(os.homedir(), ".pi", "linear-pi");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const STATE_PATH = path.join(CONFIG_DIR, "state.json");
+const LOG_PATH = path.join(CONFIG_DIR, "watch.log");
 
 function findCompatibleNodeBinDir(): string {
   if (process.env.LINEAR_PI_NODE_BIN_DIR) return process.env.LINEAR_PI_NODE_BIN_DIR;
@@ -192,12 +193,35 @@ class LinearPiOrchestrator {
     const line = `[${new Date().toLocaleTimeString()}] ${message}`;
     this.logs.push(line);
     this.logs = this.logs.slice(-50);
+    try {
+      ensureConfigDir();
+      fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ${level.toUpperCase()} ${message}\n`);
+    } catch {
+      // Keep in-memory/status logging working even if file logging is unavailable.
+    }
     ctx?.ui?.setStatus?.("linear-watch", level === "error" ? "Linear watch: error" : this.timer ? "Linear watch: running" : "Linear watch: stopped");
     ctx?.ui?.setWidget?.("linear-watch", ["Linear watch", ...this.logs.slice(-12)]);
   }
 
   getLogs(): string {
-    return this.logs.length ? this.logs.join("\n") : "No Linear watch logs yet.";
+    return this.logs.length ? this.logs.join("\n") : `No Linear watch logs yet. Log file: ${LOG_PATH}`;
+  }
+
+  statusSummary(config = readConfig(), includeRecentLogs = false): string {
+    const workers = this.listWorkers("running");
+    const lines = [
+      `Linear watcher: ${this.isWatching() ? "running" : "stopped"}`,
+      `Label: ${config.triggerLabel}`,
+      `Repo: ${config.repoRoot}`,
+      `Interval: ${config.pollIntervalMs}ms`,
+      `Required assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}`,
+      `Running workers: ${workers.length}`,
+      `Logs: ${LOG_PATH}`,
+      `Config: ${CONFIG_PATH}`,
+      `State: ${STATE_PATH}`,
+    ];
+    if (includeRecentLogs) lines.push("", "Recent logs:", this.getLogs());
+    return lines.join("\n");
   }
 
   async shutdown() {
@@ -714,8 +738,7 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
           return;
         }
         orchestrator.startWatch(ctx, maybeLabel);
-        const config = readConfig();
-        ctx.ui.notify(`Linear watcher started. Add label \`${config.triggerLabel}\` to a Linear issue to trigger it.\nConfig: ${CONFIG_PATH}`, "info");
+        ctx.ui.notify(orchestrator.statusSummary(), "info");
         return;
       }
       if (action === "stop") {
@@ -731,8 +754,7 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         ctx.ui.notify(orchestrator.getLogs(), "info");
         return;
       }
-      const config = readConfig();
-      ctx.ui.notify(`Linear watcher: ${orchestrator.isWatching() ? "running" : "stopped"}\nWatching label: \`${config.triggerLabel}\`\nRequired assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}\nPoll interval: ${config.pollIntervalMs}ms\nAdd label \`${config.triggerLabel}\` to an issue assigned to ${config.watchAssignee} to trigger it.\nConfig: ${CONFIG_PATH}\nState: ${STATE_PATH}\n\nRecent logs:\n${orchestrator.getLogs()}`, "info");
+      ctx.ui.notify(orchestrator.statusSummary(readConfig(), true), "info");
     },
   });
 
