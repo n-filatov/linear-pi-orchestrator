@@ -26,6 +26,7 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 - `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
 - `/linear-watch status` — show watcher state/config paths and recent logs.
 - `/linear-watch logs` — show recent watcher logs.
+- `/linear-watch-bar on|off|toggle|status|refresh` — control the footer status item (`Linear: ...`).
 - `/linear-status` — show recorded workers.
 - `/linear-cleanup` — show a picker of running workers and clean the selected tmux window + worktree.
 - `/linear-cleanup done` — clean workers whose Linear issue is done/canceled or has `pi:done`.
@@ -62,7 +63,7 @@ You can change the watched label from Pi:
 /linear-watch once pi:backend
 ```
 
-`/linear-watch start` runs as a detached daemon by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints the daemon pid, currently watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. While a foreground watcher runs, it also updates a `Linear watch` widget/status with the last polling events.
+`/linear-watch start` runs as a detached daemon by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints the daemon pid, currently watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. The footer status item is enabled by default and can be controlled with `/linear-watch-bar on|off|toggle|status|refresh`; it shows compact daemon/worker state such as `Linear: 🟢 daemon 12345 · 2 workers`.
 
 For each issue it:
 

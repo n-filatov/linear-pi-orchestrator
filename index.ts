@@ -66,6 +66,9 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const STATE_PATH = path.join(CONFIG_DIR, "state.json");
 const LOG_PATH = path.join(CONFIG_DIR, "watch.log");
 const PID_PATH = path.join(CONFIG_DIR, "watch.pid");
+const BAR_PREF_PATH = path.join(CONFIG_DIR, "watch-bar.json");
+const WATCH_STATUS_KEY = "linear-watch";
+const WATCH_BAR_INTERVAL_MS = 30_000;
 
 function findCompatibleNodeBinDir(): string {
   if (process.env.LINEAR_PI_NODE_BIN_DIR) return process.env.LINEAR_PI_NODE_BIN_DIR;
@@ -186,6 +189,26 @@ function tsxBinPath(): string {
   return process.env.LINEAR_PI_TSX_BIN || path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", ".bin", "tsx");
 }
 
+function readWatchBarPreference(): boolean | undefined {
+  try {
+    if (!fs.existsSync(BAR_PREF_PATH)) return undefined;
+    const data = JSON.parse(fs.readFileSync(BAR_PREF_PATH, "utf8")) as { enabled?: unknown };
+    return typeof data.enabled === "boolean" ? data.enabled : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeWatchBarPreference(enabled: boolean): boolean {
+  try {
+    ensureConfigDir();
+    fs.writeFileSync(BAR_PREF_PATH, `${JSON.stringify({ enabled }, null, 2)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function slugify(input: string, max = 64): string {
   return input
     .toLowerCase()
@@ -228,12 +251,20 @@ class LinearPiOrchestrator {
     } catch {
       // Keep in-memory/status logging working even if file logging is unavailable.
     }
-    ctx?.ui?.setStatus?.("linear-watch", level === "error" ? "Linear watch: error" : this.isWatching() ? "Linear watch: running" : "Linear watch: stopped");
-    ctx?.ui?.setWidget?.("linear-watch", ["Linear watch", ...this.logs.slice(-12)]);
+    ctx?.ui?.setStatus?.(WATCH_STATUS_KEY, level === "error" ? "Linear: error" : this.statusBarText());
+    ctx?.ui?.setWidget?.(WATCH_STATUS_KEY, ["Linear watch", ...this.logs.slice(-12)]);
   }
 
   getLogs(): string {
     return this.logs.length ? this.logs.join("\n") : `No Linear watch logs yet. Log file: ${LOG_PATH}`;
+  }
+
+  statusBarText(): string {
+    if (!this.isWatching()) return "Linear: stopped";
+    const workers = this.listWorkers("running").length;
+    const pid = readDaemonPid();
+    const mode = pid && isPidRunning(pid) ? `daemon ${pid}` : "foreground";
+    return `Linear: 🟢 ${mode}${workers ? ` · ${workers} worker${workers === 1 ? "" : "s"}` : ""}`;
   }
 
   statusSummary(config = readConfig(), includeRecentLogs = false): string {
@@ -774,8 +805,50 @@ Instructions:
 
 export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   const orchestrator = new LinearPiOrchestrator();
+  let watchBarTimer: NodeJS.Timeout | undefined;
+  let watchBarEnabled = readWatchBarPreference() ?? true;
+
+  function refreshWatchBar(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+    if (!watchBarEnabled) {
+      ctx.ui.setStatus(WATCH_STATUS_KEY, undefined);
+      return;
+    }
+    ctx.ui.setStatus(WATCH_STATUS_KEY, orchestrator.statusBarText());
+  }
+
+  function stopWatchBar(ctx?: ExtensionContext) {
+    if (watchBarTimer) clearInterval(watchBarTimer);
+    watchBarTimer = undefined;
+    if (ctx?.hasUI) ctx.ui.setStatus(WATCH_STATUS_KEY, undefined);
+  }
+
+  function startWatchBar(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+    if (watchBarTimer) clearInterval(watchBarTimer);
+    refreshWatchBar(ctx);
+    watchBarTimer = setInterval(() => refreshWatchBar(ctx), WATCH_BAR_INTERVAL_MS);
+  }
+
+  async function setWatchBarEnabled(ctx: ExtensionContext, enabled: boolean) {
+    watchBarEnabled = enabled;
+    const saved = writeWatchBarPreference(enabled);
+    if (!saved) ctx.ui.notify("Could not save Linear watch bar preference", "warning");
+    if (enabled) {
+      startWatchBar(ctx);
+      ctx.ui.notify(`Linear watch bar enabled: ${orchestrator.statusBarText()}`, "info");
+      return;
+    }
+    stopWatchBar(ctx);
+    ctx.ui.notify("Linear watch bar disabled", "info");
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (watchBarEnabled) startWatchBar(ctx);
+  });
 
   pi.on("session_shutdown", async () => {
+    stopWatchBar();
     await orchestrator.shutdown();
   });
 
@@ -804,17 +877,20 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
           return;
         }
         ctx.ui.notify(orchestrator.startDaemon(ctx, maybeLabel), "info");
+        refreshWatchBar(ctx);
         return;
       }
       if (action === "foreground") {
         orchestrator.startWatch(ctx, maybeLabel);
         ctx.ui.notify(orchestrator.statusSummary(), "info");
+        refreshWatchBar(ctx);
         return;
       }
       if (action === "stop") {
         const daemonMessage = orchestrator.stopDaemon();
         orchestrator.stopWatch(ctx);
         ctx.ui.notify(daemonMessage || "Linear watcher stopped.", "info");
+        refreshWatchBar(ctx);
         return;
       }
       if (action === "once") {
@@ -826,6 +902,37 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(orchestrator.statusSummary(readConfig(), true), "info");
+    },
+  });
+
+  pi.registerCommand("linear-watch-bar", {
+    description: "Show or hide Linear watcher status in the footer. Usage: /linear-watch-bar [on|off|toggle|status|refresh]",
+    getArgumentCompletions: (prefix) => ["on", "off", "toggle", "status", "refresh"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase() || "refresh";
+      if (["on", "enable", "enabled"].includes(action)) {
+        await setWatchBarEnabled(ctx, true);
+        return;
+      }
+      if (["off", "disable", "disabled"].includes(action)) {
+        await setWatchBarEnabled(ctx, false);
+        return;
+      }
+      if (action === "toggle") {
+        await setWatchBarEnabled(ctx, !watchBarEnabled);
+        return;
+      }
+      if (action === "status") {
+        refreshWatchBar(ctx);
+        ctx.ui.notify(`Linear watch bar: ${watchBarEnabled ? "enabled" : "disabled"}\n${orchestrator.statusBarText()}`, "info");
+        return;
+      }
+      if (action !== "refresh") {
+        ctx.ui.notify("Usage: /linear-watch-bar [on|off|toggle|status|refresh]", "warning");
+        return;
+      }
+      refreshWatchBar(ctx);
+      ctx.ui.notify(orchestrator.statusBarText(), "info");
     },
   });
 
