@@ -21,7 +21,7 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 - `/linear-watch start` — start a detached background watcher daemon for issues with the configured label.
 - `/linear-watch start pi:frontend` — set watched label to `pi:frontend` and start the background watcher daemon.
 - `/linear-watch foreground pi:frontend` — run the watcher in the current Pi process instead of the daemon.
-- `/linear-watch stop` — stop the foreground watcher and daemon.
+- `/linear-watch stop` — stop the foreground watcher and this repo's daemon.
 - `/linear-watch once` — run one polling tick.
 - `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
 - `/linear-watch status` — show watcher state/config paths and recent logs.
@@ -35,24 +35,22 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 
 ## Files
 
-First use creates:
+First use creates a global defaults file plus per-repository runtime files:
 
-- config: `~/.pi/linear-pi/config.json`
-- state: `~/.pi/linear-pi/state.json`
-- logs: `~/.pi/linear-pi/watch.log`
-- daemon pid: `~/.pi/linear-pi/watch.pid`
+- global defaults: `~/.pi/linear-pi/config.json`
+- per-repo config/state/logs/pid: `~/.pi/linear-pi/repos/<repo-name>-<hash>/`
 
 ## Cleanup behavior
 
 `/linear-cleanup` without arguments opens an interactive picker of recorded running workers, then kills the selected tmux window and removes its `wt` worktree after confirmation.
 
-`/linear-cleanup done` checks recorded workers in `~/.pi/linear-pi/state.json`, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
+`/linear-cleanup done` checks recorded workers for the current repository, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
 
 For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, and removes the worker from local state.
 
 ## Default behavior
 
-The watcher searches Linear MCP server `linear` for issues labeled with `triggerLabel` from `~/.pi/linear-pi/config.json` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). It uses the current Pi session's git repository root as `repoRoot` when `/linear-watch`, `/linear-watch once`, or `/linear-start` runs, then skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
+The watcher searches Linear MCP server `linear` for issues labeled with the current repository's `triggerLabel` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). All `/linear-watch`, `/linear-start`, `/linear-cleanup`, `/linear-status`, and footer status commands resolve the current Pi session's git repository root and use that repository's scoped config/state/log/pid files. This lets one window show/control only the frontend daemon and another window show/control only the backend daemon. The watcher skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`.
 
 Security guard: workers only start for issues with the trigger label and, unless disabled, assigned to `watchAssignee` (`me` by default). This applies to both `/linear-watch` and manual `/linear-start`. The current Linear MCP tools do not expose who added a label, so the extension cannot verify the label actor; assignment-to-you is the enforceable guard.
 
@@ -63,7 +61,7 @@ You can change the watched label from Pi:
 /linear-watch once pi:backend
 ```
 
-`/linear-watch start` runs as a detached daemon by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints the daemon pid, currently watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. The footer status item is enabled by default and can be controlled with `/linear-watch-bar on|off|toggle|status|refresh`; it shows compact daemon/worker state such as `Linear: 🟢 daemon 12345 · 2 workers`.
+`/linear-watch start` runs as a detached daemon for the current repository by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints that repo's daemon pid, watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. The footer status item is enabled per repo by default and can be controlled with `/linear-watch-bar on|off|toggle|status|refresh`; it shows compact current-repo daemon/worker state such as `Linear: 🟢 frontend daemon 12345 · 2 workers`.
 
 For each issue it:
 

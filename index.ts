@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -63,10 +64,7 @@ type Config = {
 
 const CONFIG_DIR = path.join(os.homedir(), ".pi", "linear-pi");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
-const STATE_PATH = path.join(CONFIG_DIR, "state.json");
-const LOG_PATH = path.join(CONFIG_DIR, "watch.log");
-const PID_PATH = path.join(CONFIG_DIR, "watch.pid");
-const BAR_PREF_PATH = path.join(CONFIG_DIR, "watch-bar.json");
+const REPOS_DIR = path.join(CONFIG_DIR, "repos");
 const WATCH_STATUS_KEY = "linear-watch";
 const WATCH_BAR_INTERVAL_MS = 30_000;
 
@@ -103,7 +101,7 @@ function globNodeBinDirs(root: string): string[] {
     .map((entry) => path.join(root, entry, "bin"));
 }
 
-function defaultConfig(): Config {
+function defaultConfig(repoRoot = process.env.LINEAR_PI_REPO_ROOT || process.cwd()): Config {
   return {
     mcpServer: process.env.LINEAR_PI_MCP_SERVER || "linear",
     triggerLabel: process.env.LINEAR_PI_TRIGGER_LABEL || "pi:implement",
@@ -112,7 +110,7 @@ function defaultConfig(): Config {
     blockedLabel: process.env.LINEAR_PI_BLOCKED_LABEL || "pi:blocked",
     pollIntervalMs: Number(process.env.LINEAR_PI_POLL_INTERVAL_MS || 30_000),
     tmuxSession: process.env.LINEAR_PI_TMUX_SESSION || "linear-pi",
-    repoRoot: process.env.LINEAR_PI_REPO_ROOT || process.cwd(),
+    repoRoot,
     baseBranch: process.env.LINEAR_PI_BASE_BRANCH || "origin/main",
     branchPrefix: process.env.LINEAR_PI_BRANCH_PREFIX || "feat",
     piCommand: process.env.LINEAR_PI_PI_COMMAND || "pi",
@@ -129,42 +127,69 @@ function ensureConfigDir() {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
 }
 
-function readConfig(): Config {
-  ensureConfigDir();
-  const base = defaultConfig();
-  if (!fs.existsSync(CONFIG_PATH)) {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(base, null, 2));
-    return base;
+function repoScopeDir(repoRoot: string): string {
+  const resolved = path.resolve(repoRoot);
+  const base = path.basename(resolved).replace(/[^a-zA-Z0-9._-]+/g, "-") || "repo";
+  const hash = createHash("sha1").update(resolved).digest("hex").slice(0, 10);
+  return path.join(REPOS_DIR, `${base}-${hash}`);
+}
+
+function configPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "config.json"); }
+function statePath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "state.json"); }
+function logPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch.log"); }
+function pidPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch.pid"); }
+function barPrefPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch-bar.json"); }
+
+function readJsonFile<T extends object>(filePath: string): Partial<T> {
+  try {
+    return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : {};
+  } catch {
+    return {};
   }
-  return { ...base, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
+}
+
+function readConfig(repoRootHint?: string): Config {
+  ensureConfigDir();
+  const globalConfig = readJsonFile<Config>(CONFIG_PATH);
+  const repoRoot = path.resolve(repoRootHint || process.env.LINEAR_PI_REPO_ROOT || (typeof globalConfig.repoRoot === "string" ? globalConfig.repoRoot : "") || process.cwd());
+  const scopedPath = configPath(repoRoot);
+  const scopedConfig = readJsonFile<Config>(scopedPath);
+  const config = { ...defaultConfig(repoRoot), ...globalConfig, ...scopedConfig, repoRoot };
+  if (!fs.existsSync(CONFIG_PATH)) fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig(repoRoot), null, 2));
+  if (!fs.existsSync(scopedPath)) writeConfig(config);
+  return config;
 }
 
 function writeConfig(config: Config) {
   ensureConfigDir();
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  const scopedDir = repoScopeDir(config.repoRoot);
+  fs.mkdirSync(scopedDir, { recursive: true });
+  fs.writeFileSync(configPath(config.repoRoot), JSON.stringify(config, null, 2));
 }
 
-function setTriggerLabel(label: string): Config {
-  const config = readConfig();
+function setTriggerLabel(label: string, repoRoot?: string): Config {
+  const config = readConfig(repoRoot);
   config.triggerLabel = label;
   writeConfig(config);
   return config;
 }
 
-function readState(): StateFile {
+function readState(repoRoot = readConfig().repoRoot): StateFile {
   ensureConfigDir();
-  if (!fs.existsSync(STATE_PATH)) return { workers: {} };
-  return { workers: {}, ...JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) };
+  const filePath = statePath(repoRoot);
+  if (!fs.existsSync(filePath)) return { workers: {} };
+  return { workers: {}, ...JSON.parse(fs.readFileSync(filePath, "utf8")) };
 }
 
-function writeState(state: StateFile) {
+function writeState(state: StateFile, repoRoot = readConfig().repoRoot) {
   ensureConfigDir();
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  fs.mkdirSync(repoScopeDir(repoRoot), { recursive: true });
+  fs.writeFileSync(statePath(repoRoot), JSON.stringify(state, null, 2));
 }
 
-function readDaemonPid(): number | undefined {
+function readDaemonPid(repoRoot = readConfig().repoRoot): number | undefined {
   try {
-    const pid = Number(fs.readFileSync(PID_PATH, "utf8").trim());
+    const pid = Number(fs.readFileSync(pidPath(repoRoot), "utf8").trim());
     return Number.isFinite(pid) && pid > 0 ? pid : undefined;
   } catch {
     return undefined;
@@ -180,8 +205,8 @@ function isPidRunning(pid: number): boolean {
   }
 }
 
-function isDaemonRunning(): boolean {
-  const pid = readDaemonPid();
+function isDaemonRunning(repoRoot = readConfig().repoRoot): boolean {
+  const pid = readDaemonPid(repoRoot);
   return Boolean(pid && isPidRunning(pid));
 }
 
@@ -189,20 +214,22 @@ function tsxBinPath(): string {
   return process.env.LINEAR_PI_TSX_BIN || path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", ".bin", "tsx");
 }
 
-function readWatchBarPreference(): boolean | undefined {
+function readWatchBarPreference(repoRoot = readConfig().repoRoot): boolean | undefined {
   try {
-    if (!fs.existsSync(BAR_PREF_PATH)) return undefined;
-    const data = JSON.parse(fs.readFileSync(BAR_PREF_PATH, "utf8")) as { enabled?: unknown };
+    const filePath = barPrefPath(repoRoot);
+    if (!fs.existsSync(filePath)) return undefined;
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8")) as { enabled?: unknown };
     return typeof data.enabled === "boolean" ? data.enabled : undefined;
   } catch {
     return undefined;
   }
 }
 
-function writeWatchBarPreference(enabled: boolean): boolean {
+function writeWatchBarPreference(enabled: boolean, repoRoot = readConfig().repoRoot): boolean {
   try {
     ensureConfigDir();
-    fs.writeFileSync(BAR_PREF_PATH, `${JSON.stringify({ enabled }, null, 2)}\n`);
+    fs.mkdirSync(repoScopeDir(repoRoot), { recursive: true });
+    fs.writeFileSync(barPrefPath(repoRoot), `${JSON.stringify({ enabled }, null, 2)}\n`);
     return true;
   } catch {
     return false;
@@ -242,51 +269,53 @@ class LinearPiOrchestrator {
   private logs: string[] = [];
 
   private log(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") {
+    const config = this.watchConfig ?? readConfig(ctx?.cwd);
     const line = `[${new Date().toLocaleTimeString()}] ${message}`;
     this.logs.push(line);
     this.logs = this.logs.slice(-50);
     try {
       ensureConfigDir();
-      fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ${level.toUpperCase()} ${message}\n`);
+      fs.mkdirSync(repoScopeDir(config.repoRoot), { recursive: true });
+      fs.appendFileSync(logPath(config.repoRoot), `${new Date().toISOString()} ${level.toUpperCase()} ${message}\n`);
     } catch {
       // Keep in-memory/status logging working even if file logging is unavailable.
     }
-    ctx?.ui?.setStatus?.(WATCH_STATUS_KEY, level === "error" ? "Linear: error" : this.statusBarText());
+    ctx?.ui?.setStatus?.(WATCH_STATUS_KEY, level === "error" ? "Linear: error" : this.statusBarText(config));
     ctx?.ui?.setWidget?.(WATCH_STATUS_KEY, ["Linear watch", ...this.logs.slice(-12)]);
   }
 
-  getLogs(): string {
-    return this.logs.length ? this.logs.join("\n") : `No Linear watch logs yet. Log file: ${LOG_PATH}`;
+  getLogs(config = readConfig()): string {
+    return this.logs.length ? this.logs.join("\n") : `No Linear watch logs yet. Log file: ${logPath(config.repoRoot)}`;
   }
 
-  statusBarText(): string {
-    if (!this.isWatching()) return "Linear: stopped";
-    const workers = this.listWorkers("running").length;
-    const pid = readDaemonPid();
+  statusBarText(config = readConfig()): string {
+    if (!this.isWatching(config)) return `Linear: stopped (${path.basename(config.repoRoot)})`;
+    const workers = this.listWorkers("running", config).length;
+    const pid = readDaemonPid(config.repoRoot);
     const mode = pid && isPidRunning(pid) ? `daemon ${pid}` : "foreground";
-    return `Linear: 🟢 ${mode}${workers ? ` · ${workers} worker${workers === 1 ? "" : "s"}` : ""}`;
+    return `Linear: 🟢 ${path.basename(config.repoRoot)} ${mode}${workers ? ` · ${workers} worker${workers === 1 ? "" : "s"}` : ""}`;
   }
 
   statusSummary(config = readConfig(), includeRecentLogs = false): string {
-    const workers = this.listWorkers("running");
+    const workers = this.listWorkers("running", config);
     const lines = [
-      `Linear watcher: ${this.isWatching() ? "running" : "stopped"}`,
-      `Daemon pid: ${this.daemonPidSummary()}`,
+      `Linear watcher: ${this.isWatching(config) ? "running" : "stopped"}`,
+      `Daemon pid: ${this.daemonPidSummary(config)}`,
       `Label: ${config.triggerLabel}`,
       `Repo: ${config.repoRoot}`,
       `Interval: ${config.pollIntervalMs}ms`,
       `Required assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}`,
       `Running workers: ${workers.length}`,
-      `Logs: ${LOG_PATH}`,
-      `Config: ${CONFIG_PATH}`,
-      `State: ${STATE_PATH}`,
+      `Logs: ${logPath(config.repoRoot)}`,
+      `Config: ${configPath(config.repoRoot)}`,
+      `State: ${statePath(config.repoRoot)}`,
     ];
-    if (includeRecentLogs) lines.push("", "Recent logs:", this.getLogs());
+    if (includeRecentLogs) lines.push("", "Recent logs:", this.getLogs(config));
     return lines.join("\n");
   }
 
-  private daemonPidSummary(): string {
-    const pid = readDaemonPid();
+  private daemonPidSummary(config = readConfig()): string {
+    const pid = readDaemonPid(config.repoRoot);
     if (!pid) return "none";
     return isPidRunning(pid) ? String(pid) : `${pid} (stale)`;
   }
@@ -303,43 +332,46 @@ class LinearPiOrchestrator {
     this.log(ctx, "Watcher stopped.");
   }
 
-  isWatching() {
-    return Boolean(this.timer) || isDaemonRunning();
+  isWatching(config = readConfig()) {
+    return Boolean(this.timer && this.watchConfig?.repoRoot === config.repoRoot) || isDaemonRunning(config.repoRoot);
   }
 
   startDaemon(ctx: ExtensionContext, label?: string): string {
-    if (label) setTriggerLabel(label);
-    const config = this.configForContext(ctx);
-    const pid = readDaemonPid();
+    const contextConfig = this.configForContext(ctx);
+    if (label) setTriggerLabel(label, contextConfig.repoRoot);
+    const config = label ? readConfig(contextConfig.repoRoot) : contextConfig;
+    const pid = readDaemonPid(config.repoRoot);
     if (pid && isPidRunning(pid)) return this.statusSummary(config);
 
     ensureConfigDir();
-    const out = fs.openSync(LOG_PATH, "a");
+    fs.mkdirSync(repoScopeDir(config.repoRoot), { recursive: true });
+    const out = fs.openSync(logPath(config.repoRoot), "a");
     const command = tsxBinPath();
     if (!fs.existsSync(command)) throw new Error(`Cannot start watcher daemon: tsx not found at ${command}. Set LINEAR_PI_TSX_BIN to override.`);
     const child = spawn(command, [fileURLToPath(import.meta.url), "--linear-pi-daemon"], {
       cwd: config.repoRoot,
       detached: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env, LINEAR_PI_DAEMON: "1" },
+      env: { ...process.env, LINEAR_PI_DAEMON: "1", LINEAR_PI_REPO_ROOT: config.repoRoot },
     });
     child.unref();
-    fs.writeFileSync(PID_PATH, String(child.pid));
+    fs.writeFileSync(pidPath(config.repoRoot), String(child.pid));
     this.log(ctx, `Started daemon watcher pid ${child.pid}.`);
     return this.statusSummary(config);
   }
 
-  stopDaemon(): string | undefined {
-    const pid = readDaemonPid();
+  stopDaemon(config = readConfig()): string | undefined {
+    const pid = readDaemonPid(config.repoRoot);
     if (!pid) return undefined;
     if (isPidRunning(pid)) process.kill(pid, "SIGTERM");
-    fs.rmSync(PID_PATH, { force: true });
+    fs.rmSync(pidPath(config.repoRoot), { force: true });
     return `Stopped daemon watcher pid ${pid}.`;
   }
 
   startWatch(ctx?: ExtensionContext, label?: string) {
-    if (label) setTriggerLabel(label);
-    const config = this.configForContext(ctx);
+    const contextConfig = this.configForContext(ctx);
+    if (label) setTriggerLabel(label, contextConfig.repoRoot);
+    const config = label ? readConfig(contextConfig.repoRoot) : contextConfig;
     if (this.timer) {
       this.log(ctx, `Watcher already running. Poll interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}.`, "warning");
       return;
@@ -358,7 +390,7 @@ class LinearPiOrchestrator {
 
   async watchOnce(ctx?: ExtensionContext, label?: string): Promise<string> {
     if (label) {
-      const config = setTriggerLabel(label);
+      const config = setTriggerLabel(label, this.configForContext(ctx).repoRoot);
       this.log(ctx, `Updated watched label to ${config.triggerLabel}.`);
     }
     const tickConfig = label ? this.configForContext(ctx) : this.watchConfig ?? this.configForContext(ctx);
@@ -382,7 +414,7 @@ class LinearPiOrchestrator {
       const issues = Array.isArray(response) ? response : response.issues || [];
       this.log(ctx, `Linear returned ${issues.length} issue(s).`);
 
-      const state = readState();
+      const state = readState(config.repoRoot);
       const started: string[] = [];
       const skipped: string[] = [];
       for (const issue of issues) {
@@ -418,13 +450,14 @@ class LinearPiOrchestrator {
     }
   }
 
-  listWorkers(status?: WorkerState["status"]): WorkerState[] {
-    const workers = Object.values(readState().workers);
+  listWorkers(status?: WorkerState["status"], config = readConfig()): WorkerState[] {
+    const workers = Object.values(readState(config.repoRoot).workers);
     return status ? workers.filter((worker) => worker.status === status) : workers;
   }
 
   async cleanupInteractive(ctx: ExtensionContext): Promise<string> {
-    const workers = this.listWorkers("running");
+    const config = this.configForContext(ctx);
+    const workers = this.listWorkers("running", config);
     if (!workers.length) return "No running Linear Pi workers recorded.";
 
     const choices = workers.map((worker) => this.formatWorkerChoice(worker));
@@ -444,8 +477,8 @@ class LinearPiOrchestrator {
   }
 
   async cleanup(target: string, ctx?: ExtensionContext): Promise<string> {
-    const config = readConfig();
-    const state = readState();
+    const config = this.configForContext(ctx);
+    const state = readState(config.repoRoot);
     const workers = Object.values(state.workers);
     const normalized = target.trim();
     const cleaned: string[] = [];
@@ -475,7 +508,7 @@ class LinearPiOrchestrator {
       cleaned.push(worker.identifier);
     }
 
-    writeState(state);
+    writeState(state, config.repoRoot);
     if (!cleaned.length) {
       return normalized === "done"
         ? `No done workers found. Skipped: ${skipped.join(", ") || "none"}`
@@ -490,7 +523,7 @@ class LinearPiOrchestrator {
 
   private async shouldCleanupWorker(worker: WorkerState, target: string, config: Config): Promise<boolean> {
     if (!target || target === "done") {
-      const issue = await this.callLinear<LinearIssue>("get_issue", { id: worker.identifier }).catch(() => undefined);
+      const issue = await this.callLinear<LinearIssue>("get_issue", { id: worker.identifier }, config).catch(() => undefined);
       if (!issue) return false;
       const labels = issueLabels(issue);
       return labels.includes(config.doneLabel) || issue.statusType === "completed" || issue.statusType === "canceled" || issue.status === "Done" || issue.status === "Canceled";
@@ -555,7 +588,7 @@ class LinearPiOrchestrator {
     const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() }, config);
     const identifier = issue.id || issueId.trim();
     await this.assertIssueCanStart(issue, config, ctx);
-    const state = readState();
+    const state = readState(config.repoRoot);
     if (state.workers[identifier]?.status === "running") return state.workers[identifier];
 
     const slug = slugify(`${identifier}-${issue.title}`);
@@ -581,7 +614,7 @@ class LinearPiOrchestrator {
         startedAt: new Date().toISOString(),
       };
       state.workers[identifier] = worker;
-      writeState(state);
+      writeState(state, config.repoRoot);
 
       await this.markLinearRunning(config, issue, worker).catch((error) => {
         ctx?.ui?.notify?.(`Worker started, but Linear update failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -601,7 +634,7 @@ class LinearPiOrchestrator {
         error: error instanceof Error ? error.message : String(error),
       };
       state.workers[identifier] = worker;
-      writeState(state);
+      writeState(state, config.repoRoot);
       await this.callLinear("save_comment", {
         issueId: identifier,
         body: `Pi worker failed to start.\n\n\`\`\`\n${worker.error}\n\`\`\``,
@@ -610,9 +643,9 @@ class LinearPiOrchestrator {
     }
   }
 
-  private configForContext(ctx?: ExtensionContext): Config {
-    const config = readConfig();
+  configForContext(ctx?: ExtensionContext): Config {
     const repoRoot = this.resolveRepoRoot(ctx?.cwd);
+    const config = readConfig(repoRoot);
     if (repoRoot && config.repoRoot !== repoRoot) {
       config.repoRoot = repoRoot;
       writeConfig(config);
@@ -806,15 +839,17 @@ Instructions:
 export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   const orchestrator = new LinearPiOrchestrator();
   let watchBarTimer: NodeJS.Timeout | undefined;
-  let watchBarEnabled = readWatchBarPreference() ?? true;
+  let watchBarEnabled = true;
 
   function refreshWatchBar(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
+    const config = orchestrator.configForContext(ctx);
+    watchBarEnabled = readWatchBarPreference(config.repoRoot) ?? true;
     if (!watchBarEnabled) {
       ctx.ui.setStatus(WATCH_STATUS_KEY, undefined);
       return;
     }
-    ctx.ui.setStatus(WATCH_STATUS_KEY, orchestrator.statusBarText());
+    ctx.ui.setStatus(WATCH_STATUS_KEY, orchestrator.statusBarText(config));
   }
 
   function stopWatchBar(ctx?: ExtensionContext) {
@@ -831,12 +866,13 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   }
 
   async function setWatchBarEnabled(ctx: ExtensionContext, enabled: boolean) {
+    const config = orchestrator.configForContext(ctx);
     watchBarEnabled = enabled;
-    const saved = writeWatchBarPreference(enabled);
+    const saved = writeWatchBarPreference(enabled, config.repoRoot);
     if (!saved) ctx.ui.notify("Could not save Linear watch bar preference", "warning");
     if (enabled) {
       startWatchBar(ctx);
-      ctx.ui.notify(`Linear watch bar enabled: ${orchestrator.statusBarText()}`, "info");
+      ctx.ui.notify(`Linear watch bar enabled: ${orchestrator.statusBarText(config)}`, "info");
       return;
     }
     stopWatchBar(ctx);
@@ -844,6 +880,8 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    const config = orchestrator.configForContext(ctx);
+    watchBarEnabled = readWatchBarPreference(config.repoRoot) ?? true;
     if (watchBarEnabled) startWatchBar(ctx);
   });
 
@@ -882,12 +920,12 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
       }
       if (action === "foreground") {
         orchestrator.startWatch(ctx, maybeLabel);
-        ctx.ui.notify(orchestrator.statusSummary(), "info");
+        ctx.ui.notify(orchestrator.statusSummary(orchestrator.configForContext(ctx)), "info");
         refreshWatchBar(ctx);
         return;
       }
       if (action === "stop") {
-        const daemonMessage = orchestrator.stopDaemon();
+        const daemonMessage = orchestrator.stopDaemon(orchestrator.configForContext(ctx));
         orchestrator.stopWatch(ctx);
         ctx.ui.notify(daemonMessage || "Linear watcher stopped.", "info");
         refreshWatchBar(ctx);
@@ -898,10 +936,11 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         return;
       }
       if (action === "logs") {
-        ctx.ui.notify(orchestrator.getLogs(), "info");
+        const config = orchestrator.configForContext(ctx);
+        ctx.ui.notify(orchestrator.getLogs(config), "info");
         return;
       }
-      ctx.ui.notify(orchestrator.statusSummary(readConfig(), true), "info");
+      ctx.ui.notify(orchestrator.statusSummary(orchestrator.configForContext(ctx), true), "info");
     },
   });
 
@@ -924,7 +963,8 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
       }
       if (action === "status") {
         refreshWatchBar(ctx);
-        ctx.ui.notify(`Linear watch bar: ${watchBarEnabled ? "enabled" : "disabled"}\n${orchestrator.statusBarText()}`, "info");
+        const config = orchestrator.configForContext(ctx);
+        ctx.ui.notify(`Linear watch bar: ${watchBarEnabled ? "enabled" : "disabled"}\n${orchestrator.statusBarText(config)}`, "info");
         return;
       }
       if (action !== "refresh") {
@@ -932,14 +972,14 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         return;
       }
       refreshWatchBar(ctx);
-      ctx.ui.notify(orchestrator.statusBarText(), "info");
+      ctx.ui.notify(orchestrator.statusBarText(orchestrator.configForContext(ctx)), "info");
     },
   });
 
   pi.registerCommand("linear-cleanup", {
     description: "Clean tmux windows and wt worktrees. Usage: /linear-cleanup to pick a running worker, or /linear-cleanup [done|all|CRM-123]",
     getArgumentCompletions: (prefix) => {
-      const workers = orchestrator.listWorkers();
+      const workers = orchestrator.listWorkers(undefined, readConfig(process.cwd()));
       return ["done", "all", ...workers.map((worker) => worker.identifier), ...workers.map((worker) => worker.branch)]
         .filter((x) => x.startsWith(prefix))
         .map((value) => ({ value, label: value }));
@@ -960,7 +1000,7 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   pi.registerCommand("linear-status", {
     description: "Show Linear Pi worker state",
     handler: async (_args, ctx) => {
-      const state = readState();
+      const state = readState(orchestrator.configForContext(ctx).repoRoot);
       const workers = Object.values(state.workers);
       if (!workers.length) {
         ctx.ui.notify("No Linear Pi workers recorded.", "info");
@@ -976,10 +1016,12 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
 
 async function runDaemon() {
   ensureConfigDir();
-  fs.writeFileSync(PID_PATH, String(process.pid));
+  const config = readConfig(process.env.LINEAR_PI_REPO_ROOT || process.cwd());
+  fs.mkdirSync(repoScopeDir(config.repoRoot), { recursive: true });
+  fs.writeFileSync(pidPath(config.repoRoot), String(process.pid));
   const orchestrator = new LinearPiOrchestrator();
   const cleanup = async () => {
-    fs.rmSync(PID_PATH, { force: true });
+    fs.rmSync(pidPath(config.repoRoot), { force: true });
     await orchestrator.shutdown();
   };
   process.once("SIGTERM", () => void cleanup().finally(() => process.exit(0)));
@@ -990,7 +1032,9 @@ async function runDaemon() {
 if (process.argv.includes("--linear-pi-daemon")) {
   void runDaemon().catch((error) => {
     ensureConfigDir();
-    fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ERROR Daemon failed: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+    const config = readConfig(process.env.LINEAR_PI_REPO_ROOT || process.cwd());
+    fs.mkdirSync(repoScopeDir(config.repoRoot), { recursive: true });
+    fs.appendFileSync(logPath(config.repoRoot), `${new Date().toISOString()} ERROR Daemon failed: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
     process.exit(1);
   });
 }
