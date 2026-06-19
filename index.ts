@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { McpServerManager } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/server-manager.ts";
@@ -64,6 +65,7 @@ const CONFIG_DIR = path.join(os.homedir(), ".pi", "linear-pi");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const STATE_PATH = path.join(CONFIG_DIR, "state.json");
 const LOG_PATH = path.join(CONFIG_DIR, "watch.log");
+const PID_PATH = path.join(CONFIG_DIR, "watch.pid");
 
 function findCompatibleNodeBinDir(): string {
   if (process.env.LINEAR_PI_NODE_BIN_DIR) return process.env.LINEAR_PI_NODE_BIN_DIR;
@@ -157,6 +159,33 @@ function writeState(state: StateFile) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
+function readDaemonPid(): number | undefined {
+  try {
+    const pid = Number(fs.readFileSync(PID_PATH, "utf8").trim());
+    return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isDaemonRunning(): boolean {
+  const pid = readDaemonPid();
+  return Boolean(pid && isPidRunning(pid));
+}
+
+function tsxBinPath(): string {
+  return process.env.LINEAR_PI_TSX_BIN || path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", ".bin", "tsx");
+}
+
 function slugify(input: string, max = 64): string {
   return input
     .toLowerCase()
@@ -199,7 +228,7 @@ class LinearPiOrchestrator {
     } catch {
       // Keep in-memory/status logging working even if file logging is unavailable.
     }
-    ctx?.ui?.setStatus?.("linear-watch", level === "error" ? "Linear watch: error" : this.timer ? "Linear watch: running" : "Linear watch: stopped");
+    ctx?.ui?.setStatus?.("linear-watch", level === "error" ? "Linear watch: error" : this.isWatching() ? "Linear watch: running" : "Linear watch: stopped");
     ctx?.ui?.setWidget?.("linear-watch", ["Linear watch", ...this.logs.slice(-12)]);
   }
 
@@ -211,6 +240,7 @@ class LinearPiOrchestrator {
     const workers = this.listWorkers("running");
     const lines = [
       `Linear watcher: ${this.isWatching() ? "running" : "stopped"}`,
+      `Daemon pid: ${this.daemonPidSummary()}`,
       `Label: ${config.triggerLabel}`,
       `Repo: ${config.repoRoot}`,
       `Interval: ${config.pollIntervalMs}ms`,
@@ -222,6 +252,12 @@ class LinearPiOrchestrator {
     ];
     if (includeRecentLogs) lines.push("", "Recent logs:", this.getLogs());
     return lines.join("\n");
+  }
+
+  private daemonPidSummary(): string {
+    const pid = readDaemonPid();
+    if (!pid) return "none";
+    return isPidRunning(pid) ? String(pid) : `${pid} (stale)`;
   }
 
   async shutdown() {
@@ -237,10 +273,40 @@ class LinearPiOrchestrator {
   }
 
   isWatching() {
-    return Boolean(this.timer);
+    return Boolean(this.timer) || isDaemonRunning();
   }
 
-  startWatch(ctx: ExtensionContext, label?: string) {
+  startDaemon(ctx: ExtensionContext, label?: string): string {
+    if (label) setTriggerLabel(label);
+    const config = this.configForContext(ctx);
+    const pid = readDaemonPid();
+    if (pid && isPidRunning(pid)) return this.statusSummary(config);
+
+    ensureConfigDir();
+    const out = fs.openSync(LOG_PATH, "a");
+    const command = tsxBinPath();
+    if (!fs.existsSync(command)) throw new Error(`Cannot start watcher daemon: tsx not found at ${command}. Set LINEAR_PI_TSX_BIN to override.`);
+    const child = spawn(command, [fileURLToPath(import.meta.url), "--linear-pi-daemon"], {
+      cwd: config.repoRoot,
+      detached: true,
+      stdio: ["ignore", out, out],
+      env: { ...process.env, LINEAR_PI_DAEMON: "1" },
+    });
+    child.unref();
+    fs.writeFileSync(PID_PATH, String(child.pid));
+    this.log(ctx, `Started daemon watcher pid ${child.pid}.`);
+    return this.statusSummary(config);
+  }
+
+  stopDaemon(): string | undefined {
+    const pid = readDaemonPid();
+    if (!pid) return undefined;
+    if (isPidRunning(pid)) process.kill(pid, "SIGTERM");
+    fs.rmSync(PID_PATH, { force: true });
+    return `Stopped daemon watcher pid ${pid}.`;
+  }
+
+  startWatch(ctx?: ExtensionContext, label?: string) {
     if (label) setTriggerLabel(label);
     const config = this.configForContext(ctx);
     if (this.timer) {
@@ -253,13 +319,13 @@ class LinearPiOrchestrator {
       void this.watchOnce(ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         this.log(ctx, `Watch tick failed: ${message}`, "error");
-        ctx.ui?.notify?.(`Linear watch failed: ${message}`, "error");
+        ctx?.ui?.notify?.(`Linear watch failed: ${message}`, "error");
       });
     }, config.pollIntervalMs);
     void this.watchOnce(ctx);
   }
 
-  async watchOnce(ctx: ExtensionContext, label?: string): Promise<string> {
+  async watchOnce(ctx?: ExtensionContext, label?: string): Promise<string> {
     if (label) {
       const config = setTriggerLabel(label);
       this.log(ctx, `Updated watched label to ${config.triggerLabel}.`);
@@ -728,8 +794,8 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("linear-watch", {
-    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | once [label] | stop | status | logs",
-    getArgumentCompletions: (prefix) => ["start", "stop", "once", "status", "logs"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
+    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | foreground [label] | once [label] | stop | status | logs",
+    getArgumentCompletions: (prefix) => ["start", "foreground", "stop", "once", "status", "logs"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const [action = "status", maybeLabel] = args.trim().split(/\s+/).filter(Boolean);
       if (action === "start") {
@@ -737,13 +803,18 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
           ctx.ui.notify("Refusing to start watcher in a spawned worker session.", "warning");
           return;
         }
+        ctx.ui.notify(orchestrator.startDaemon(ctx, maybeLabel), "info");
+        return;
+      }
+      if (action === "foreground") {
         orchestrator.startWatch(ctx, maybeLabel);
         ctx.ui.notify(orchestrator.statusSummary(), "info");
         return;
       }
       if (action === "stop") {
+        const daemonMessage = orchestrator.stopDaemon();
         orchestrator.stopWatch(ctx);
-        ctx.ui.notify("Linear watcher stopped.", "info");
+        ctx.ui.notify(daemonMessage || "Linear watcher stopped.", "info");
         return;
       }
       if (action === "once") {
@@ -793,5 +864,26 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
         .join("\n\n");
       ctx.ui.notify(text, "info");
     },
+  });
+}
+
+async function runDaemon() {
+  ensureConfigDir();
+  fs.writeFileSync(PID_PATH, String(process.pid));
+  const orchestrator = new LinearPiOrchestrator();
+  const cleanup = async () => {
+    fs.rmSync(PID_PATH, { force: true });
+    await orchestrator.shutdown();
+  };
+  process.once("SIGTERM", () => void cleanup().finally(() => process.exit(0)));
+  process.once("SIGINT", () => void cleanup().finally(() => process.exit(0)));
+  orchestrator.startWatch(undefined);
+}
+
+if (process.argv.includes("--linear-pi-daemon")) {
+  void runDaemon().catch((error) => {
+    ensureConfigDir();
+    fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ERROR Daemon failed: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+    process.exit(1);
   });
 }

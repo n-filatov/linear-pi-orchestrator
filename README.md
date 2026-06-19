@@ -18,9 +18,10 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 ## Commands
 
 - `/linear-start CRM-123` — start one worker manually.
-- `/linear-watch start` — poll Linear for issues with the configured label and start workers.
-- `/linear-watch start pi:frontend` — set watched label to `pi:frontend` and start polling.
-- `/linear-watch stop` — stop polling.
+- `/linear-watch start` — start a detached background watcher daemon for issues with the configured label.
+- `/linear-watch start pi:frontend` — set watched label to `pi:frontend` and start the background watcher daemon.
+- `/linear-watch foreground pi:frontend` — run the watcher in the current Pi process instead of the daemon.
+- `/linear-watch stop` — stop the foreground watcher and daemon.
 - `/linear-watch once` — run one polling tick.
 - `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
 - `/linear-watch status` — show watcher state/config paths and recent logs.
@@ -37,6 +38,8 @@ First use creates:
 
 - config: `~/.pi/linear-pi/config.json`
 - state: `~/.pi/linear-pi/state.json`
+- logs: `~/.pi/linear-pi/watch.log`
+- daemon pid: `~/.pi/linear-pi/watch.pid`
 
 ## Cleanup behavior
 
@@ -59,7 +62,7 @@ You can change the watched label from Pi:
 /linear-watch once pi:backend
 ```
 
-`/linear-watch status` also prints the currently watched label, required assignee, poll interval, config/state paths, and recent logs. While the watcher runs, it updates a `Linear watch` widget/status with the last polling events so you can see what it is doing.
+`/linear-watch start` runs as a detached daemon by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints the daemon pid, currently watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. While a foreground watcher runs, it also updates a `Linear watch` widget/status with the last polling events.
 
 For each issue it:
 
