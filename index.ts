@@ -29,6 +29,7 @@ type WorkerState = {
   title: string;
   branch: string;
   worktree: string;
+  repoRoot?: string;
   tmuxSession: string;
   tmuxWindow: string;
   tmuxWindowIndex?: string;
@@ -339,9 +340,16 @@ class LinearPiOrchestrator {
       await this.killTmuxWindow(worker).catch((error) => {
         ctx?.ui?.notify?.(`Failed to kill tmux window for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
       });
-      await this.removeWorktree(worker).catch((error) => {
-        ctx?.ui?.notify?.(`Failed to remove worktree for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
-      });
+
+      try {
+        await this.removeWorktree(worker, config);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx?.ui?.notify?.(`Failed to remove worktree/branch for ${worker.identifier}: ${message}`, "warning");
+        skipped.push(`${worker.identifier} (cleanup failed: ${message})`);
+        continue;
+      }
+
       delete state.workers[worker.identifier];
       cleaned.push(worker.identifier);
     }
@@ -382,12 +390,43 @@ class LinearPiOrchestrator {
     }
   }
 
-  private async removeWorktree(worker: WorkerState): Promise<void> {
-    if (!worker.branch) return;
-    await execFileAsync("wt", ["remove", worker.branch, "--force", "-D", "--foreground", "-y", "--no-hooks"], {
-      cwd: readConfig().repoRoot,
-      maxBuffer: 1024 * 1024,
-    });
+  private async removeWorktree(worker: WorkerState, config: Config): Promise<void> {
+    const cwd = this.cleanupRepoRoot(worker, config);
+    const target = worker.branch || (worker.worktree && fs.existsSync(worker.worktree) ? worker.worktree : "");
+    if (!target) return;
+
+    const wtArgs = ["-C", cwd, "remove", target, "--force", "-D", "--foreground", "-y", "--no-hooks"];
+    const wtRemoved = await execFileAsync("wt", wtArgs, { maxBuffer: 1024 * 1024 })
+      .then(() => true)
+      .catch(() => false);
+    if (wtRemoved) return;
+
+    // Fallback for stale records or older wt behavior: remove the git worktree by path
+    // and force-delete the branch explicitly. Keep state if either critical step fails.
+    if (worker.worktree && fs.existsSync(worker.worktree)) {
+      await execFileAsync("git", ["worktree", "remove", "--force", worker.worktree], { cwd, maxBuffer: 1024 * 1024 });
+    }
+    if (worker.branch && await this.localBranchExists(cwd, worker.branch)) {
+      await execFileAsync("git", ["branch", "-D", worker.branch], { cwd, maxBuffer: 1024 * 1024 });
+    }
+  }
+
+  private cleanupRepoRoot(worker: WorkerState, config: Config): string {
+    if (worker.repoRoot && fs.existsSync(worker.repoRoot)) return worker.repoRoot;
+    if (worker.worktree && fs.existsSync(worker.worktree)) {
+      try {
+        return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: worker.worktree, encoding: "utf8" }).trim();
+      } catch {
+        // Fall through to configured repo root.
+      }
+    }
+    return config.repoRoot;
+  }
+
+  private async localBranchExists(repoRoot: string, branch: string): Promise<boolean> {
+    return execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repoRoot })
+      .then(() => true)
+      .catch(() => false);
   }
 
   async startIssue(issueId: string, ctx?: ExtensionContext, providedConfig?: Config): Promise<WorkerState> {
@@ -413,6 +452,7 @@ class LinearPiOrchestrator {
         title: issue.title,
         branch,
         worktree,
+        repoRoot: config.repoRoot,
         tmuxSession: config.tmuxSession,
         tmuxWindow: windowName,
         tmuxWindowIndex: index,
@@ -432,6 +472,7 @@ class LinearPiOrchestrator {
         title: issue.title,
         branch,
         worktree: "",
+        repoRoot: config.repoRoot,
         tmuxSession: config.tmuxSession,
         tmuxWindow: windowName,
         status: "failed",
@@ -526,7 +567,7 @@ class LinearPiOrchestrator {
     const args = ["switch"];
     if (!branchExists) args.push("--create");
     args.push(branch);
-    if (!branchExists) args.push("--base", config.baseBranch);
+    if (!branchExists) args.push("--base", await this.resolveBaseBranch(config));
     args.push("--format", "json", "-y");
 
     const { stdout } = await execFileAsync("wt", args, { cwd: config.repoRoot, maxBuffer: 1024 * 1024 });
@@ -539,6 +580,28 @@ class LinearPiOrchestrator {
     const match = Array.isArray(entries) ? entries.find((entry) => entry.branch === branch) : undefined;
     if (match?.path) return match.path;
     throw new Error(`Created/switched branch ${branch}, but could not resolve worktree path.`);
+  }
+
+  private async resolveBaseBranch(config: Config): Promise<string> {
+    const candidates = [
+      config.baseBranch,
+      await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { cwd: config.repoRoot, encoding: "utf8" })
+        .then(({ stdout }) => stdout.trim())
+        .catch(() => ""),
+      "origin/main",
+      "origin/master",
+      "main",
+      "master",
+    ].filter(Boolean);
+
+    for (const candidate of Array.from(new Set(candidates))) {
+      const exists = await execFileAsync("git", ["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`], { cwd: config.repoRoot })
+        .then(() => true)
+        .catch(() => false);
+      if (exists) return candidate;
+    }
+
+    throw new Error(`Could not resolve base branch. Tried: ${candidates.join(", ")}`);
   }
 
   private async startTmuxPi(config: Config, windowName: string, worktree: string, issueId: string, promptPath: string): Promise<{ index: string }> {
