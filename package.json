@@ -17,5 +17,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "pi-mcp-adapter": "^2.10.0"
   }
 }
