@@ -600,7 +600,11 @@ class LinearPiOrchestrator {
     if (worker.repoRoot && fs.existsSync(worker.repoRoot)) return worker.repoRoot;
     if (worker.worktree && fs.existsSync(worker.worktree)) {
       try {
-        return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: worker.worktree, encoding: "utf8" }).trim();
+        return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+          cwd: worker.worktree,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
       } catch {
         // Fall through to configured repo root.
       }
@@ -688,7 +692,11 @@ class LinearPiOrchestrator {
   private resolveRepoRoot(cwd?: string): string | undefined {
     if (!cwd) return undefined;
     try {
-      return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+      return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
     } catch {
       return cwd;
     }
