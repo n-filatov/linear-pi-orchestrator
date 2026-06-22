@@ -12,6 +12,13 @@ import type { ServerEntry } from "pi-mcp-adapter/types.ts";
 
 const execFileAsync = promisify(execFile);
 
+type LinearAttachment = {
+  id: string;
+  title?: string;
+  subtitle?: string;
+  url?: string;
+};
+
 type LinearIssue = {
   id: string;
   title: string;
@@ -24,6 +31,13 @@ type LinearIssue = {
   assignee?: string | { id?: string; name?: string; email?: string; displayName?: string } | null;
   assigneeId?: string | null;
   team?: string;
+  attachments?: LinearAttachment[];
+};
+
+type WorkerPromptAttachment = LinearAttachment & {
+  localPath?: string;
+  contentPreview?: string;
+  error?: string;
 };
 
 type WorkerState = {
@@ -265,7 +279,11 @@ function parseMcpJson<T>(result: any): T {
     .join("\n")
     .trim();
   if (!text) return result as T;
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text as T;
+  }
 }
 
 class LinearPiOrchestrator {
@@ -632,8 +650,9 @@ class LinearPiOrchestrator {
 
     try {
       const worktree = await this.ensureWorktree(config, branch);
+      const attachments = await this.collectIssueAttachments(issue, worktree, config);
       const promptPath = path.join(worktree, ".pi-linear-prompt.md");
-      fs.writeFileSync(promptPath, buildWorkerPrompt(issue, branch, worktree));
+      fs.writeFileSync(promptPath, buildWorkerPrompt(issue, branch, worktree, attachments));
 
       const { index } = await this.startTmuxPi(config, windowName, worktree, identifier, promptPath);
       const worker: WorkerState = {
@@ -725,7 +744,60 @@ class LinearPiOrchestrator {
     }
   }
 
-  private async callLinear<T>(toolName: string, args: Record<string, unknown>, providedConfig?: Config): Promise<T> {
+  private async collectIssueAttachments(issue: LinearIssue, worktree: string, config: Config): Promise<WorkerPromptAttachment[]> {
+    const attachments = issue.attachments || [];
+    const inlineImageUrls = extractMarkdownImageUrls(issue.description);
+    if (!attachments.length && !inlineImageUrls.length) return [];
+
+    const dir = path.join(worktree, ".pi-linear-attachments");
+    fs.mkdirSync(dir, { recursive: true });
+
+    const collected: WorkerPromptAttachment[] = [];
+    if (inlineImageUrls.length) {
+      try {
+        const result = await this.callLinearToolResult("extract_images", { markdown: issue.description || "" }, config);
+        const images = (result?.content || []).filter((part: any) => part?.type === "image" && typeof part.data === "string");
+        images.forEach((part: any, index: number) => {
+          const extension = extensionForMimeType(part.mimeType);
+          const filePath = path.join(dir, `inline-image-${index + 1}${extension}`);
+          fs.writeFileSync(filePath, Buffer.from(part.data, "base64"));
+          collected.push({
+            id: `inline-image-${index + 1}`,
+            title: `Inline image ${index + 1}`,
+            url: inlineImageUrls[index],
+            localPath: filePath,
+            contentPreview: `Saved embedded Linear description image to ${filePath}`,
+          });
+        });
+      } catch (error) {
+        collected.push({
+          id: "inline-images",
+          title: "Inline images from description",
+          contentPreview: inlineImageUrls.map((url) => `- ${url}`).join("\n"),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const attachment of attachments) {
+      const item: WorkerPromptAttachment = { ...attachment };
+      try {
+        const content = await this.callLinear<unknown>("get_attachment", { id: attachment.id }, config);
+        const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+        const fileName = `${slugify(attachment.title || attachment.id, 80)}${extensionForAttachmentContent(text)}`;
+        const filePath = path.join(dir, fileName);
+        fs.writeFileSync(filePath, text);
+        item.localPath = filePath;
+        item.contentPreview = text.slice(0, 12_000);
+      } catch (error) {
+        item.error = error instanceof Error ? error.message : String(error);
+      }
+      collected.push(item);
+    }
+    return collected;
+  }
+
+  private async callLinearToolResult(toolName: string, args: Record<string, unknown>, providedConfig?: Config): Promise<any> {
     const config = providedConfig ?? readConfig();
     const mcpConfig = loadMcpConfig(undefined, config.repoRoot);
     const definition = mcpConfig.mcpServers[config.mcpServer] as ServerEntry | undefined;
@@ -745,11 +817,15 @@ class LinearPiOrchestrator {
     try {
       const result = await connection.client.callTool({ name: originalName, arguments: args });
       if ((result as any).isError) throw new Error(JSON.stringify(result));
-      return parseMcpJson<T>(result);
+      return result;
     } finally {
       this.manager.decrementInFlight(config.mcpServer);
       this.manager.touch(config.mcpServer);
     }
+  }
+
+  private async callLinear<T>(toolName: string, args: Record<string, unknown>, providedConfig?: Config): Promise<T> {
+    return parseMcpJson<T>(await this.callLinearToolResult(toolName, args, providedConfig));
   }
 
   private async ensureWorktree(config: Config, branch: string): Promise<string> {
@@ -847,7 +923,50 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function buildWorkerPrompt(issue: LinearIssue, branch: string, worktree: string): string {
+function extensionForAttachmentContent(content: string): string {
+  const trimmed = content.trimStart().toLowerCase();
+  if (trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html")) return ".html";
+  if (trimmed.startsWith("#") || trimmed.includes("\n## ")) return ".md";
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return ".json";
+  return ".txt";
+}
+
+function extensionForMimeType(mimeType?: string): string {
+  if (mimeType === "image/jpeg") return ".jpg";
+  if (mimeType === "image/gif") return ".gif";
+  if (mimeType === "image/webp") return ".webp";
+  if (mimeType === "image/svg+xml") return ".svg";
+  return ".png";
+}
+
+function extractMarkdownImageUrls(markdown?: string): string[] {
+  if (!markdown) return [];
+  const urls = new Set<string>();
+  const imagePattern = /!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g;
+  for (const match of markdown.matchAll(imagePattern)) urls.add(match[1].replace(/^<|>$/g, ""));
+  return Array.from(urls);
+}
+
+function formatWorkerPromptAttachments(attachments: WorkerPromptAttachment[]): string {
+  if (!attachments.length) return "No separate Linear attachments returned by Linear MCP.";
+  return attachments.map((attachment, index) => {
+    const lines = [
+      `### Attachment ${index + 1}: ${attachment.title || attachment.id}`,
+      `- id: ${attachment.id}`,
+      attachment.subtitle ? `- subtitle: ${attachment.subtitle}` : undefined,
+      attachment.url ? `- url: ${attachment.url}` : undefined,
+      attachment.localPath ? `- saved file: ${attachment.localPath}` : undefined,
+      attachment.error ? `- fetch error: ${attachment.error}` : undefined,
+    ].filter(Boolean) as string[];
+    if (attachment.contentPreview) {
+      lines.push("", "Content preview:", "```", attachment.contentPreview, attachment.contentPreview.length >= 12_000 ? "\n[truncated; read the saved file for full content]" : "", "```");
+    }
+    return lines.join("\n");
+  }).join("\n\n");
+}
+
+function buildWorkerPrompt(issue: LinearIssue, branch: string, worktree: string, attachments: WorkerPromptAttachment[] = []): string {
+  const inlineImageUrls = extractMarkdownImageUrls(issue.description);
   return `You are implementing Linear issue ${issue.id}.
 
 Title:
@@ -858,6 +977,12 @@ ${issue.description || "(no description)"}
 
 URL:
 ${issue.url || "(no url)"}
+
+Inline image URLs found in the description:
+${inlineImageUrls.length ? inlineImageUrls.map((url) => `- ${url}`).join("\n") : "(none)"}
+
+Linear attachments:
+${formatWorkerPromptAttachments(attachments)}
 
 Branch:
 ${branch}
@@ -870,6 +995,8 @@ Instructions:
 - Inspect existing code patterns before editing.
 - Add or update tests when appropriate.
 - Run relevant formatting, linting, typecheck, and tests for affected packages before finishing.
+- Read the Linear attachments saved above before implementing when they are relevant.
+- Inspect inline image URLs from the description when matching UI screenshots.
 - Use Linear MCP tools if you need to reread or update the issue.
 - If blocked, comment on the Linear issue with the blocker and stop.
 `;
