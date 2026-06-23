@@ -48,6 +48,9 @@ type WorkerState = {
   repoRoot?: string;
   tmuxSession: string;
   tmuxWindow: string;
+  /** Stable tmux window id (for example @12). Window indexes can be renumbered. */
+  tmuxWindowId?: string;
+  /** Best-effort display index only. Never use this as an unverified cleanup target. */
   tmuxWindowIndex?: string;
   status: "running" | "failed";
   startedAt: string;
@@ -593,15 +596,60 @@ class LinearPiOrchestrator {
   }
 
   private async killTmuxWindow(worker: WorkerState): Promise<void> {
-    const targets = [
-      worker.tmuxWindowIndex ? `${worker.tmuxSession}:${worker.tmuxWindowIndex}` : undefined,
-      `${worker.tmuxSession}:${worker.tmuxWindow}`,
-    ].filter(Boolean) as string[];
+    const target = await this.resolveTmuxWindowTarget(worker);
+    if (!target) return;
+    await execFileAsync("tmux", ["kill-window", "-t", target]);
+  }
 
-    for (const target of targets) {
-      const ok = await execFileAsync("tmux", ["kill-window", "-t", target]).then(() => true).catch(() => false);
-      if (ok) return;
+  private async resolveTmuxWindowTarget(worker: WorkerState): Promise<string | undefined> {
+    if (worker.tmuxWindowId && await this.tmuxWindowMatches(worker, worker.tmuxWindowId)) {
+      return worker.tmuxWindowId;
     }
+
+    const windows = await this.listTmuxWindows(worker.tmuxSession);
+    const matches = windows.filter((window) => this.tmuxWindowRecordMatches(worker, window));
+    if (matches.length === 1) return matches[0].id;
+
+    // Backward-compatible fallback for old state entries that only stored an index:
+    // use the index only after verifying the current tmux window still has the
+    // expected name and pane cwd. This avoids killing a different worker after
+    // tmux renumbers windows.
+    if (worker.tmuxWindowIndex) {
+      const indexed = windows.find((window) => window.index === worker.tmuxWindowIndex);
+      if (indexed && this.tmuxWindowRecordMatches(worker, indexed)) return indexed.id;
+    }
+
+    return undefined;
+  }
+
+  private async tmuxWindowMatches(worker: WorkerState, target: string): Promise<boolean> {
+    const { stdout } = await execFileAsync("tmux", ["display-message", "-p", "-t", target, "#{session_name}\t#{window_name}\t#{pane_current_path}"], { maxBuffer: 1024 * 1024 })
+      .catch(() => ({ stdout: "" }));
+    const [session, name, cwd] = stdout.trim().split("\t");
+    return this.tmuxWindowRecordMatches(worker, { id: target, index: "", session, name, cwd });
+  }
+
+  private async listTmuxWindows(session: string): Promise<Array<{ id: string; index: string; session: string; name: string; cwd: string }>> {
+    const { stdout } = await execFileAsync("tmux", ["list-windows", "-t", session, "-F", "#{window_id}\t#{window_index}\t#{session_name}\t#{window_name}\t#{pane_current_path}"], { maxBuffer: 1024 * 1024 })
+      .catch(() => ({ stdout: "" }));
+    return stdout
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [id, index, tmuxSession, name, cwd] = line.split("\t");
+        return { id, index, session: tmuxSession, name, cwd };
+      });
+  }
+
+  private tmuxWindowRecordMatches(worker: WorkerState, window: { id?: string; index?: string; session?: string; name?: string; cwd?: string }): boolean {
+    if (window.session !== worker.tmuxSession) return false;
+    if (window.name !== worker.tmuxWindow) return false;
+
+    const cwd = window.cwd || "";
+    const expectedPaths = [worker.worktree, worker.repoRoot].filter(Boolean) as string[];
+    if (!expectedPaths.length) return true;
+    return expectedPaths.some((expectedPath) => cwd === expectedPath || cwd.startsWith(`${expectedPath}${path.sep}`));
   }
 
   private async removeWorktree(worker: WorkerState, config: Config): Promise<void> {
@@ -665,7 +713,7 @@ class LinearPiOrchestrator {
       const promptPath = path.join(worktree, ".pi-linear-prompt.md");
       fs.writeFileSync(promptPath, buildWorkerPrompt(issue, branch, worktree, attachments));
 
-      const { index } = await this.startTmuxPi(config, windowName, worktree, identifier, promptPath);
+      const { id: tmuxWindowId, index } = await this.startTmuxPi(config, windowName, worktree, identifier, promptPath);
       const worker: WorkerState = {
         identifier,
         title: issue.title,
@@ -674,6 +722,7 @@ class LinearPiOrchestrator {
         repoRoot: config.repoRoot,
         tmuxSession: config.tmuxSession,
         tmuxWindow: windowName,
+        tmuxWindowId,
         tmuxWindowIndex: index,
         status: "running",
         startedAt: new Date().toISOString(),
@@ -884,7 +933,7 @@ class LinearPiOrchestrator {
     throw new Error(`Could not resolve base branch. Tried: ${candidates.join(", ")}`);
   }
 
-  private async startTmuxPi(config: Config, windowName: string, worktree: string, issueId: string, promptPath: string): Promise<{ index: string }> {
+  private async startTmuxPi(config: Config, windowName: string, worktree: string, issueId: string, promptPath: string): Promise<{ id?: string; index: string }> {
     await execFileAsync("tmux", ["has-session", "-t", config.tmuxSession]).catch(async () => {
       await execFileAsync("tmux", ["new-session", "-d", "-s", config.tmuxSession, "-n", "anchor"]);
     });
@@ -899,14 +948,17 @@ class LinearPiOrchestrator {
     while (windows.includes(index)) index++;
 
     const shellCommand = `export PATH=${shellQuote(config.nodeBinDir)}:\$PATH; LINEAR_PI_WORKER=1 ${shellQuote(config.piCommand)} --name ${shellQuote(issueId)} "$(cat ${shellQuote(promptPath)})"; exec \${SHELL:-zsh} -l`;
-    await execFileAsync("tmux", [
+    const { stdout } = await execFileAsync("tmux", [
       "new-window",
+      "-P",
+      "-F", "#{window_id}\t#{window_index}",
       "-t", `${config.tmuxSession}:${index}`,
       "-n", windowName,
       "-c", worktree,
       `bash -lc ${shellQuote(shellCommand)}`,
     ]);
-    return { index: String(index) };
+    const [id, actualIndex] = stdout.trim().split("\t");
+    return { id, index: actualIndex || String(index) };
   }
 
   private async markLinearRunning(config: Config, issue: LinearIssue, worker: WorkerState) {
