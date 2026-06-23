@@ -6,9 +6,9 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { McpServerManager } from "pi-mcp-adapter/server-manager.ts";
-import { loadMcpConfig } from "pi-mcp-adapter/config.ts";
-import type { ServerEntry } from "pi-mcp-adapter/types.ts";
+import { McpServerManager } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/server-manager.ts";
+import { loadMcpConfig } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/config.ts";
+import type { ServerEntry } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/types.ts";
 
 const execFileAsync = promisify(execFile);
 
