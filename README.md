@@ -46,7 +46,7 @@ First use creates a global defaults file plus per-repository runtime files:
 
 `/linear-cleanup done` checks recorded workers for the current repository, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
 
-For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, removes the trigger/running labels from Linear so the watcher does not immediately recreate it, and removes the worker from local state. When cleaning a done/canceled issue, it also ensures the `pi:done` label is present.
+For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, removes the trigger/running labels from Linear so the watcher does not immediately recreate it, and removes the worker from local state. When cleaning a done/canceled issue, it also ensures the `pi:done` label is present. After the last recorded worker is cleaned, the repo-scoped temp folder under `~/.pi/linear-pi/repos/` is removed when the watcher is not running.
 
 ## Default behavior
 
@@ -62,6 +62,8 @@ You can change the watched label from Pi:
 ```
 
 `/linear-watch start` runs as a detached daemon for the current repository by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints that repo's daemon pid, watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. The footer status item is enabled per repo by default and can be controlled with `/linear-watch-bar on|off|toggle|status|refresh`; it shows compact current-repo daemon/worker state such as `Linear: 🟢 frontend daemon 12345 · 2 workers`.
+
+When a Linear description contains markdown images, the worker prompt keeps those images in the description and adds a local saved-file reference next to each image. The same files are also listed in the Linear attachments section for quick lookup.
 
 For each issue it:
 

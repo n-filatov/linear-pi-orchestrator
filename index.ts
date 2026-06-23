@@ -201,6 +201,16 @@ function writeState(state: StateFile, repoRoot = readConfig().repoRoot) {
   fs.writeFileSync(statePath(repoRoot), JSON.stringify(state, null, 2));
 }
 
+function removeRepoScopeDirIfUnused(repoRoot: string): boolean {
+  const state = readState(repoRoot);
+  if (Object.keys(state.workers).length > 0 || isDaemonRunning(repoRoot)) return false;
+
+  const scopedDir = repoScopeDir(repoRoot);
+  if (!fs.existsSync(scopedDir)) return false;
+  fs.rmSync(scopedDir, { recursive: true, force: true });
+  return true;
+}
+
 function readDaemonPid(repoRoot = readConfig().repoRoot): number | undefined {
   try {
     const pid = Number(fs.readFileSync(pidPath(repoRoot), "utf8").trim());
@@ -547,6 +557,7 @@ class LinearPiOrchestrator {
     }
 
     writeState(state, config.repoRoot);
+    const removedRepoScopeDir = cleaned.length > 0 && !this.isWatching(config) && removeRepoScopeDirIfUnused(config.repoRoot);
     if (!cleaned.length) {
       return normalized === "done"
         ? `No done workers found. Skipped: ${skipped.join(", ") || "none"}`
@@ -554,7 +565,7 @@ class LinearPiOrchestrator {
           ? `No workers cleaned. Skipped: ${skipped.join(", ")}`
           : `No matching workers found for "${normalized}".`;
     }
-    return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}${skipped.length ? `\nSkipped: ${skipped.join(", ")}` : ""}`;
+    return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}${skipped.length ? `\nSkipped: ${skipped.join(", ")}` : ""}${removedRepoScopeDir ? `\nRemoved repo temp folder: ${repoScopeDir(config.repoRoot)}` : ""}`;
   }
 
   private formatWorkerChoice(worker: WorkerState): string {
@@ -947,7 +958,32 @@ function extractMarkdownImageUrls(markdown?: string): string[] {
   return Array.from(urls);
 }
 
-function formatWorkerPromptAttachments(attachments: WorkerPromptAttachment[]): string {
+function pathForPrompt(filePath: string, worktree: string): string {
+  const relativePath = path.relative(worktree, filePath);
+  return relativePath.startsWith("..") ? filePath : relativePath;
+}
+
+function markdownWithLocalImageReferences(markdown: string | undefined, attachments: WorkerPromptAttachment[], worktree: string): string {
+  if (!markdown) return "(no description)";
+
+  const imageAttachmentsByUrl = new Map(
+    attachments
+      .filter((attachment) => attachment.url && attachment.localPath && attachment.localPath.match(/\.(png|jpe?g|gif|webp|svg)$/i))
+      .map((attachment) => [attachment.url!, attachment]),
+  );
+  if (!imageAttachmentsByUrl.size) return markdown;
+
+  const imagePattern = /!\[([^\]]*)\]\((<[^>]+>|[^\s)]+)([^)]*)\)/g;
+  return markdown.replace(imagePattern, (fullMatch, _alt: string, rawUrl: string) => {
+    const url = rawUrl.replace(/^<|>$/g, "");
+    const attachment = imageAttachmentsByUrl.get(url);
+    if (!attachment?.localPath) return fullMatch;
+
+    return `${fullMatch}\n\n> Local image file: \`${pathForPrompt(attachment.localPath, worktree)}\` (${attachment.id})\n`;
+  });
+}
+
+function formatWorkerPromptAttachments(attachments: WorkerPromptAttachment[], worktree: string): string {
   if (!attachments.length) return "No separate Linear attachments returned by Linear MCP.";
   return attachments.map((attachment, index) => {
     const lines = [
@@ -955,7 +991,7 @@ function formatWorkerPromptAttachments(attachments: WorkerPromptAttachment[]): s
       `- id: ${attachment.id}`,
       attachment.subtitle ? `- subtitle: ${attachment.subtitle}` : undefined,
       attachment.url ? `- url: ${attachment.url}` : undefined,
-      attachment.localPath ? `- saved file: ${attachment.localPath}` : undefined,
+      attachment.localPath ? `- saved file: ${pathForPrompt(attachment.localPath, worktree)}` : undefined,
       attachment.error ? `- fetch error: ${attachment.error}` : undefined,
     ].filter(Boolean) as string[];
     if (attachment.contentPreview) {
@@ -967,13 +1003,14 @@ function formatWorkerPromptAttachments(attachments: WorkerPromptAttachment[]): s
 
 function buildWorkerPrompt(issue: LinearIssue, branch: string, worktree: string, attachments: WorkerPromptAttachment[] = []): string {
   const inlineImageUrls = extractMarkdownImageUrls(issue.description);
+  const description = markdownWithLocalImageReferences(issue.description, attachments, worktree);
   return `You are implementing Linear issue ${issue.id}.
 
 Title:
 ${issue.title}
 
 Description:
-${issue.description || "(no description)"}
+${description}
 
 URL:
 ${issue.url || "(no url)"}
@@ -982,7 +1019,7 @@ Inline image URLs found in the description:
 ${inlineImageUrls.length ? inlineImageUrls.map((url) => `- ${url}`).join("\n") : "(none)"}
 
 Linear attachments:
-${formatWorkerPromptAttachments(attachments)}
+${formatWorkerPromptAttachments(attachments, worktree)}
 
 Branch:
 ${branch}
