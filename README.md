@@ -24,6 +24,8 @@ You can also install it as a Pi package from this repo once it is pushed to GitH
 - `/linear-watch stop` — stop the foreground watcher and this repo's daemon.
 - `/linear-watch once` — run one polling tick.
 - `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
+- `/linear-watch model` — open a picker to choose which agent CLI runs in each worker (`pi`, `claude`, `codex`, `opencode`). Defaults to `pi`.
+- `/linear-watch model claude` — set the worker agent directly (also `codex`, `opencode`, `pi`). Persisted in the repo's watcher config.
 - `/linear-watch status` — show watcher state/config paths and recent logs.
 - `/linear-watch logs` — show recent watcher logs.
 - `/linear-watch-bar on|off|toggle|status|refresh` — control the footer status item (`Linear: ...`).
@@ -81,6 +83,8 @@ For each issue it:
 - `LINEAR_PI_REPO_ROOT=/Users/nikita.filatov/Development/frontend` (initial/default value; commands update this to the active Pi session's git root)
 - `LINEAR_PI_BASE_BRANCH=origin/main`
 - `LINEAR_PI_BRANCH_PREFIX=feat`
+- `LINEAR_PI_AGENT=pi` (worker agent CLI: `pi`, `claude`, `codex`, or `opencode`; persisted via `/linear-watch model`)
+- `LINEAR_PI_AGENT_COMMAND` (override the binary used for the selected agent, e.g. an absolute path)
 - `LINEAR_PI_NODE_BIN_DIR=/Users/nikita.filatov/.local/share/nvm/v23.11.1/bin`
 - `LINEAR_PI_POLL_INTERVAL_MS=30000`
 - `LINEAR_PI_REQUIRE_ASSIGNEE_ME=true`
