@@ -71,6 +71,7 @@ type Config = {
   baseBranch: string;
   branchPrefix: string;
   piCommand: string;
+  agent: string;
   nodeBinDir: string;
   issueLimit: number;
   requireAssigneeMe: boolean;
@@ -131,6 +132,7 @@ function defaultConfig(repoRoot = process.env.LINEAR_PI_REPO_ROOT || process.cwd
     baseBranch: process.env.LINEAR_PI_BASE_BRANCH || "origin/main",
     branchPrefix: process.env.LINEAR_PI_BRANCH_PREFIX || "feat",
     piCommand: process.env.LINEAR_PI_PI_COMMAND || "pi",
+    agent: (process.env.LINEAR_PI_AGENT || "pi").toLowerCase(),
     nodeBinDir: findCompatibleNodeBinDir(),
     issueLimit: Number(process.env.LINEAR_PI_ISSUE_LIMIT || 50),
     requireAssigneeMe: process.env.LINEAR_PI_REQUIRE_ASSIGNEE_ME !== "false",
@@ -153,6 +155,7 @@ function repoScopeDir(repoRoot: string): string {
 
 function configPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "config.json"); }
 function statePath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "state.json"); }
+function lockPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "state.lock"); }
 function logPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch.log"); }
 function pidPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch.pid"); }
 function barPrefPath(repoRoot: string): string { return path.join(repoScopeDir(repoRoot), "watch-bar.json"); }
@@ -191,6 +194,62 @@ function setTriggerLabel(label: string, repoRoot?: string): Config {
   return config;
 }
 
+type AgentPreset = {
+  id: string;
+  label: string;
+  defaultCommand: string;
+  buildInvocation: (binary: string, issueId: string, quotedPromptPath: string) => string;
+};
+
+const DEFAULT_AGENT = "pi";
+
+const AGENT_PRESETS: Record<string, AgentPreset> = {
+  pi: {
+    id: "pi",
+    label: "Pi",
+    defaultCommand: "pi",
+    buildInvocation: (binary, issueId, prompt) => `${shellQuote(binary)} --name ${shellQuote(issueId)} "$(cat ${prompt})"`,
+  },
+  claude: {
+    id: "claude",
+    label: "Claude Code",
+    defaultCommand: "claude",
+    buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} "$(cat ${prompt})"`,
+  },
+  codex: {
+    id: "codex",
+    label: "Codex",
+    defaultCommand: "codex",
+    buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} "$(cat ${prompt})"`,
+  },
+  opencode: {
+    id: "opencode",
+    label: "OpenCode",
+    defaultCommand: "opencode",
+    buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} run "$(cat ${prompt})"`,
+  },
+};
+
+function resolveAgentPreset(agent: string | undefined): AgentPreset {
+  const key = (agent || DEFAULT_AGENT).toLowerCase();
+  return AGENT_PRESETS[key] || AGENT_PRESETS[DEFAULT_AGENT];
+}
+
+function resolveAgentBinary(config: Config, preset: AgentPreset): string {
+  if (process.env.LINEAR_PI_AGENT_COMMAND) return process.env.LINEAR_PI_AGENT_COMMAND;
+  // Backward compatibility: piCommand overrides the pi binary when using the pi agent.
+  if (preset.id === "pi" && config.piCommand && config.piCommand !== "pi") return config.piCommand;
+  return preset.defaultCommand;
+}
+
+function setAgent(agent: string, repoRoot?: string): Config {
+  const preset = resolveAgentPreset(agent);
+  const config = readConfig(repoRoot);
+  config.agent = preset.id;
+  writeConfig(config);
+  return config;
+}
+
 function readState(repoRoot = readConfig().repoRoot): StateFile {
   ensureConfigDir();
   const filePath = statePath(repoRoot);
@@ -202,6 +261,41 @@ function writeState(state: StateFile, repoRoot = readConfig().repoRoot) {
   ensureConfigDir();
   fs.mkdirSync(repoScopeDir(repoRoot), { recursive: true });
   fs.writeFileSync(statePath(repoRoot), JSON.stringify(state, null, 2));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withStateLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  ensureConfigDir();
+  fs.mkdirSync(repoScopeDir(repoRoot), { recursive: true });
+  const filePath = lockPath(repoRoot);
+  const staleAfterMs = 20 * 60 * 1000;
+  const deadline = Date.now() + 5 * 60 * 1000;
+
+  while (true) {
+    try {
+      fs.mkdirSync(filePath);
+      fs.writeFileSync(path.join(filePath, "owner.json"), JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2));
+      break;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      const stat = fs.statSync(filePath, { throwIfNoEntry: false });
+      if (stat && Date.now() - stat.mtimeMs > staleAfterMs) {
+        fs.rmSync(filePath, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for Linear Pi state lock: ${filePath}`);
+      await sleep(250);
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    fs.rmSync(filePath, { recursive: true, force: true });
+  }
 }
 
 function removeRepoScopeDirIfUnused(repoRoot: string): boolean {
@@ -331,7 +425,9 @@ class LinearPiOrchestrator {
     const workers = this.listWorkers("running", config).length;
     const pid = readDaemonPid(config.repoRoot);
     const mode = pid && isPidRunning(pid) ? `daemon ${pid}` : "foreground";
-    return `Linear: 🟢 ${path.basename(config.repoRoot)} ${mode}${workers ? ` · ${workers} worker${workers === 1 ? "" : "s"}` : ""}`;
+    const agent = resolveAgentPreset(config.agent);
+    const agentSuffix = agent.id === DEFAULT_AGENT ? "" : ` · ${agent.label}`;
+    return `Linear: 🟢 ${path.basename(config.repoRoot)} ${mode}${workers ? ` · ${workers} worker${workers === 1 ? "" : "s"}` : ""}${agentSuffix}`;
   }
 
   statusSummary(config = readConfig(), includeRecentLogs = false): string {
@@ -340,6 +436,7 @@ class LinearPiOrchestrator {
       `Linear watcher: ${this.isWatching(config) ? "running" : "stopped"}`,
       `Daemon pid: ${this.daemonPidSummary(config)}`,
       `Label: ${config.triggerLabel}`,
+      `Agent: ${resolveAgentPreset(config.agent).label} (${resolveAgentPreset(config.agent).id})`,
       `Repo: ${config.repoRoot}`,
       `Interval: ${config.pollIntervalMs}ms`,
       `Required assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}`,
@@ -644,7 +741,8 @@ class LinearPiOrchestrator {
 
   private tmuxWindowRecordMatches(worker: WorkerState, window: { id?: string; index?: string; session?: string; name?: string; cwd?: string }): boolean {
     if (window.session !== worker.tmuxSession) return false;
-    if (window.name !== worker.tmuxWindow) return false;
+    const windowName = window.name || "";
+    if (windowName !== worker.tmuxWindow && !windowName.startsWith(`${worker.tmuxWindow} `)) return false;
 
     const cwd = window.cwd || "";
     const expectedPaths = [worker.worktree, worker.repoRoot].filter(Boolean) as string[];
@@ -697,6 +795,10 @@ class LinearPiOrchestrator {
 
   async startIssue(issueId: string, ctx?: ExtensionContext, providedConfig?: Config): Promise<WorkerState> {
     const config = providedConfig ?? this.configForContext(ctx);
+    return withStateLock(config.repoRoot, () => this.startIssueLocked(issueId, ctx, config));
+  }
+
+  private async startIssueLocked(issueId: string, ctx: ExtensionContext | undefined, config: Config): Promise<WorkerState> {
     const issue = await this.callLinear<LinearIssue>("get_issue", { id: issueId.trim() }, config);
     const identifier = issue.id || issueId.trim();
     await this.assertIssueCanStart(issue, config, ctx);
@@ -947,7 +1049,10 @@ class LinearPiOrchestrator {
     let index = baseIndex;
     while (windows.includes(index)) index++;
 
-    const shellCommand = `export PATH=${shellQuote(config.nodeBinDir)}:\$PATH; LINEAR_PI_WORKER=1 ${shellQuote(config.piCommand)} --name ${shellQuote(issueId)} "$(cat ${shellQuote(promptPath)})"; exec \${SHELL:-zsh} -l`;
+    const preset = resolveAgentPreset(config.agent);
+    const binary = resolveAgentBinary(config, preset);
+    const agentInvocation = preset.buildInvocation(binary, issueId, shellQuote(promptPath));
+    const shellCommand = `export PATH=${shellQuote(config.nodeBinDir)}:\$PATH; LINEAR_PI_WORKER=1 ${agentInvocation}; exec \${SHELL:-zsh} -l`;
     const { stdout } = await execFileAsync("tmux", [
       "new-window",
       "-P",
@@ -1160,8 +1265,15 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("linear-watch", {
-    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | foreground [label] | once [label] | stop | status | logs",
-    getArgumentCompletions: (prefix) => ["start", "foreground", "stop", "once", "status", "logs"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value })),
+    description: "Manage Linear label watcher. Usage: /linear-watch start [label] | foreground [label] | once [label] | model [pi|claude|codex|opencode] | stop | status | logs",
+    getArgumentCompletions: (prefix) => {
+      const tokens = prefix.split(/\s+/);
+      if (tokens.length > 1 && (tokens[0] === "model" || tokens[0] === "agent")) {
+        const last = tokens[tokens.length - 1];
+        return Object.keys(AGENT_PRESETS).filter((x) => x.startsWith(last)).map((value) => ({ value: `${tokens[0]} ${value}`, label: value }));
+      }
+      return ["start", "foreground", "stop", "once", "model", "status", "logs"].filter((x) => x.startsWith(prefix)).map((value) => ({ value, label: value }));
+    },
     handler: async (args, ctx) => {
       const [action = "status", maybeLabel] = args.trim().split(/\s+/).filter(Boolean);
       if (action === "start") {
@@ -1188,6 +1300,28 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
       }
       if (action === "once") {
         ctx.ui.notify(await orchestrator.watchOnce(ctx, maybeLabel), "info");
+        return;
+      }
+      if (action === "model" || action === "agent") {
+        const config = orchestrator.configForContext(ctx);
+        const presets = Object.values(AGENT_PRESETS);
+        let target = maybeLabel;
+        if (!target) {
+          const choices = presets.map((p) => `${p.label} (${p.id})${p.id === config.agent ? " — current" : ""}`);
+          const selected = await ctx.ui.select("Select agent to run for Linear workers", choices);
+          if (!selected) {
+            ctx.ui.notify(`Agent unchanged: ${resolveAgentPreset(config.agent).label}.`, "info");
+            return;
+          }
+          target = presets[choices.indexOf(selected)].id;
+        }
+        if (!AGENT_PRESETS[target.toLowerCase()]) {
+          ctx.ui.notify(`Unknown agent "${target}". Available: ${Object.keys(AGENT_PRESETS).join(", ")}.`, "error");
+          return;
+        }
+        const updated = setAgent(target, config.repoRoot);
+        refreshWatchBar(ctx);
+        ctx.ui.notify(`Linear worker agent set to ${resolveAgentPreset(updated.agent).label}. Applies to newly started workers; restart a running daemon (/linear-watch stop && start) to pick it up.`, "info");
         return;
       }
       if (action === "logs") {
