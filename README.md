@@ -48,6 +48,8 @@ First use creates a global defaults file plus per-repository runtime files:
 
 `/linear-cleanup done` checks recorded workers for the current repository, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
 
+The extension also auto-cleans done workers during watcher polling and watches successful Linear MCP `save_issue` calls. If an issue with a recorded worker is marked done/canceled or receives `pi:done`, it automatically runs the same cleanup path as `/linear-cleanup` for that worker.
+
 For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, removes the trigger/running labels from Linear so the watcher does not immediately recreate it, and removes the worker from local state. When cleaning a done/canceled issue, it also ensures the `pi:done` label is present. After the last recorded worker is cleaned, the repo-scoped temp folder under `~/.pi/linear-pi/repos/` is removed when the watcher is not running.
 
 ## Default behavior
