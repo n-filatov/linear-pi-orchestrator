@@ -443,6 +443,10 @@ class LinearPiOrchestrator {
     ctx?.ui?.setWidget?.(WATCH_STATUS_KEY, ["Linear watch", ...this.logs.slice(-12)]);
   }
 
+  logMessage(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") {
+    this.log(ctx, message, level);
+  }
+
   getLogs(config = readConfig()): string {
     return this.logs.length ? this.logs.join("\n") : `No Linear watch logs yet. Log file: ${logPath(config.repoRoot)}`;
   }
@@ -566,7 +570,11 @@ class LinearPiOrchestrator {
       const config = tickConfig;
       this.log(ctx, `Polling Linear for label ${config.triggerLabel}${config.requireAssigneeMe ? ` assigned to ${config.watchAssignee}` : ""} in ${config.repoRoot} (limit ${config.issueLimit})...`);
       const cleanupResult = await this.cleanup("done", ctx);
-      if (cleanupResult.startsWith("Cleaned ")) this.log(ctx, `Auto-cleaned done Linear worker(s): ${cleanupResult}`);
+      if (cleanupResult.startsWith("Cleaned ")) {
+        this.log(ctx, `Auto-cleaned done Linear worker(s): ${cleanupResult}`);
+      } else {
+        this.log(ctx, `Auto-cleanup check: ${cleanupResult}`);
+      }
       const listArgs: Record<string, unknown> = {
         label: config.triggerLabel,
         limit: config.issueLimit,
@@ -1306,12 +1314,15 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
     if (event.isError || event.toolName !== "mcp" || details?.mode !== "call" || details?.server !== "linear" || details?.tool !== "save_issue") return;
 
     const inputId = extractLinearSaveIssueInputId(event);
+    if (!inputId) return;
+
     const savedIssue = extractLinearIssueFromToolResult(event);
     const result = await orchestrator.cleanupIfIssueDone(inputId, ctx, savedIssue).catch((error) => {
-      ctx.ui.notify(`Linear issue was updated, but automatic worker cleanup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      orchestrator.logMessage(ctx, `save_issue for ${inputId}: auto-cleanup failed - ${error instanceof Error ? error.message : String(error)}`, "warning");
       return undefined;
     });
     if (result) {
+      orchestrator.logMessage(ctx, `save_issue for ${inputId}: auto-cleaned worker - ${result}`);
       ctx.ui.notify(`Linear issue is done; cleaned worker automatically.\n${result}`, "info");
       refreshWatchBar(ctx);
     }
