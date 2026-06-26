@@ -6,9 +6,9 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { McpServerManager } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/server-manager.ts";
-import { loadMcpConfig } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/config.ts";
-import type { ServerEntry } from "/Users/nikita.filatov/.pi/agent/npm/node_modules/pi-mcp-adapter/types.ts";
+import { McpServerManager } from "/home/claude-user/.pi/agent/npm/node_modules/pi-mcp-adapter/server-manager.ts";
+import { loadMcpConfig } from "/home/claude-user/.pi/agent/npm/node_modules/pi-mcp-adapter/config.ts";
+import type { ServerEntry } from "/home/claude-user/.pi/agent/npm/node_modules/pi-mcp-adapter/types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +21,7 @@ type LinearAttachment = {
 
 type LinearIssue = {
   id: string;
+  identifier?: string;
   title: string;
   description?: string;
   url?: string;
@@ -379,6 +380,32 @@ function isIssueDoneOrCanceled(issue: LinearIssue): boolean {
     || issue.status === "Canceled";
 }
 
+function parseJsonString(value: unknown): any | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function firstTextContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  return content.find((part: any) => part?.type === "text" && typeof part.text === "string")?.text;
+}
+
+function extractLinearSaveIssueInputId(event: any): string | undefined {
+  const args = typeof event?.input?.args === "string" ? parseJsonString(event.input.args) : event?.input?.args;
+  return typeof args?.id === "string" && args.id.trim() ? args.id.trim() : undefined;
+}
+
+function extractLinearIssueFromToolResult(event: any): Partial<LinearIssue> | undefined {
+  const text = firstTextContent(event?.details?.mcpResult?.content) || firstTextContent(event?.content);
+  const parsed = parseJsonString(text);
+  if (!parsed || typeof parsed !== "object") return undefined;
+  return parsed as Partial<LinearIssue>;
+}
+
 function parseMcpJson<T>(result: any): T {
   const text = (result?.content || [])
     .filter((part: any) => part?.type === "text")
@@ -538,6 +565,8 @@ class LinearPiOrchestrator {
     try {
       const config = tickConfig;
       this.log(ctx, `Polling Linear for label ${config.triggerLabel}${config.requireAssigneeMe ? ` assigned to ${config.watchAssignee}` : ""} in ${config.repoRoot} (limit ${config.issueLimit})...`);
+      const cleanupResult = await this.cleanup("done", ctx);
+      if (cleanupResult.startsWith("Cleaned ")) this.log(ctx, `Auto-cleaned done Linear worker(s): ${cleanupResult}`);
       const listArgs: Record<string, unknown> = {
         label: config.triggerLabel,
         limit: config.issueLimit,
@@ -666,6 +695,28 @@ class LinearPiOrchestrator {
           : `No matching workers found for "${normalized}".`;
     }
     return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}${skipped.length ? `\nSkipped: ${skipped.join(", ")}` : ""}${removedRepoScopeDir ? `\nRemoved repo temp folder: ${repoScopeDir(config.repoRoot)}` : ""}`;
+  }
+
+  async cleanupIfIssueDone(issueRef: string | undefined, ctx?: ExtensionContext, savedIssue?: Partial<LinearIssue>): Promise<string | undefined> {
+    const config = this.configForContext(ctx);
+    const state = readState(config.repoRoot);
+    const refs = Array.from(new Set([
+      issueRef,
+      savedIssue?.identifier,
+      savedIssue?.id,
+    ].filter((ref): ref is string => typeof ref === "string" && ref.trim().length > 0)));
+    if (!refs.length) return undefined;
+
+    const worker = Object.values(state.workers).find((candidate) => refs.some((ref) => candidate.identifier.toLowerCase() === ref.toLowerCase()));
+    if (!worker) return undefined;
+
+    const issue = await this.callLinear<LinearIssue>("get_issue", { id: worker.identifier }, config).catch(() => undefined);
+    if (!issue) return undefined;
+
+    const labels = issueLabels(issue);
+    if (!labels.includes(config.doneLabel) && !isIssueDoneOrCanceled(issue)) return undefined;
+
+    return this.cleanup(worker.identifier, ctx);
   }
 
   private formatWorkerChoice(worker: WorkerState): string {
@@ -1248,6 +1299,22 @@ export default function linearPiOrchestratorExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     stopWatchBar();
     await orchestrator.shutdown();
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    const details = event.details as any;
+    if (event.isError || event.toolName !== "mcp" || details?.mode !== "call" || details?.server !== "linear" || details?.tool !== "save_issue") return;
+
+    const inputId = extractLinearSaveIssueInputId(event);
+    const savedIssue = extractLinearIssueFromToolResult(event);
+    const result = await orchestrator.cleanupIfIssueDone(inputId, ctx, savedIssue).catch((error) => {
+      ctx.ui.notify(`Linear issue was updated, but automatic worker cleanup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      return undefined;
+    });
+    if (result) {
+      ctx.ui.notify(`Linear issue is done; cleaned worker automatically.\n${result}`, "info");
+      refreshWatchBar(ctx);
+    }
   });
 
   pi.registerCommand("linear-start", {
