@@ -37,7 +37,7 @@ jobs:
             bun-target: bun-darwin-arm64
             artifact: linear-pi-macos-arm64
 
-          - os: macos-13
+          - os: macos-latest
             bun-target: bun-darwin-x64
             artifact: linear-pi-macos-x64
 
@@ -71,11 +71,8 @@ jobs:
             --outfile=${{ matrix.artifact }} \
             src/cli.ts
 
-      - name: Smoke test (native only)
-        if: |
-          (matrix.os == 'ubuntu-latest') ||
-          (matrix.os == 'macos-latest') ||
-          (matrix.os == 'macos-13')
+      - name: Smoke test
+        if: matrix.bun-target == 'bun-linux-x64' || matrix.bun-target == 'bun-darwin-arm64'
         run: ./${{ matrix.artifact }} --help
 
       - uses: actions/upload-artifact@v4
