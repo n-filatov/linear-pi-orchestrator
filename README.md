@@ -1,14 +1,60 @@
 # Linear Pi Orchestrator
 
-Pi extension that starts a dedicated tmux + `wt` worktree + Pi worker for Linear issues using the existing Linear MCP OAuth connection.
+Watches Linear issues and starts dedicated tmux + `wt` worktree + AI agent workers. Works two ways:
 
-## Install
+- **CLI** — standalone binary, no Pi required. Uses the same Linear MCP OAuth flow (no API key needed).
+- **Pi extension** — runs inside a Pi coding agent session, adding `/linear-start`, `/linear-watch`, etc.
+
+## Install — CLI binary
+
+**One-line install (macOS + Linux):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | sh
+```
+
+To install to a custom directory (e.g. `~/.local/bin`):
+```bash
+INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | sh
+```
+
+On first run, `linear-pi` opens a browser window for Linear OAuth. Tokens are stored in `~/.pi/linear-pi/oauth/` and reused on subsequent runs.
+
+**Update to the latest release:**
+```bash
+linear-pi update
+```
+
+The CLI also checks for updates in the background once every 24 hours and prints a notice at the end of the next command when a new release is available.
+
+## CLI usage
+
+```bash
+linear-pi update                         # update binary to the latest release
+linear-pi start CRM-123                  # start one worker manually
+linear-pi watch start                    # start background daemon
+linear-pi watch start pi:frontend        # set label and start daemon
+linear-pi watch foreground               # run watcher in foreground (blocking)
+linear-pi watch stop                     # stop daemon
+linear-pi watch once                     # run one poll tick
+linear-pi watch once pi:backend          # set label and run one tick
+linear-pi watch model claude             # set worker agent (pi/claude/codex/opencode)
+linear-pi watch status                   # show daemon state and recent logs
+linear-pi watch logs                     # show recent logs
+linear-pi cleanup                        # interactive picker
+linear-pi cleanup done                   # clean workers whose issue is done/canceled
+linear-pi cleanup CRM-123               # clean one worker
+linear-pi cleanup all                    # clean all workers
+linear-pi status                         # show recorded workers
+linear-pi -C /path/to/repo watch start   # target a specific repo root
+```
+
+## Install — Pi extension
 
 Global install for local development:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-ln -sf "$PWD/index.ts" ~/.pi/agent/extensions/linear-pi-orchestrator.ts
+ln -sf "$PWD/src/extension.ts" ~/.pi/agent/extensions/linear-pi-orchestrator.ts
 ```
 
 Then restart Pi or run `/reload`.
