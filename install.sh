@@ -29,7 +29,7 @@ case "$OS" in
     ;;
 esac
 
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+URL="https://github.com/${REPO}/releases/download/latest/${ASSET}"
 DEST="${INSTALL_DIR}/${BINARY}"
 
 echo "Downloading ${ASSET}..."
