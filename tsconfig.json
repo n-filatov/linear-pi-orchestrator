@@ -6,7 +6,18 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/extension.ts",
+    "src/providers/mcp-linear-pi.ts",
+    "src/providers/pi-ui.ts"
+  ]
 }

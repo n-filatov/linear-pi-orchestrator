@@ -1,0 +1,143 @@
+name: Build CLI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Type-check (fast, runs on every push/PR) ────────────────────────────────
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  # ── Build native binaries ───────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: typecheck
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bun-target: bun-linux-x64
+            artifact: linear-pi-linux-x64
+
+          - os: macos-latest
+            bun-target: bun-darwin-arm64
+            artifact: linear-pi-macos-arm64
+
+          - os: macos-13
+            bun-target: bun-darwin-x64
+            artifact: linear-pi-macos-x64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Write version info
+        run: |
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          else
+            RELEASE_TAG="latest"
+          fi
+          printf 'export const BUILD_DATE = "%s";\nexport const RELEASE_TAG = "%s";\n' \
+            "$BUILD_DATE" "$RELEASE_TAG" > src/core/version.ts
+
+      - name: Compile binary
+        run: |
+          bun build \
+            --compile \
+            --target=${{ matrix.bun-target }} \
+            --outfile=${{ matrix.artifact }} \
+            src/cli.ts
+
+      - name: Smoke test (native only)
+        if: |
+          (matrix.os == 'ubuntu-latest') ||
+          (matrix.os == 'macos-latest') ||
+          (matrix.os == 'macos-13')
+        run: ./${{ matrix.artifact }} --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 30
+
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  # main pushes  → update the rolling "latest" release (prerelease)
+  # version tags → create a proper versioned release
+  release:
+    name: Publish release
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}"        >> "$GITHUB_OUTPUT"
+            echo "name=${GITHUB_REF_NAME}"       >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"              >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest"                    >> "$GITHUB_OUTPUT"
+            echo "name=Latest (main)"            >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"               >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          files: dist/linear-pi-*
+          generate_release_notes: ${{ steps.meta.outputs.prerelease == 'false' }}
+          body: |
+            ## Install
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-macos-arm64 -o linear-pi
+            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-macos-x64 -o linear-pi
+            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            ```
+
+            **Linux (x64)**
+            ```bash
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-linux-x64 -o linear-pi
+            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            ```
