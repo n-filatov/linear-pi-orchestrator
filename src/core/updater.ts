@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { BUILD_DATE, RELEASE_TAG } from "./version.js";
 
 const REPO = "n-filatov/linear-pi-orchestrator";
@@ -77,19 +78,21 @@ export async function performUpdate(): Promise<void> {
   const asset = `linear-pi-${platform}`;
   const url = `https://github.com/${REPO}/releases/download/latest/${asset}`;
 
-  process.stdout.write(`Downloading ${asset} from latest release...\n`);
-
-  const res = await fetch(url, {
-    headers: { "User-Agent": "linear-pi-cli" },
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}\n${url}`);
-
-  const buffer = Buffer.from(await res.arrayBuffer());
   const currentBin = process.execPath;
   const tmpBin = `${currentBin}.update`;
 
-  fs.writeFileSync(tmpBin, buffer, { mode: 0o755 });
+  process.stdout.write(`Downloading ${asset} from latest release...\n`);
+
+  // Use curl for the download — Bun's compiled fetch() has issues following
+  // GitHub's redirect chain to the CDN. curl is reliable and always available.
+  try {
+    execFileSync("curl", ["-fSL", url, "-o", tmpBin], { stdio: "inherit" });
+  } catch {
+    fs.rmSync(tmpBin, { force: true });
+    throw new Error(`Download failed. Check your connection or download manually:\n${url}`);
+  }
+
+  fs.chmodSync(tmpBin, 0o755);
   fs.renameSync(tmpBin, currentBin);
 
   try { fs.rmSync(CACHE_PATH); } catch {}
