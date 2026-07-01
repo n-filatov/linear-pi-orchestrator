@@ -275,7 +275,8 @@ export class SdkMcpLinearClient implements LinearClient {
   }
 
   /**
-   * Two-phase OAuth flow:
+   * Full two-phase OAuth flow, used only when nothing has triggered phase 1 yet
+   * (i.e. explicit `linear-pi auth login`, not the lazy re-auth in getClient()).
    *  Phase 1 — provider.redirectToAuthorization() is called by SDK, which opens browser.
    *  Phase 2 — we exchange the auth code received at the callback server.
    */
@@ -285,11 +286,22 @@ export class SdkMcpLinearClient implements LinearClient {
     // so port 19876 is never bound when tokens are already valid.
     const phase1Result = await runSdkAuth(this.authProvider, { serverUrl: new URL(this.serverUrl) });
     if (phase1Result === "AUTHORIZED") return;
+    await this.completePendingAuth();
+  }
 
-    // Phase 2: browser opened, wait for the callback the server is already listening for
+  /**
+   * Completes phase 2 only — waits for the OAuth callback and exchanges the code.
+   * Used after client.connect() throws UnauthorizedError: the SDK's transport
+   * already ran phase 1 internally (registering a client, generating a PKCE
+   * challenge, and calling provider.redirectToAuthorization()) as part of its
+   * own 401 handling. Re-running phase 1 here would trigger a SECOND redirect
+   * with a second callback listener racing the first one on the same stdin —
+   * that was causing the double "Linear authentication required" prompt and
+   * an occasional "Could not parse code/state from:" crash on paste.
+   */
+  private async completePendingAuth(): Promise<void> {
     process.stderr.write("Waiting for authorization callback...\n");
     const { code } = await this.authProvider.pendingCallback();
-
     await runSdkAuth(this.authProvider, {
       serverUrl: new URL(this.serverUrl),
       authorizationCode: code,
@@ -356,7 +368,9 @@ export class SdkMcpLinearClient implements LinearClient {
             "terminal, then restart the watcher with `linear-pi watch start`.",
           );
         }
-        await this.authenticate();
+        // client.connect() already ran phase 1 internally (that's how we got
+        // an UnauthorizedError with a pending callback) — only finish phase 2.
+        await this.completePendingAuth();
         // Reconnect with fresh transport now that we have tokens
         const freshTransport = this.createTransport();
         const freshClient = new Client({ name: "linear-pi-cli", version: "0.1.0" }, {});
