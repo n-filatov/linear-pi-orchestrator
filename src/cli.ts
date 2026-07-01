@@ -253,7 +253,14 @@ function runCli() {
       const authed = linear.checkAuth();
       const info = linear.tokenInfo();
       const lines = [authed ? "Authenticated with Linear." : "Not authenticated with Linear."];
-      if (info?.expiresAt) lines.push(`Token expires: ${new Date(info.expiresAt * 1000).toLocaleString()}`);
+      if (info?.expiresAt) {
+        const expiry = new Date(info.expiresAt * 1000).toLocaleString();
+        lines.push(
+          info.refreshToken
+            ? `Access token expires: ${expiry} (will auto-refresh silently, no action needed).`
+            : `Access token expires: ${expiry} (no refresh token stored — you'll need to run \`linear-pi auth login\` again after this).`,
+        );
+      }
       if (!authed) lines.push("Run `linear-pi auth login` to authenticate.");
       ui.notify(lines.join("\n"));
     });
