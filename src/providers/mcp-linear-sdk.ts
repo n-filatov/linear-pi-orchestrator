@@ -30,6 +30,7 @@ const SERVER_NAME = "linear-sdk";
 
 class LinearOAuthProvider implements OAuthClientProvider {
   readonly redirectUrl = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`;
+  _callbackPromise: Promise<{ code: string; state: string }> | undefined;
 
   get clientMetadata(): OAuthClientMetadata {
     return {
@@ -103,8 +104,13 @@ class LinearOAuthProvider implements OAuthClientProvider {
     else clearTokens(SERVER_NAME);
   }
 
-  /** Called by the SDK when a fresh authorization code flow is needed. Opens browser. */
+  /**
+   * Called by the SDK when a fresh authorization code flow is needed.
+   * Starts the callback server HERE (not before) so port 19876 is only
+   * bound when we actually need the browser flow.
+   */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    this._callbackPromise = waitForOAuthCallback();
     process.stderr.write(`\nLinear authentication required.\nIf the browser does not open automatically, visit:\n${authorizationUrl.toString()}\n\n`);
     try {
       const { default: open } = await import("open");
@@ -112,6 +118,11 @@ class LinearOAuthProvider implements OAuthClientProvider {
     } catch {
       // `open` not available — user opens manually
     }
+  }
+
+  pendingCallback(): Promise<{ code: string; state: string }> {
+    if (!this._callbackPromise) throw new Error("No pending OAuth callback — redirectToAuthorization was not called.");
+    return this._callbackPromise;
   }
 }
 
@@ -201,17 +212,16 @@ export class SdkMcpLinearClient implements LinearClient {
    *  Phase 2 — we exchange the auth code received at the callback server.
    */
   private async authenticate(): Promise<void> {
-    const callbackPromise = waitForOAuthCallback();
-
-    // Phase 1: initiate — triggers redirectToAuthorization, opens browser
+    // Phase 1: SDK calls redirectToAuthorization() only if tokens are missing/expired.
+    // The callback server is started inside redirectToAuthorization(), NOT here,
+    // so port 19876 is never bound when tokens are already valid.
     const phase1Result = await runSdkAuth(this.authProvider, { serverUrl: new URL(this.serverUrl) });
-    if (phase1Result === "AUTHORIZED") return; // Already had valid tokens
+    if (phase1Result === "AUTHORIZED") return;
 
-    // Wait for user to complete auth in browser
+    // Phase 2: browser opened, wait for the callback the server is already listening for
     process.stderr.write("Waiting for authorization callback...\n");
-    const { code } = await callbackPromise;
+    const { code } = await this.authProvider.pendingCallback();
 
-    // Phase 2: exchange code for tokens
     await runSdkAuth(this.authProvider, {
       serverUrl: new URL(this.serverUrl),
       authorizationCode: code,
