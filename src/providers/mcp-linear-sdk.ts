@@ -125,13 +125,16 @@ class LinearOAuthProvider implements OAuthClientProvider {
     }
     this._callbackPromise = waitForOAuthCallback();
     process.stderr.write(`\nLinear authentication required.\nOpen this URL in your browser:\n\n  ${authorizationUrl.toString()}\n`);
-    try {
-      const { default: open } = await import("open");
-      // open() on Linux without a display (VPS) throws ENOENT for xdg-open.
-      // Wrap in a separate promise so any sync or async spawn error is caught.
-      await Promise.resolve(open(authorizationUrl.toString())).catch(() => {});
-    } catch {
-      // ignore — URL already printed above, user can open manually
+    // Only attempt to open the browser on macOS/Windows — on Linux xdg-open
+    // is frequently absent (especially on VPS) and emits an unhandled child
+    // process error event that can't be caught with try/catch.
+    if (process.platform !== "linux") {
+      try {
+        const { default: open } = await import("open");
+        await open(authorizationUrl.toString());
+      } catch {
+        // ignore — URL already printed above
+      }
     }
   }
 
