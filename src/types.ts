@@ -39,6 +39,8 @@ export type WorkerState = {
   tmuxWindowId?: string;
   /** Best-effort display index only. Never use as unverified cleanup target. */
   tmuxWindowIndex?: string;
+  /** PID of the pane's shell process at launch; used to walk the process tree on cleanup. */
+  panePid?: number;
   status: "running" | "failed";
   /** Last-known Linear workflow status name (e.g. "In Review"); display-only. */
   linearStatus?: string;

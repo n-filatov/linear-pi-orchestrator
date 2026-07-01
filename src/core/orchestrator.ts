@@ -15,7 +15,7 @@ import {
   isDaemonRunning, removeRepoScopeDirIfUnused,
 } from "./state.ts";
 import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.ts";
-import { killTmuxWindow, startTmuxWindow, renameTmuxWindow } from "./tmux.ts";
+import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow } from "./tmux.ts";
 import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -276,7 +276,7 @@ export class LinearPiOrchestrator {
       const promptPath = path.join(worktree, ".pi-linear-prompt.md");
       fs.writeFileSync(promptPath, buildWorkerPrompt(issue, branch, worktree, attachments));
 
-      const { id: tmuxWindowId, index } = await startTmuxWindow(config, windowName, worktree, identifier, promptPath);
+      const { id: tmuxWindowId, index, panePid } = await startTmuxWindow(config, windowName, worktree, identifier, promptPath);
       const worker: WorkerState = {
         identifier,
         title: issue.title,
@@ -287,6 +287,7 @@ export class LinearPiOrchestrator {
         tmuxWindow: windowName,
         tmuxWindowId,
         tmuxWindowIndex: index,
+        panePid,
         status: "running",
         linearStatus: issue.status,
         startedAt: new Date().toISOString(),
@@ -340,9 +341,11 @@ export class LinearPiOrchestrator {
   }
 
   async cleanup(target: string, config: Config): Promise<string> {
+    const normalized = target.trim();
+    if (normalized === "orphans") return this.cleanupOrphans(config);
+
     const state = readState(config.repoRoot);
     const workers = Object.values(state.workers);
-    const normalized = target.trim();
     const cleaned: string[] = [];
     const skipped: string[] = [];
 
@@ -350,9 +353,25 @@ export class LinearPiOrchestrator {
       const shouldClean = await this.shouldCleanupWorker(worker, normalized, config);
       if (!shouldClean) { skipped.push(worker.identifier); continue; }
 
+      // Kill the process tree first, then the tmux window.
+      await killWorkerProcesses(worker).catch((error) => {
+        this.ui.notify(`Failed to kill processes for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      });
+
       await killTmuxWindow(worker).catch((error) => {
         this.ui.notify(`Failed to kill tmux window for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
       });
+
+      // Verify all worker processes are gone before removing the worktree.
+      if (worker.worktree) {
+        const allDead = await verifyNoWorktreeProcesses(worker.worktree);
+        if (!allDead) {
+          const msg = `Processes for ${worker.identifier} are still alive after kill; keeping state entry.`;
+          this.ui.notify(msg, "warning");
+          skipped.push(`${worker.identifier} (processes still running)`);
+          continue;
+        }
+      }
 
       try {
         await this.removeWorktree(worker, config);
@@ -386,6 +405,44 @@ export class LinearPiOrchestrator {
           : `No matching workers found for "${normalized}".`;
     }
     return `Cleaned ${cleaned.length} worker(s): ${cleaned.join(", ")}${skipped.length ? `\nSkipped: ${skipped.join(", ")}` : ""}${removedRepoScopeDir ? `\nRemoved repo temp folder: ${repoScopeDir(config.repoRoot)}` : ""}`;
+  }
+
+  private async cleanupOrphans(config: Config): Promise<string> {
+    const self = process.pid;
+    const killed: string[] = [];
+
+    const killPids = async (pids: number[], label: string): Promise<void> => {
+      if (!pids.length) return;
+      for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+      await new Promise(r => setTimeout(r, 2000));
+      for (const pid of pids) {
+        try { process.kill(pid, 0); process.kill(pid, "SIGKILL"); killed.push(`${label}:${pid}`); } catch {}
+      }
+    };
+
+    const pgrepPids = async (pattern: string): Promise<number[]> => {
+      const { stdout } = await execFileAsync("pgrep", ["-f", pattern], { maxBuffer: 1024 * 1024 })
+        .catch(() => ({ stdout: "" }));
+      return stdout.trim().split("\n").filter(Boolean).map(Number).filter(p => !isNaN(p) && p !== self);
+    };
+
+    // Processes whose command references the wt trash directory.
+    const trashDir = path.join(config.repoRoot, ".git", "wt", "trash");
+    if (fs.existsSync(trashDir)) {
+      await killPids(await pgrepPids(trashDir), "trash");
+    }
+
+    // Processes referencing worktree paths that are recorded in state but no longer exist on disk.
+    const state = readState(config.repoRoot);
+    for (const worker of Object.values(state.workers)) {
+      if (worker.worktree && !fs.existsSync(worker.worktree)) {
+        await killPids(await pgrepPids(worker.worktree), worker.identifier);
+      }
+    }
+
+    return killed.length
+      ? `Killed ${killed.length} orphaned process(es): ${killed.join(", ")}`
+      : "No orphaned processes found.";
   }
 
   async cleanupIfIssueDone(
