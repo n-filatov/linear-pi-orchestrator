@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import * as readline from "node:readline";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -111,7 +112,7 @@ class LinearOAuthProvider implements OAuthClientProvider {
    */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
     this._callbackPromise = waitForOAuthCallback();
-    process.stderr.write(`\nLinear authentication required.\nIf the browser does not open automatically, visit:\n${authorizationUrl.toString()}\n\n`);
+    process.stderr.write(`\nLinear authentication required.\nOpen this URL in your browser:\n\n  ${authorizationUrl.toString()}\n`);
     try {
       const { default: open } = await import("open");
       await open(authorizationUrl.toString());
@@ -126,32 +127,70 @@ class LinearOAuthProvider implements OAuthClientProvider {
   }
 }
 
-// ── Callback server ───────────────────────────────────────────────────────────
+// ── Callback server + manual paste (VPS fallback) ────────────────────────────
 
+/**
+ * Waits for the OAuth callback two ways simultaneously:
+ *  1. HTTP server on port 19876 — works when browser is on the same machine.
+ *  2. Manual paste from stdin — works on a VPS/headless environment where the
+ *     user opens the URL on their laptop, sees the browser fail to connect to
+ *     localhost:19876, copies that URL from the address bar, and pastes it here.
+ */
 function waitForOAuthCallback(): Promise<{ code: string; state: string }> {
   return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
+    let settled = false;
+    let server: http.Server | undefined;
+    let rl: readline.Interface | undefined;
+    const timeout = setTimeout(() => finish(new Error("OAuth callback timed out after 5 minutes.")), 5 * 60 * 1000);
+
+    function finish(result: { code: string; state: string } | Error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try { server?.close(); } catch {}
+      try { rl?.close(); } catch {}
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    }
+
+    function parseCallbackUrl(raw: string): { code: string; state: string } | null {
       try {
-        const url = new URL(req.url!, `http://localhost:${OAUTH_CALLBACK_PORT}`);
+        const url = new URL(raw.trim());
         const code = url.searchParams.get("code");
         const state = url.searchParams.get("state");
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body style='font-family:sans-serif;padding:2rem'><h1>✓ Authorized</h1><p>You can close this tab and return to the terminal.</p></body></html>");
-        server.close();
-        if (code && state) resolve({ code, state });
-        else reject(new Error("OAuth callback is missing code or state parameters."));
-      } catch (err) {
-        reject(err);
-      }
+        if (code && state) return { code, state };
+      } catch {}
+      return null;
+    }
+
+    // 1. Try HTTP server (desktop / local use)
+    server = http.createServer((req, res) => {
+      const parsed = parseCallbackUrl(`http://localhost${req.url}`);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<html><body style='font-family:sans-serif;padding:2rem'><h1>✓ Authorized</h1><p>You can close this tab and return to the terminal.</p></body></html>");
+      if (parsed) finish(parsed);
+      else finish(new Error("OAuth callback is missing code or state parameters."));
+    });
+    server.listen(OAUTH_CALLBACK_PORT, "127.0.0.1");
+    server.once("error", () => {
+      // Port in use — fall back to manual paste only (no hard failure)
+      server = undefined;
+      process.stderr.write(`(Port ${OAUTH_CALLBACK_PORT} in use — waiting for manual paste only)\n`);
     });
 
-    server.listen(OAUTH_CALLBACK_PORT, "127.0.0.1");
-    server.once("error", reject);
-    const timeout = setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth callback timed out after 5 minutes."));
-    }, 5 * 60 * 1000);
-    server.once("close", () => clearTimeout(timeout));
+    // 2. Always also accept manual paste from stdin (VPS / remote use)
+    process.stderr.write(
+      `\nOn a VPS or remote machine, open the URL above on any device.\n` +
+      `When your browser shows "This site can't be reached", copy the full URL\n` +
+      `from the address bar (starts with http://localhost:${OAUTH_CALLBACK_PORT}/callback?code=...)\n` +
+      `and paste it here, then press Enter:\n> `,
+    );
+    rl = readline.createInterface({ input: process.stdin });
+    rl.once("line", (line) => {
+      const parsed = parseCallbackUrl(line);
+      if (parsed) finish(parsed);
+      else finish(new Error(`Could not parse code/state from: ${line}`));
+    });
   });
 }
 
