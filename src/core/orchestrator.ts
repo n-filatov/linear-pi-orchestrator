@@ -166,14 +166,15 @@ export class LinearPiOrchestrator {
     }
     this.watchConfig = config;
     this.log(config, `Watcher starting. Interval: ${config.pollIntervalMs}ms. Label: ${config.triggerLabel}. Repo: ${config.repoRoot}.`);
+    const handleTickError = (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log(config, `Watch tick failed: ${message}`, "error");
+      this.ui.notify(`Linear watch failed: ${message}`, "error");
+    };
     this.timer = setInterval(() => {
-      void this.watchOnce(this.watchConfig ?? config).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.log(config, `Watch tick failed: ${message}`, "error");
-        this.ui.notify(`Linear watch failed: ${message}`, "error");
-      });
+      void this.watchOnce(this.watchConfig ?? config).catch(handleTickError);
     }, config.pollIntervalMs);
-    void this.watchOnce(config);
+    void this.watchOnce(config).catch(handleTickError);
   }
 
   async watchOnce(config: Config, label?: string): Promise<string> {

@@ -36,7 +36,7 @@ async function runDaemon() {
   fs.writeFileSync(pidPath(config.repoRoot), String(process.pid));
 
   const ui = new CliUIProvider();
-  const linear = new SdkMcpLinearClient();
+  const linear = new SdkMcpLinearClient({ interactive: false });
   const orchestrator = new LinearPiOrchestrator(ui, linear);
 
   const cleanup = async () => {

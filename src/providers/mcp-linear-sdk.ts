@@ -234,9 +234,12 @@ export class SdkMcpLinearClient implements LinearClient {
   private client: Client | undefined;
   private readonly authProvider = new LinearOAuthProvider();
   private readonly serverUrl: string;
+  private readonly interactive: boolean;
 
-  constructor() {
+  /** @param interactive Set false in daemon mode to prevent interactive auth prompts. */
+  constructor({ interactive = true }: { interactive?: boolean } = {}) {
     this.serverUrl = readLinearMcpUrl();
+    this.interactive = interactive;
   }
 
   private createTransport(): StreamableHTTPClientTransport {
@@ -281,6 +284,12 @@ export class SdkMcpLinearClient implements LinearClient {
       return client;
     } catch (error) {
       if (error instanceof UnauthorizedError) {
+        if (!this.interactive) {
+          throw new Error(
+            "Linear tokens expired. Run `linear-pi watch stop && linear-pi watch start` " +
+            "from an interactive terminal to re-authenticate.",
+          );
+        }
         await this.authenticate();
         // Reconnect with fresh transport now that we have tokens
         const freshTransport = this.createTransport();
