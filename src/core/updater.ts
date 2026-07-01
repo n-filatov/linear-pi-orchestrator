@@ -75,7 +75,7 @@ function detectPlatform(): string {
 export async function performUpdate(): Promise<void> {
   const platform = detectPlatform();
   const asset = `linear-pi-${platform}`;
-  const url = `https://github.com/${REPO}/releases/latest/download/${asset}`;
+  const url = `https://github.com/${REPO}/releases/download/latest/${asset}`;
 
   process.stdout.write(`Downloading ${asset} from latest release...\n`);
 
