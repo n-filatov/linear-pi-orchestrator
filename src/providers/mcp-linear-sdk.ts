@@ -94,9 +94,9 @@ class LinearOAuthProvider implements OAuthClientProvider {
   }
 
   state(): string {
-    const s = getOAuthState(SERVER_NAME);
-    if (!s) throw new UnauthorizedError("No OAuth state saved — re-authentication required.");
-    return s;
+    // The SDK runtime checks `provider.state ? await provider.state() : undefined`
+    // so returning undefined here is safe — the interface types are stricter than the runtime.
+    return getOAuthState(SERVER_NAME) ?? (undefined as unknown as string);
   }
 
   invalidateCredentials(type: "all" | "client" | "tokens"): void {
