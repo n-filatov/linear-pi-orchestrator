@@ -20,6 +20,7 @@ import {
   getClientInfo, saveClientInfo, clearClientInfo,
   getCodeVerifier, saveCodeVerifier,
   getOAuthState, saveOAuthState, clearAll,
+  type StoredTokens,
 } from "./oauth-storage.js";
 
 const LINEAR_MCP_URL = "https://mcp.linear.app/mcp";
@@ -33,6 +34,8 @@ class LinearOAuthProvider implements OAuthClientProvider {
   readonly redirectUrl = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`;
   _callbackPromise: Promise<{ code: string; state: string }> | undefined;
   readonly interactive: boolean;
+  /** Set true when redirectToAuthorization actually runs the interactive flow (vs. tokens already valid). */
+  didRedirect = false;
 
   constructor({ interactive = true }: { interactive?: boolean } = {}) {
     this.interactive = interactive;
@@ -118,11 +121,14 @@ class LinearOAuthProvider implements OAuthClientProvider {
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
     if (!this.interactive) {
       // Reject immediately so the transport's re-auth fails fast with a clear message.
-      this._callbackPromise = Promise.reject(
-        new Error("Linear tokens expired. Run `linear-pi watch stop && linear-pi watch start` from an interactive terminal to re-authenticate."),
+      const rejection = Promise.reject(
+        new Error("Linear tokens expired or missing. Run `linear-pi auth login` from an interactive terminal to re-authenticate."),
       );
+      rejection.catch(() => {}); // avoid an unhandled rejection warning if pendingCallback() is never awaited
+      this._callbackPromise = rejection;
       return;
     }
+    this.didRedirect = true;
     this._callbackPromise = waitForOAuthCallback();
     process.stderr.write(`\nLinear authentication required.\nOpen this URL in your browser:\n\n  ${authorizationUrl.toString()}\n`);
     // Only attempt to open the browser on macOS/Windows — on Linux xdg-open
@@ -288,8 +294,48 @@ export class SdkMcpLinearClient implements LinearClient {
       serverUrl: new URL(this.serverUrl),
       authorizationCode: code,
     });
+  }
 
-    process.stderr.write("Linear authentication complete.\n");
+  /** Returns stored token metadata (for `linear-pi auth status`), without making a network call. */
+  tokenInfo(): StoredTokens | undefined {
+    return getTokens(SERVER_NAME);
+  }
+
+  /**
+   * Reports whether we hold tokens that look usable — purely a local check
+   * against stored state. Does NOT make a network call: connecting with the
+   * real auth provider would itself kick off the interactive redirect flow
+   * as a side effect (the SDK's transport does this internally on 401),
+   * which is exactly what a passive status check must not do.
+   */
+  checkAuth(): boolean {
+    const stored = getTokens(SERVER_NAME);
+    if (!stored?.accessToken) return false;
+    if (stored.refreshToken) return true; // refreshable even if the access token expired
+    return stored.expiresAt === undefined || stored.expiresAt * 1000 > Date.now();
+  }
+
+  /**
+   * Explicit login for `linear-pi auth login`. Handles both:
+   *  - Local machine with a browser: opens the authorization URL automatically.
+   *  - Headless/VPS: prints the URL to open elsewhere and accepts the callback
+   *    URL pasted back into the terminal (see waitForOAuthCallback).
+   */
+  async login(opts: { force?: boolean } = {}): Promise<"already-authenticated" | "authenticated"> {
+    if (opts.force) {
+      this.authProvider.invalidateCredentials("all");
+      this.client = undefined;
+    }
+    this.authProvider.didRedirect = false;
+    await this.authenticate();
+    await this.getClient();
+    return this.authProvider.didRedirect ? "authenticated" : "already-authenticated";
+  }
+
+  /** Removes stored Linear credentials. */
+  logout(): void {
+    this.client = undefined;
+    this.authProvider.invalidateCredentials("all");
   }
 
   private async getClient(): Promise<Client> {
@@ -306,8 +352,8 @@ export class SdkMcpLinearClient implements LinearClient {
       if (error instanceof UnauthorizedError) {
         if (!this.interactive) {
           throw new Error(
-            "Linear tokens expired. Run `linear-pi watch stop && linear-pi watch start` " +
-            "from an interactive terminal to re-authenticate.",
+            "Linear tokens expired or missing. Run `linear-pi auth login` from an interactive " +
+            "terminal, then restart the watcher with `linear-pi watch start`.",
           );
         }
         await this.authenticate();

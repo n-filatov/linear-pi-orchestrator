@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import * as fs from "node:fs";
 import { Command } from "commander";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { LinearPiOrchestrator } from "./core/orchestrator.js";
 import { CliUIProvider } from "./providers/cli-ui.js";
 import { SdkMcpLinearClient } from "./providers/mcp-linear-sdk.js";
@@ -213,6 +214,50 @@ function runCli() {
       ui.notify(text);
     });
 
+  // ── linear-pi auth ────────────────────────────────────────────────────────
+
+  const auth = program
+    .command("auth")
+    .description("Manage Linear authentication");
+
+  auth
+    .command("login", { isDefault: true })
+    .description(
+      "Authenticate with Linear. On a machine with a browser this opens it automatically; " +
+      "on a headless/VPS box it prints a URL to open elsewhere and lets you paste the callback URL back.",
+    )
+    .option("--force", "Re-authenticate even if already logged in")
+    .action(async (opts: { force?: boolean }) => {
+      resolveConfig(program.opts().cwd);
+      const result = await linear.login({ force: opts.force });
+      ui.notify(
+        result === "already-authenticated"
+          ? "Already authenticated with Linear. Use --force to re-authenticate."
+          : "Linear authentication complete.",
+      );
+      await orchestrator.shutdown();
+    });
+
+  auth
+    .command("logout")
+    .description("Remove stored Linear credentials")
+    .action(() => {
+      linear.logout();
+      ui.notify("Linear credentials removed. Run `linear-pi auth login` to re-authenticate.");
+    });
+
+  auth
+    .command("status")
+    .description("Check whether linear-pi has usable Linear credentials stored")
+    .action(() => {
+      const authed = linear.checkAuth();
+      const info = linear.tokenInfo();
+      const lines = [authed ? "Authenticated with Linear." : "Not authenticated with Linear."];
+      if (info?.expiresAt) lines.push(`Token expires: ${new Date(info.expiresAt * 1000).toLocaleString()}`);
+      if (!authed) lines.push("Run `linear-pi auth login` to authenticate.");
+      ui.notify(lines.join("\n"));
+    });
+
   // ── linear-pi update ─────────────────────────────────────────────────────
 
   program
@@ -223,7 +268,11 @@ function runCli() {
     });
 
   program.parseAsync(process.argv).catch((error) => {
-    ui.notify(error instanceof Error ? error.message : String(error), "error");
+    if (error instanceof UnauthorizedError) {
+      ui.notify("Not authorized with Linear. Run `linear-pi auth login` to authenticate.", "error");
+    } else {
+      ui.notify(error instanceof Error ? error.message : String(error), "error");
+    }
     process.exit(1);
   });
 }
