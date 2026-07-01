@@ -133,6 +133,9 @@ For each issue it:
 - `LINEAR_PI_BRANCH_PREFIX=feat`
 - `LINEAR_PI_AGENT=pi` (worker agent CLI: `pi`, `claude`, `codex`, or `opencode`; persisted via `/linear-watch model`)
 - `LINEAR_PI_AGENT_COMMAND` (override the binary used for the selected agent, e.g. an absolute path)
+- `LINEAR_PI_<AGENT>_COMMAND` (per-agent binary override, e.g. `LINEAR_PI_CLAUDE_COMMAND=/Users/me/.claude/local/claude`)
+
+Workers launch via `bash -lc`, so the agent command must be resolvable there. The watcher resolves each agent to an absolute path (probing `PATH` plus common install locations like `~/.claude/local/claude`) so it still works when the command is only available through a shell alias/function (for example a fish `claude` wrapper). Set `LINEAR_PI_<AGENT>_COMMAND` if your binary lives elsewhere.
 - `LINEAR_PI_NODE_BIN_DIR=/Users/nikita.filatov/.local/share/nvm/v23.11.1/bin`
 - `LINEAR_PI_POLL_INTERVAL_MS=30000`
 - `LINEAR_PI_REQUIRE_ASSIGNEE_ME=true`

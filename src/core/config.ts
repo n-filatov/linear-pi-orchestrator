@@ -140,20 +140,53 @@ export const AGENT_PRESETS: Record<string, AgentPreset> = {
     label: "Claude Code",
     defaultCommand: "claude",
     buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} "$(cat ${prompt})"`,
+    binaryCandidates: () => [
+      path.join(os.homedir(), ".claude", "local", "claude"),
+      path.join(os.homedir(), ".local", "bin", "claude"),
+      "/opt/homebrew/bin/claude",
+      "/usr/local/bin/claude",
+    ],
   },
   codex: {
     id: "codex",
     label: "Codex",
     defaultCommand: "codex",
     buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} "$(cat ${prompt})"`,
+    binaryCandidates: () => [
+      "/opt/homebrew/bin/codex",
+      path.join(os.homedir(), ".local", "bin", "codex"),
+      "/usr/local/bin/codex",
+    ],
   },
   opencode: {
     id: "opencode",
     label: "OpenCode",
     defaultCommand: "opencode",
     buildInvocation: (binary, _issueId, prompt) => `${shellQuote(binary)} run "$(cat ${prompt})"`,
+    binaryCandidates: () => [
+      path.join(os.homedir(), ".opencode", "bin", "opencode"),
+      path.join(os.homedir(), ".local", "bin", "opencode"),
+      "/opt/homebrew/bin/opencode",
+      "/usr/local/bin/opencode",
+    ],
   },
 };
+
+/** Resolves a bare command name to an absolute path by probing PATH plus extra candidates. */
+function findExecutable(name: string, extraCandidates: string[] = []): string {
+  if (name.includes("/")) return name;
+  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const candidates = [...pathDirs.map((dir) => path.join(dir, name)), ...extraCandidates];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return name;
+}
 
 export function resolveAgentPreset(agent: string | undefined): AgentPreset {
   const key = (agent || DEFAULT_AGENT).toLowerCase();
@@ -162,8 +195,13 @@ export function resolveAgentPreset(agent: string | undefined): AgentPreset {
 
 export function resolveAgentBinary(config: Config, preset: AgentPreset): string {
   if (process.env.LINEAR_PI_AGENT_COMMAND) return process.env.LINEAR_PI_AGENT_COMMAND;
+  const perAgentEnv = process.env[`LINEAR_PI_${preset.id.toUpperCase()}_COMMAND`];
+  if (perAgentEnv) return perAgentEnv;
+  // Backward compatibility: piCommand overrides the pi binary when using the pi agent.
   if (preset.id === "pi" && config.piCommand && config.piCommand !== "pi") return config.piCommand;
-  return preset.defaultCommand;
+  // Resolve to an absolute path so the worker's `bash -lc` shell finds it even when
+  // the command is only available via a shell alias/function (e.g. fish `claude`).
+  return findExecutable(preset.defaultCommand, preset.binaryCandidates?.() ?? []);
 }
 
 export function setAgent(agent: string, repoRoot?: string): Config {

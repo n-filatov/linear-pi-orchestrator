@@ -72,6 +72,8 @@ export type AgentPreset = {
   label: string;
   defaultCommand: string;
   buildInvocation: (binary: string, issueId: string, quotedPromptPath: string) => string;
+  /** Extra absolute locations to probe when the command is not on PATH. */
+  binaryCandidates?: () => string[];
 };
 
 export type ListIssuesArgs = {
