@@ -174,8 +174,10 @@ function waitForOAuthCallback(): Promise<{ code: string; state: string }> {
       try {
         const url = new URL(raw.trim());
         const code = url.searchParams.get("code");
-        const state = url.searchParams.get("state");
-        if (code && state) return { code, state };
+        if (!code) return null;
+        // state may be absent if provider.state() returned undefined (no saved state)
+        const state = url.searchParams.get("state") ?? "";
+        return { code, state };
       } catch {}
       return null;
     }
