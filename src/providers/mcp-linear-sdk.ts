@@ -32,6 +32,11 @@ const SERVER_NAME = "linear-sdk";
 class LinearOAuthProvider implements OAuthClientProvider {
   readonly redirectUrl = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`;
   _callbackPromise: Promise<{ code: string; state: string }> | undefined;
+  readonly interactive: boolean;
+
+  constructor({ interactive = true }: { interactive?: boolean } = {}) {
+    this.interactive = interactive;
+  }
 
   get clientMetadata(): OAuthClientMetadata {
     return {
@@ -111,13 +116,22 @@ class LinearOAuthProvider implements OAuthClientProvider {
    * bound when we actually need the browser flow.
    */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    if (!this.interactive) {
+      // Reject immediately so the transport's re-auth fails fast with a clear message.
+      this._callbackPromise = Promise.reject(
+        new Error("Linear tokens expired. Run `linear-pi watch stop && linear-pi watch start` from an interactive terminal to re-authenticate."),
+      );
+      return;
+    }
     this._callbackPromise = waitForOAuthCallback();
     process.stderr.write(`\nLinear authentication required.\nOpen this URL in your browser:\n\n  ${authorizationUrl.toString()}\n`);
     try {
       const { default: open } = await import("open");
-      await open(authorizationUrl.toString());
+      // open() on Linux without a display (VPS) throws ENOENT for xdg-open.
+      // Wrap in a separate promise so any sync or async spawn error is caught.
+      await Promise.resolve(open(authorizationUrl.toString())).catch(() => {});
     } catch {
-      // `open` not available — user opens manually
+      // ignore — URL already printed above, user can open manually
     }
   }
 
@@ -232,7 +246,7 @@ function parseMcpJson<T>(result: any): T {
 
 export class SdkMcpLinearClient implements LinearClient {
   private client: Client | undefined;
-  private readonly authProvider = new LinearOAuthProvider();
+  private readonly authProvider: LinearOAuthProvider;
   private readonly serverUrl: string;
   private readonly interactive: boolean;
 
@@ -240,6 +254,7 @@ export class SdkMcpLinearClient implements LinearClient {
   constructor({ interactive = true }: { interactive?: boolean } = {}) {
     this.serverUrl = readLinearMcpUrl();
     this.interactive = interactive;
+    this.authProvider = new LinearOAuthProvider({ interactive });
   }
 
   private createTransport(): StreamableHTTPClientTransport {
