@@ -3,7 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import type { Config, AgentPreset } from "../types.js";
+import type { Config, AgentPreset, LinearIssue } from "../types.ts";
+import { isIssueDoneOrCanceled } from "../types.ts";
 
 export const CONFIG_DIR = path.join(os.homedir(), ".pi", "linear-pi");
 export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -254,4 +255,38 @@ export function slugify(input: string, max = 64): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, max)
     .replace(/-+$/g, "") || "linear-task";
+}
+
+/** Max total length of a tmux window name we generate. */
+const WINDOW_NAME_MAX = 45;
+
+/**
+ * Short uppercase code for a Linear issue's workflow state, shown as a `[CODE]`
+ * prefix in the tmux window name. Keyed off the status *name* first because
+ * "In Progress" and "In Review" usually share `statusType: "started"`.
+ */
+export function statusCode(issue: LinearIssue): string {
+  if (isIssueDoneOrCanceled(issue)) {
+    return issue.statusType === "canceled" || issue.status === "Canceled" ? "CXL" : "DONE";
+  }
+  const name = (issue.status || "").toLowerCase();
+  if (name.includes("review")) return "REV";
+  if (name.includes("progress") || issue.statusType === "started") return "WIP";
+  if (name === "todo" || issue.statusType === "unstarted") return "TODO";
+  if (issue.statusType === "backlog") return "BKLG";
+  if (issue.statusType === "triage") return "TRI";
+  return (issue.status || "").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 4).toUpperCase() || "?";
+}
+
+/**
+ * Build the tmux window name: `[CODE] REF title-slug`, capped to
+ * WINDOW_NAME_MAX by truncating only the title portion. The prefix
+ * (brackets, ref) is preserved as-is — tmux allows brackets/spaces/uppercase.
+ */
+export function buildWindowName(issue: LinearIssue): string {
+  const ref = issue.identifier || issue.id;
+  const prefix = `[${statusCode(issue)}] ${ref} `;
+  const titleBudget = Math.max(0, WINDOW_NAME_MAX - prefix.length);
+  const title = slugify(issue.title, titleBudget || 1);
+  return `${prefix}${title}`.trim();
 }
