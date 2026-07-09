@@ -2,21 +2,21 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import type { LinearIssue, WorkerState, WorkerPromptAttachment, Config } from "../types.js";
-import type { UIProvider } from "../providers/ui.js";
-import type { LinearClient } from "../providers/linear.js";
+import type { LinearIssue, WorkerState, WorkerPromptAttachment, Config } from "../types.ts";
+import type { UIProvider } from "../providers/ui.ts";
+import type { LinearClient } from "../providers/linear.ts";
 import {
   readConfig, writeConfig, repoScopeDir, logPath, pidPath,
-  resolveAgentPreset, AGENT_PRESETS, DEFAULT_AGENT, slugify,
+  resolveAgentPreset, AGENT_PRESETS, DEFAULT_AGENT, slugify, buildWindowName,
   setTriggerLabel, setAgent as setAgentConfig,
-} from "./config.js";
+} from "./config.ts";
 import {
   readState, writeState, withStateLock, readDaemonPid, isPidRunning,
   isDaemonRunning, removeRepoScopeDirIfUnused,
-} from "./state.js";
-import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.js";
-import { killTmuxWindow, startTmuxWindow } from "./tmux.js";
-import { issueLabels, isIssueDoneOrCanceled } from "../types.js";
+} from "./state.ts";
+import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.ts";
+import { killTmuxWindow, startTmuxWindow, renameTmuxWindow } from "./tmux.ts";
+import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -27,11 +27,13 @@ export class LinearPiOrchestrator {
   private runningOnce = false;
   private watchConfig: Config | undefined;
   private logs: string[] = [];
+  private readonly ui: UIProvider;
+  private readonly linear: LinearClient;
 
-  constructor(
-    private readonly ui: UIProvider,
-    private readonly linear: LinearClient,
-  ) {}
+  constructor(ui: UIProvider, linear: LinearClient) {
+    this.ui = ui;
+    this.linear = linear;
+  }
 
   // ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -200,6 +202,8 @@ export class LinearPiOrchestrator {
         this.log(tickConfig, `Auto-cleanup check: ${cleanupResult}`);
       }
 
+      await this.refreshWindowNames(tickConfig);
+
       const listArgs: Record<string, unknown> = {
         label: tickConfig.triggerLabel,
         limit: tickConfig.issueLimit,
@@ -264,7 +268,7 @@ export class LinearPiOrchestrator {
 
     const slug = slugify(`${identifier}-${issue.title}`);
     const branch = `${config.branchPrefix}/${slug}`;
-    const windowName = slug.slice(0, 48);
+    const windowName = buildWindowName(issue);
 
     try {
       const worktree = await this.ensureWorktree(config, branch);
@@ -284,6 +288,7 @@ export class LinearPiOrchestrator {
         tmuxWindowId,
         tmuxWindowIndex: index,
         status: "running",
+        linearStatus: issue.status,
         startedAt: new Date().toISOString(),
       };
       state.workers[identifier] = worker;
@@ -422,6 +427,37 @@ export class LinearPiOrchestrator {
 
   private formatWorkerChoice(worker: WorkerState): string {
     return `${worker.identifier} — ${worker.title}\n  tmux: ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}\n  branch: ${worker.branch}\n  worktree: ${worker.worktree}`;
+  }
+
+  /**
+   * Re-fetch each running worker's Linear status and rename its tmux window to
+   * reflect the current workflow state (e.g. `[REV] ENG-123 fix-login`). Only
+   * renames when the computed name changed. Never throws — a rename problem must
+   * not break the poll tick.
+   */
+  private async refreshWindowNames(config: Config): Promise<void> {
+    const workers = Object.values(readState(config.repoRoot).workers).filter((w) => w.status === "running");
+    for (const worker of workers) {
+      try {
+        const issue = await this.linear.getIssue(worker.identifier).catch(() => undefined);
+        if (!issue) continue;
+        const newName = buildWindowName(issue);
+        if (newName === worker.tmuxWindow) continue;
+        const renamed = await renameTmuxWindow(worker, newName);
+        if (!renamed) continue;
+        await withStateLock(config.repoRoot, async () => {
+          const state = readState(config.repoRoot);
+          const current = state.workers[worker.identifier];
+          if (!current) return;
+          current.tmuxWindow = newName;
+          current.linearStatus = issue.status;
+          writeState(state, config.repoRoot);
+        });
+        this.log(config, `Renamed window for ${worker.identifier} -> ${newName}.`);
+      } catch (error) {
+        this.log(config, `Failed to refresh window name for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    }
   }
 
   private async shouldCleanupWorker(worker: WorkerState, target: string, config: Config): Promise<boolean> {

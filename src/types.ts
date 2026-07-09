@@ -40,6 +40,8 @@ export type WorkerState = {
   /** Best-effort display index only. Never use as unverified cleanup target. */
   tmuxWindowIndex?: string;
   status: "running" | "failed";
+  /** Last-known Linear workflow status name (e.g. "In Review"); display-only. */
+  linearStatus?: string;
   startedAt: string;
   error?: string;
 };

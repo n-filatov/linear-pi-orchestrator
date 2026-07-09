@@ -1,8 +1,8 @@
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { WorkerState, Config } from "../types.js";
-import { resolveAgentPreset, resolveAgentBinary, shellQuote } from "./config.js";
+import type { WorkerState, Config } from "../types.ts";
+import { resolveAgentPreset, resolveAgentBinary, shellQuote } from "./config.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -63,6 +63,13 @@ export async function resolveTmuxWindowTarget(worker: WorkerState): Promise<stri
     if (indexed && tmuxWindowRecordMatches(worker, indexed)) return indexed.id;
   }
   return undefined;
+}
+
+export async function renameTmuxWindow(worker: WorkerState, newName: string): Promise<boolean> {
+  const target = await resolveTmuxWindowTarget(worker);
+  if (!target) return false;
+  await execFileAsync("tmux", ["rename-window", "-t", target, newName]).catch(() => {});
+  return true;
 }
 
 export async function killTmuxWindow(worker: WorkerState): Promise<void> {
