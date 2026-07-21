@@ -69,6 +69,10 @@ export type Config = {
   watchAssignee: string;
   setInProgress: boolean;
   inProgressState: string;
+  resourceCheckEnabled: boolean;
+  minFreeMemoryMb: number;
+  minFreeMemoryPercent: number;
+  maxLoadAveragePerCpu: number;
 };
 
 export type AgentPreset = {

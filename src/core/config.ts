@@ -81,6 +81,10 @@ export function defaultConfig(repoRoot = process.env.LINEAR_PI_REPO_ROOT || proc
     watchAssignee: process.env.LINEAR_PI_WATCH_ASSIGNEE || "me",
     setInProgress: process.env.LINEAR_PI_SET_IN_PROGRESS !== "false",
     inProgressState: process.env.LINEAR_PI_IN_PROGRESS_STATE || "In Progress",
+    resourceCheckEnabled: process.env.LINEAR_PI_RESOURCE_CHECK_ENABLED !== "false",
+    minFreeMemoryMb: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_MB || 1024),
+    minFreeMemoryPercent: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_PERCENT || 10),
+    maxLoadAveragePerCpu: Number(process.env.LINEAR_PI_MAX_LOAD_AVERAGE_PER_CPU || 4),
   };
 }
 
