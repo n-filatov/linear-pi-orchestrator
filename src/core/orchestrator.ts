@@ -16,6 +16,7 @@ import {
 } from "./state.ts";
 import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.ts";
 import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow } from "./tmux.ts";
+import { checkResourceCapacity } from "./resources.ts";
 import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -228,6 +229,14 @@ export class LinearPiOrchestrator {
         const blockingLabels = [tickConfig.runningLabel, tickConfig.doneLabel, tickConfig.blockedLabel].filter((l) => labels.includes(l));
         if (blockingLabels.length) { skipped.push(`${id}: has ${blockingLabels.join(", ")}`); continue; }
 
+        const resourceCheck = checkResourceCapacity(tickConfig);
+        if (!resourceCheck.ok) {
+          const message = `Skipping worker start for ${id}: insufficient server capacity (${resourceCheck.reason}). ${resourceCheck.details}.`;
+          this.log(tickConfig, message, "warning");
+          skipped.push(`${id}: insufficient capacity (${resourceCheck.reason})`);
+          break; // Stop starting more workers this tick; retry once capacity frees up.
+        }
+
         this.log(tickConfig, `Starting worker for ${id} (${issue.title})...`);
         const worker = await this.startIssue(id, tickConfig);
         started.push(`${id} -> ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}`);
@@ -265,6 +274,13 @@ export class LinearPiOrchestrator {
     await this.assertIssueCanStart(issue, config);
     const state = readState(config.repoRoot);
     if (state.workers[identifier]?.status === "running") return state.workers[identifier];
+
+    const resourceCheck = checkResourceCapacity(config);
+    if (!resourceCheck.ok) {
+      const message = `Refusing to start ${identifier}: insufficient server capacity (${resourceCheck.reason}). ${resourceCheck.details}.`;
+      this.log(config, message, "warning");
+      throw new Error(message);
+    }
 
     const slug = slugify(`${identifier}-${issue.title}`);
     const branch = `${config.branchPrefix}/${slug}`;
