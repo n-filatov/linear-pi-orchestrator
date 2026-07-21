@@ -15,7 +15,7 @@ import {
   isDaemonRunning, removeRepoScopeDirIfUnused,
 } from "./state.ts";
 import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.ts";
-import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow } from "./tmux.ts";
+import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow, resolveTmuxWindowTarget } from "./tmux.ts";
 import { checkResourceCapacity } from "./resources.ts";
 import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
 
@@ -203,6 +203,7 @@ export class LinearPiOrchestrator {
         this.log(tickConfig, `Auto-cleanup check: ${cleanupResult}`);
       }
 
+      await this.restoreLostSessions(tickConfig);
       await this.refreshWindowNames(tickConfig);
 
       const listArgs: Record<string, unknown> = {
@@ -500,6 +501,51 @@ export class LinearPiOrchestrator {
 
   private formatWorkerChoice(worker: WorkerState): string {
     return `${worker.identifier} — ${worker.title}\n  tmux: ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}\n  branch: ${worker.branch}\n  worktree: ${worker.worktree}`;
+  }
+
+  /**
+   * Recreate the tmux window (and session, if that was lost too) for any worker
+   * recorded as "running" whose tmux window no longer exists — e.g. after a tmux
+   * server crash/restart wiped all sessions. Never throws — a restore problem
+   * must not break the poll tick.
+   */
+  private async restoreLostSessions(config: Config): Promise<void> {
+    const workers = Object.values(readState(config.repoRoot).workers).filter((w) => w.status === "running");
+    for (const worker of workers) {
+      try {
+        const target = await resolveTmuxWindowTarget(worker);
+        if (target) continue;
+
+        if (!worker.worktree || !fs.existsSync(worker.worktree)) {
+          this.log(config, `Cannot restore session for ${worker.identifier}: worktree missing (${worker.worktree || "none"}).`, "warning");
+          continue;
+        }
+        const promptPath = path.join(worker.worktree, ".pi-linear-prompt.md");
+        if (!fs.existsSync(promptPath)) {
+          this.log(config, `Cannot restore session for ${worker.identifier}: prompt file missing (${promptPath}).`, "warning");
+          continue;
+        }
+
+        this.log(config, `Tmux session/window for ${worker.identifier} is gone; recreating it.`, "warning");
+        const restoreConfig: Config = { ...config, tmuxSession: worker.tmuxSession || config.tmuxSession };
+        const { id: tmuxWindowId, index, panePid } = await startTmuxWindow(
+          restoreConfig, worker.tmuxWindow, worker.worktree, worker.identifier, promptPath,
+        );
+        await withStateLock(config.repoRoot, async () => {
+          const state = readState(config.repoRoot);
+          const current = state.workers[worker.identifier];
+          if (!current) return;
+          current.tmuxSession = restoreConfig.tmuxSession;
+          current.tmuxWindowId = tmuxWindowId;
+          current.tmuxWindowIndex = index;
+          current.panePid = panePid;
+          writeState(state, config.repoRoot);
+        });
+        this.log(config, `Restored ${worker.identifier}: ${restoreConfig.tmuxSession}:${index}:${worker.tmuxWindow}.`);
+      } catch (error) {
+        this.log(config, `Failed to restore session for ${worker.identifier}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    }
   }
 
   /**
