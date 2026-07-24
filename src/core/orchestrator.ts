@@ -18,6 +18,8 @@ import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, exte
 import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow, resolveTmuxWindowTarget } from "./tmux.ts";
 import { checkResourceCapacity } from "./resources.ts";
 import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
+import { color } from "./logger.ts";
+import { renderSummary } from "./render.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,6 +50,8 @@ export class LinearPiOrchestrator {
     } catch {
       // Keep in-memory logging working even if file logging is unavailable.
     }
+    // Pretty, human-attended console (no-op unless an interactive TTY / CLI).
+    this.ui.logLine("watch", message, level);
     this.ui.setStatus(WATCH_STATUS_KEY, level === "error" ? "Linear: error" : this.statusBarText(config));
     this.ui.setWidget(WATCH_STATUS_KEY, ["Linear watch", ...this.logs.slice(-12)]);
   }
@@ -74,19 +78,20 @@ export class LinearPiOrchestrator {
 
   statusSummary(config = readConfig(), includeRecentLogs = false): string {
     const workers = this.listWorkers("running", config);
-    const lines = [
-      `Linear watcher: ${this.isWatching(config) ? "running" : "stopped"}`,
-      `Daemon pid: ${this.daemonPidSummary(config)}`,
-      `Label: ${config.triggerLabel}`,
-      `Agent: ${resolveAgentPreset(config.agent).label} (${resolveAgentPreset(config.agent).id})`,
-      `Repo: ${config.repoRoot}`,
-      `Interval: ${config.pollIntervalMs}ms`,
-      `Required assignee: ${config.requireAssigneeMe ? config.watchAssignee : "disabled"}`,
-      `Running workers: ${workers.length}`,
-      `Logs: ${logPath(config.repoRoot)}`,
-    ];
-    if (includeRecentLogs) lines.push("", "Recent logs:", this.getLogs(config));
-    return lines.join("\n");
+    const agent = resolveAgentPreset(config.agent);
+    const summary = renderSummary([
+      ["Linear watcher", this.isWatching(config) ? color.green("running") : color.dim("stopped")],
+      ["Daemon pid", this.daemonPidSummary(config)],
+      ["Label", config.triggerLabel],
+      ["Agent", `${agent.label} (${agent.id})`],
+      ["Repo", config.repoRoot],
+      ["Interval", `${config.pollIntervalMs}ms`],
+      ["Required assignee", config.requireAssigneeMe ? config.watchAssignee : color.dim("disabled")],
+      ["Running workers", String(workers.length)],
+      ["Logs", logPath(config.repoRoot)],
+    ]);
+    if (!includeRecentLogs) return summary;
+    return `${summary}\n\n${color.bold("Recent logs:")}\n${this.getLogs(config)}`;
   }
 
   private daemonPidSummary(config = readConfig()): string {
@@ -194,7 +199,7 @@ export class LinearPiOrchestrator {
     }
     this.runningOnce = true;
     try {
-      this.log(tickConfig, `Polling for label ${tickConfig.triggerLabel}${tickConfig.requireAssigneeMe ? ` assigned to ${tickConfig.watchAssignee}` : ""} (limit ${tickConfig.issueLimit})...`);
+      this.log(tickConfig, `Polling  label=${tickConfig.triggerLabel}${tickConfig.requireAssigneeMe ? `  assignee=${tickConfig.watchAssignee}` : ""}  limit=${tickConfig.issueLimit}`);
 
       const cleanupResult = await this.cleanup("done", tickConfig);
       if (cleanupResult.startsWith("Cleaned ")) {
@@ -215,39 +220,36 @@ export class LinearPiOrchestrator {
       if (tickConfig.requireAssigneeMe) listArgs.assignee = tickConfig.watchAssignee;
 
       const issues = await this.linear.listIssues(listArgs as any);
-      this.log(tickConfig, `Linear returned ${issues.length} issue(s).`);
+      this.log(tickConfig, `→ ${issues.length} issue(s) returned`);
 
       const state = readState(tickConfig.repoRoot);
       const started: string[] = [];
-      const skipped: string[] = [];
+      const skip = (id: string, reason: string) => this.log(tickConfig, `⏭  ${id}  skipped (${reason})`);
 
       for (const issue of issues) {
         const id = issue.id;
         const labels = issueLabels(issue);
-        if (!id) { skipped.push("unknown issue: missing id"); continue; }
-        if (state.workers[id]?.status === "running") { skipped.push(`${id}: already has running worker`); continue; }
-        if (isIssueDoneOrCanceled(issue)) { skipped.push(`${id}: status is ${issue.status || issue.statusType || "done/canceled"}`); continue; }
+        if (!id) { skip("unknown issue", "missing id"); continue; }
+        if (state.workers[id]?.status === "running") { skip(id, "worker already running"); continue; }
+        if (isIssueDoneOrCanceled(issue)) { skip(id, `status is ${issue.status || issue.statusType || "done/canceled"}`); continue; }
         const blockingLabels = [tickConfig.runningLabel, tickConfig.doneLabel, tickConfig.blockedLabel].filter((l) => labels.includes(l));
-        if (blockingLabels.length) { skipped.push(`${id}: has ${blockingLabels.join(", ")}`); continue; }
+        if (blockingLabels.length) { skip(id, `has ${blockingLabels.join(", ")}`); continue; }
 
         const resourceCheck = checkResourceCapacity(tickConfig);
         if (!resourceCheck.ok) {
-          const message = `Skipping worker start for ${id}: insufficient server capacity (${resourceCheck.reason}). ${resourceCheck.details}.`;
-          this.log(tickConfig, message, "warning");
-          skipped.push(`${id}: insufficient capacity (${resourceCheck.reason})`);
+          this.log(tickConfig, `⏸  ${id}  skipped (insufficient capacity: ${resourceCheck.reason}). ${resourceCheck.details}.`, "warning");
           break; // Stop starting more workers this tick; retry once capacity frees up.
         }
 
-        this.log(tickConfig, `Starting worker for ${id} (${issue.title})...`);
         const worker = await this.startIssue(id, tickConfig);
-        started.push(`${id} -> ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}`);
-        this.log(tickConfig, `Started ${id}: ${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}.`);
+        const target = `${worker.tmuxSession}:${worker.tmuxWindowIndex || "?"}:${worker.tmuxWindow}`;
+        started.push(`${id} -> ${target}`);
+        this.log(tickConfig, `▶  ${id}  started → ${target}`);
       }
 
-      if (skipped.length) this.log(tickConfig, `Skipped: ${skipped.join("; ")}.`);
       const message = started.length
-        ? `Started ${started.length} worker(s) for label \`${tickConfig.triggerLabel}\`:\n${started.join("\n")}`
-        : `No issues with label \`${tickConfig.triggerLabel}\` to start.`;
+        ? `${color.green(`✔ Started ${started.length} worker(s)`)} for label \`${tickConfig.triggerLabel}\`:\n${started.map((s) => `  ▶  ${s}`).join("\n")}`
+        : color.dim(`No issues with label \`${tickConfig.triggerLabel}\` to start.`);
       this.log(tickConfig, started.length ? `Tick done. Started ${started.length}.` : "Tick done. Nothing to start.");
       return message;
     } catch (error) {

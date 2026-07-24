@@ -2,13 +2,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LinearPiOrchestrator } from "./core/orchestrator.js";
-import { PiUIProvider } from "./providers/pi-ui.js";
-import { PiMcpLinearClient } from "./providers/mcp-linear-pi.js";
+import { LinearPiOrchestrator } from "./core/orchestrator.ts";
+import { PiUIProvider } from "./providers/pi-ui.ts";
+import { PiMcpLinearClient } from "./providers/mcp-linear-pi.ts";
 import {
   readConfig, writeConfig, resolveRepoRoot, AGENT_PRESETS,
   setTriggerLabel, setAgent, readWatchBarPreference, writeWatchBarPreference,
-} from "./core/config.js";
+} from "./core/config.ts";
 
 const WATCH_STATUS_KEY = "linear-watch";
 const WATCH_BAR_INTERVAL_MS = 30_000;

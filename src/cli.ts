@@ -2,17 +2,18 @@
 import * as fs from "node:fs";
 import { Command } from "commander";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import { LinearPiOrchestrator } from "./core/orchestrator.js";
-import { CliUIProvider } from "./providers/cli-ui.js";
-import { SdkMcpLinearClient } from "./providers/mcp-linear-sdk.js";
+import { LinearPiOrchestrator } from "./core/orchestrator.ts";
+import { CliUIProvider } from "./providers/cli-ui.ts";
+import { renderWorkerTable } from "./core/render.ts";
+import { SdkMcpLinearClient } from "./providers/mcp-linear-sdk.ts";
 import {
   readConfig, writeConfig, resolveRepoRoot, AGENT_PRESETS,
   setTriggerLabel, setAgent, logPath, pidPath, repoScopeDir,
-} from "./core/config.js";
-import { isDaemonRunning } from "./core/state.js";
+} from "./core/config.ts";
+import { isDaemonRunning } from "./core/state.ts";
 import {
   readCachedUpdateAvailable, checkForUpdateBackground, performUpdate, versionString,
-} from "./core/updater.js";
+} from "./core/updater.ts";
 
 // ── Daemon mode (spawned by startDaemon) ──────────────────────────────────────
 
@@ -208,10 +209,7 @@ function runCli() {
       const config = resolveConfig(program.opts().cwd);
       const workers = orchestrator.listWorkers(undefined, config);
       if (!workers.length) { ui.notify("No Linear Pi workers recorded."); return; }
-      const text = workers
-        .map((w) => `${w.identifier} [${w.status}]\n  tmux: ${w.tmuxSession}:${w.tmuxWindowIndex || "?"}:${w.tmuxWindow}\n  branch: ${w.branch}\n  worktree: ${w.worktree}${w.error ? `\n  error: ${w.error}` : ""}`)
-        .join("\n\n");
-      ui.notify(text);
+      ui.notify(renderWorkerTable(workers));
     });
 
   // ── linear-pi auth ────────────────────────────────────────────────────────

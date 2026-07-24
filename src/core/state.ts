@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
-import type { StateFile } from "../types.js";
-import { ensureConfigDir, repoScopeDir, statePath, lockPath, pidPath, readConfig } from "./config.js";
+import type { StateFile } from "../types.ts";
+import { ensureConfigDir, repoScopeDir, statePath, lockPath, pidPath, readConfig } from "./config.ts";
 
 export function readState(repoRoot = readConfig().repoRoot): StateFile {
   ensureConfigDir();

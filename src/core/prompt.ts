@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import type { LinearIssue, WorkerPromptAttachment } from "../types.js";
+import type { LinearIssue, WorkerPromptAttachment } from "../types.ts";
 
 export function extractMarkdownImageUrls(markdown?: string): string[] {
   if (!markdown) return [];

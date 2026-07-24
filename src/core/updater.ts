@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { BUILD_DATE, RELEASE_TAG } from "./version.js";
+import { BUILD_DATE, RELEASE_TAG } from "./version.ts";
 
 const REPO = "n-filatov/linear-pi-orchestrator";
 const CACHE_PATH = path.join(os.homedir(), ".pi", "linear-pi", "update-check.json");
