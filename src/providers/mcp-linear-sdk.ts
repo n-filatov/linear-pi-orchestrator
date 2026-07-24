@@ -13,15 +13,15 @@ import type {
   OAuthClientInformationMixed,
   OAuthClientInformationFull,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import type { LinearClient } from "./linear.js";
-import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.js";
+import type { LinearClient } from "./linear.ts";
+import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.ts";
 import {
   getTokens, saveTokens, clearTokens,
   getClientInfo, saveClientInfo, clearClientInfo,
   getCodeVerifier, saveCodeVerifier,
   getOAuthState, saveOAuthState, clearAll,
   type StoredTokens,
-} from "./oauth-storage.js";
+} from "./oauth-storage.ts";
 
 const LINEAR_MCP_URL = "https://mcp.linear.app/mcp";
 const OAUTH_CALLBACK_PORT = 19876;

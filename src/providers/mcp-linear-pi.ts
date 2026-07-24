@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import type { LinearClient } from "./linear.js";
-import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.js";
+import type { LinearClient } from "./linear.ts";
+import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.ts";
 
 // pi-mcp-adapter lives inside the Pi agent's own npm install, under the current
 // user's home directory — not a regular project dependency — so it can't be a

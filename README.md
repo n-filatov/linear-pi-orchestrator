@@ -50,11 +50,12 @@ linear-pi -C /path/to/repo watch start   # target a specific repo root
 
 ## Install — Pi extension
 
-Global install for local development:
+Global install for local development. Symlink the repo root (not the entry file directly) so Pi's package.json-based
+extension resolution picks up `pi.extensions` and relative imports between `src/` files resolve correctly:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-ln -sf "$PWD/src/extension.ts" ~/.pi/agent/extensions/linear-pi-orchestrator.ts
+ln -sf "$PWD" ~/.pi/agent/extensions/linear-pi-orchestrator
 ```
 
 Then restart Pi or run `/reload`.

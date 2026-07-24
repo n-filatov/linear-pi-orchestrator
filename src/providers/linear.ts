@@ -1,4 +1,4 @@
-import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.js";
+import type { LinearIssue, ListIssuesArgs, SaveIssueArgs, ExtractedImage } from "../types.ts";
 
 export interface LinearClient {
   listIssues(args: ListIssuesArgs): Promise<LinearIssue[]>;

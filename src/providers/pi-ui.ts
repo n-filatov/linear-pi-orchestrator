@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { UIProvider } from "./ui.js";
+import type { UIProvider } from "./ui.ts";
 
 export class PiUIProvider implements UIProvider {
   private ctx: ExtensionContext | undefined;
@@ -11,6 +11,9 @@ export class PiUIProvider implements UIProvider {
   notify(message: string, level: "info" | "warning" | "error" = "info") {
     this.ctx?.ui?.notify?.(message, level);
   }
+
+  /** No-op — the Pi host renders watcher progress via the status widget. */
+  logLine(_scope: string, _message: string, _level: "info" | "warning" | "error" = "info") {}
 
   async select(prompt: string, choices: string[]): Promise<string | undefined> {
     if (!this.ctx) return undefined;

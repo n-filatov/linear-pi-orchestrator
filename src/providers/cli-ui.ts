@@ -1,16 +1,13 @@
-import type { UIProvider } from "./ui.js";
-
-const LEVEL_PREFIX: Record<string, string> = {
-  info: "",
-  warning: "Warning: ",
-  error: "Error: ",
-};
+import type { UIProvider } from "./ui.ts";
+import { notify as consolaNotify, logLine as consolaLogLine } from "../core/logger.ts";
 
 export class CliUIProvider implements UIProvider {
   notify(message: string, level: "info" | "warning" | "error" = "info") {
-    const stream = level === "error" ? process.stderr : process.stdout;
-    const prefix = LEVEL_PREFIX[level] ?? "";
-    stream.write(`${prefix}${message}\n`);
+    consolaNotify(message, level);
+  }
+
+  logLine(scope: string, message: string, level: "info" | "warning" | "error" = "info") {
+    consolaLogLine(scope, message, level);
   }
 
   async select(prompt: string, choices: string[]): Promise<string | undefined> {
