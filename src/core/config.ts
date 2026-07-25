@@ -84,7 +84,7 @@ export function defaultConfig(repoRoot = process.env.LINEAR_PI_REPO_ROOT || proc
     resourceCheckEnabled: process.env.LINEAR_PI_RESOURCE_CHECK_ENABLED !== "false",
     minFreeMemoryMb: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_MB || 1024),
     minFreeMemoryPercent: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_PERCENT || 10),
-    maxLoadAveragePerCpu: Number(process.env.LINEAR_PI_MAX_LOAD_AVERAGE_PER_CPU || 4),
+    maxLoadAveragePerCpu: Number(process.env.LINEAR_PI_MAX_LOAD_AVERAGE_PER_CPU || 2),
   };
 }
 
