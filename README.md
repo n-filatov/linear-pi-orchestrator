@@ -141,14 +141,17 @@ Workers launch via `bash -lc`, so the agent command must be resolvable there. Th
 - `LINEAR_PI_POLL_INTERVAL_MS=30000`
 - `LINEAR_PI_REQUIRE_ASSIGNEE_ME=true`
 - `LINEAR_PI_WATCH_ASSIGNEE=me`
-- `LINEAR_PI_RESOURCE_CHECK_ENABLED=true` (set `false` to disable the capacity guard below)
-- `LINEAR_PI_MIN_FREE_MEMORY_MB=1024` (refuse to start a worker if free RAM drops below this)
-- `LINEAR_PI_MIN_FREE_MEMORY_PERCENT=10` (refuse to start a worker if free RAM drops below this percentage of total)
-- `LINEAR_PI_MAX_LOAD_AVERAGE_PER_CPU=4` (refuse to start a worker if 1-minute load average per CPU core exceeds this; `0` disables the load check)
+- `LINEAR_PI_MAX_WORKERS=5` (max workers allowed to run at once; `0` means unlimited)
 
-## Server capacity guard
+## Worker cap
 
-Before starting a worker (from `/linear-watch` polling or a manual `/linear-start`), the orchestrator checks free memory and load average against the thresholds above. If the server doesn't have enough headroom, it logs a warning (`Skipping worker start for <ID>: insufficient server capacity ...` / `Refusing to start <ID>: ...`) and does not spawn the agent — the watcher retries the issue on its next poll instead of piling on more workers and crashing the box. Tune the thresholds or set `LINEAR_PI_RESOURCE_CHECK_ENABLED=false` if you want the old unguarded behavior.
+Before starting a worker (from `/linear-watch` polling or a manual `/linear-start`), the orchestrator counts workers already in `running` state and refuses to start another once `LINEAR_PI_MAX_WORKERS` is reached. The watcher logs `⏸ <ID> skipped (at worker cap: ...)` and stops starting workers for that tick, retrying on the next poll as slots free up; a manual `/linear-start` fails with `Refusing to start <ID>: at worker cap ...`.
+
+`failed` workers do not consume a slot — they hold a tmux window until cleanup, but they aren't doing work, so a few failures can't wedge the watcher.
+
+Pick the number from what one worker actually costs on your machine, remembering that a worker's footprint is bimodal: a few hundred MB while it thinks, several GB while it runs a test suite. A 48 GB laptop running a JS monorepo comfortably fits about 5. `LINEAR_PI_MAX_WORKERS=0` restores the old unbounded behavior.
+
+This replaces the earlier free-memory/load-average thresholds (`LINEAR_PI_MIN_FREE_MEMORY_MB` and friends), which measured the wrong thing at the wrong moment: a worker reads a few hundred MB for its first minute and only later balloons into a test run, so several could clear a memory floor in the same tick and collectively swamp the machine. Those settings are ignored on read and dropped from `config.json` the next time it is written.
 
 ## Notes
 

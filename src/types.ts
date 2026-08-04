@@ -69,10 +69,8 @@ export type Config = {
   watchAssignee: string;
   setInProgress: boolean;
   inProgressState: string;
-  resourceCheckEnabled: boolean;
-  minFreeMemoryMb: number;
-  minFreeMemoryPercent: number;
-  maxLoadAveragePerCpu: number;
+  /** Max workers allowed to run at once. `0` (or less) means unlimited. */
+  maxWorkers: number;
 };
 
 export type AgentPreset = {

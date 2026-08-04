@@ -81,11 +81,16 @@ export function defaultConfig(repoRoot = process.env.LINEAR_PI_REPO_ROOT || proc
     watchAssignee: process.env.LINEAR_PI_WATCH_ASSIGNEE || "me",
     setInProgress: process.env.LINEAR_PI_SET_IN_PROGRESS !== "false",
     inProgressState: process.env.LINEAR_PI_IN_PROGRESS_STATE || "In Progress",
-    resourceCheckEnabled: process.env.LINEAR_PI_RESOURCE_CHECK_ENABLED !== "false",
-    minFreeMemoryMb: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_MB || 1024),
-    minFreeMemoryPercent: Number(process.env.LINEAR_PI_MIN_FREE_MEMORY_PERCENT || 10),
-    maxLoadAveragePerCpu: Number(process.env.LINEAR_PI_MAX_LOAD_AVERAGE_PER_CPU || 4),
+    maxWorkers: numberEnv("LINEAR_PI_MAX_WORKERS", 5),
   };
+}
+
+/** Reads a numeric env var, falling back when unset, blank or unparseable. */
+function numberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
 }
 
 function readJsonFile<T extends object>(filePath: string): Partial<T> {
@@ -96,9 +101,32 @@ function readJsonFile<T extends object>(filePath: string): Partial<T> {
   }
 }
 
+/**
+ * Settings that no longer exist. The memory/load thresholds they configured were
+ * replaced by the single `maxWorkers` cap; a persisted config that still carries
+ * them would otherwise be spread into the merged object and written straight back
+ * out, leaving dead keys in the file forever.
+ */
+const REMOVED_CONFIG_KEYS = [
+  "resourceCheckEnabled",
+  "minFreeMemoryMb",
+  "minFreeMemoryPercent",
+  "minAvailableMemoryMb",
+  "minAvailableMemoryPercent",
+  "maxSwapUsedPercent",
+  "maxLoadAveragePerCpu",
+];
+
+/** Strips retired keys from a config layer before it is merged. */
+function dropRemovedKeys(layer: Partial<Config>): Partial<Config> {
+  const record = layer as Record<string, unknown>;
+  for (const key of REMOVED_CONFIG_KEYS) delete record[key];
+  return layer;
+}
+
 export function readConfig(repoRootHint?: string): Config {
   ensureConfigDir();
-  const globalConfig = readJsonFile<Config>(CONFIG_PATH);
+  const globalConfig = dropRemovedKeys(readJsonFile<Config>(CONFIG_PATH));
   const repoRoot = path.resolve(
     repoRootHint
     || process.env.LINEAR_PI_REPO_ROOT
@@ -106,7 +134,7 @@ export function readConfig(repoRootHint?: string): Config {
     || process.cwd()
   );
   const scopedPath = configPath(repoRoot);
-  const scopedConfig = readJsonFile<Config>(scopedPath);
+  const scopedConfig = dropRemovedKeys(readJsonFile<Config>(scopedPath));
   const config = { ...defaultConfig(repoRoot), ...globalConfig, ...scopedConfig, repoRoot };
   if (!fs.existsSync(CONFIG_PATH)) fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig(repoRoot), null, 2));
   if (!fs.existsSync(scopedPath)) writeConfig(config);

@@ -16,7 +16,7 @@ import {
 } from "./state.ts";
 import { buildWorkerPrompt, extractMarkdownImageUrls, extensionForMimeType, extensionForAttachmentContent } from "./prompt.ts";
 import { killTmuxWindow, killWorkerProcesses, verifyNoWorktreeProcesses, startTmuxWindow, renameTmuxWindow, resolveTmuxWindowTarget } from "./tmux.ts";
-import { checkResourceCapacity } from "./resources.ts";
+import { checkWorkerCapacity } from "./capacity.ts";
 import { issueLabels, isIssueDoneOrCanceled } from "../types.ts";
 import { color } from "./logger.ts";
 import { renderSummary } from "./render.ts";
@@ -235,10 +235,13 @@ export class LinearPiOrchestrator {
         const blockingLabels = [tickConfig.runningLabel, tickConfig.doneLabel, tickConfig.blockedLabel].filter((l) => labels.includes(l));
         if (blockingLabels.length) { skip(id, `has ${blockingLabels.join(", ")}`); continue; }
 
-        const resourceCheck = checkResourceCapacity(tickConfig);
-        if (!resourceCheck.ok) {
-          this.log(tickConfig, `⏸  ${id}  skipped (insufficient capacity: ${resourceCheck.reason}). ${resourceCheck.details}.`, "warning");
-          break; // Stop starting more workers this tick; retry once capacity frees up.
+        // Re-read state each iteration: workers started earlier in this same loop
+        // must count against the cap, and `state` above was read before any of
+        // them existed.
+        const capacity = checkWorkerCapacity(tickConfig, readState(tickConfig.repoRoot));
+        if (!capacity.ok) {
+          this.log(tickConfig, `⏸  ${id}  skipped (at worker cap: ${capacity.reason})`, "warning");
+          break; // Stop starting more workers this tick; retry once a slot frees up.
         }
 
         const worker = await this.startIssue(id, tickConfig);
@@ -278,9 +281,11 @@ export class LinearPiOrchestrator {
     const state = readState(config.repoRoot);
     if (state.workers[identifier]?.status === "running") return state.workers[identifier];
 
-    const resourceCheck = checkResourceCapacity(config);
-    if (!resourceCheck.ok) {
-      const message = `Refusing to start ${identifier}: insufficient server capacity (${resourceCheck.reason}). ${resourceCheck.details}.`;
+    // Authoritative gate: runs under the state lock, so two concurrent starts
+    // cannot both observe a free slot and take it.
+    const capacity = checkWorkerCapacity(config, state);
+    if (!capacity.ok) {
+      const message = `Refusing to start ${identifier}: at worker cap (${capacity.reason}). Raise LINEAR_PI_MAX_WORKERS to allow more.`;
       this.log(config, message, "warning");
       throw new Error(message);
     }

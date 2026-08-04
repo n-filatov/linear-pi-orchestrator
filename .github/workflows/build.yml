@@ -50,7 +50,10 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install
+        # --frozen-lockfile fails if bun.lock is out of sync with package.json,
+        # catching lockfile drift (e.g. a dep added to package.json but not the
+        # lockfile) before it can break a later install path.
+        run: bun install --frozen-lockfile
 
       - name: Write version info
         run: |
