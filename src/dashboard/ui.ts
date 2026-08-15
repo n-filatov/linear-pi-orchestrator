@@ -57,7 +57,16 @@ export function renderDashboardHtml(projectName: string): string {
 <div x-show="mainTab === 'workers'" class="flex-1 overflow-auto p-4">
   <div class="flex items-center justify-between mb-3">
     <span class="text-xs uppercase tracking-widest text-base-content/40 font-medium">Active &amp; recent workers</span>
-    <span class="text-xs text-base-content/30">auto-refresh 5s</span>
+    <div class="flex items-center gap-3">
+      <div class="flex items-center gap-1.5">
+        <template x-for="s in allStatuses" :key="s">
+          <button class="badge badge-sm font-medium cursor-pointer border transition-opacity"
+            :class="hiddenStatuses.indexOf(s) < 0 ? statusBadgeClass(s) : 'badge-ghost opacity-30'"
+            @click="toggleStatus(s)" x-text="s"></button>
+        </template>
+      </div>
+      <span class="text-xs text-base-content/30">auto-refresh 5s</span>
+    </div>
   </div>
   <div class="overflow-x-auto rounded-lg border border-base-300">
     <table class="table table-sm">
@@ -71,10 +80,10 @@ export function renderDashboardHtml(projectName: string): string {
         <template x-if="loadingRuns">
           <tr><td colspan="7" class="text-center py-10 text-base-content/30">Loading…</td></tr>
         </template>
-        <template x-if="!loadingRuns && runs.length === 0">
-          <tr><td colspan="7" class="text-center py-10 text-base-content/30">No runs yet.</td></tr>
+        <template x-if="!loadingRuns && filteredRuns().length === 0">
+          <tr><td colspan="7" class="text-center py-10 text-base-content/30" x-text="runs.length > 0 ? 'No runs match the current filter.' : 'No runs yet.'"></td></tr>
         </template>
-        <template x-for="run in runs" :key="run.id">
+        <template x-for="run in filteredRuns()" :key="run.id">
           <tr class="hover">
             <td class="font-bold text-primary text-xs" x-text="run.item.id"></td>
             <td class="max-w-xs truncate text-sm" :title="run.item.title" x-text="run.item.title"></td>
@@ -577,6 +586,8 @@ function relay() {
   return {
     daemon: 'checking', activeRuns: '—', totalRuns: '—',
     mainTab: 'workers', runs: [], loadingRuns: true,
+    allStatuses: ['claimed','provisioning','launching','running','failed','stopped','succeeded'],
+    hiddenStatuses: ['stopped','succeeded'],
     configSection: 'project', loadingConfig: true, saving: false,
     feedback: null, externalChanged: false, lastMtime: 0, configPath: '',
     configSections: [
@@ -767,6 +778,9 @@ function relay() {
     addAction(){this.actions.push({key:'',use:'launch',enabled:true,withJson:'{}',launchHarness:this.harnesses.length?this.harnesses[0].key:'',launchMode:'interactive',launchModel:'',launchPrompt:'Implement {{item.id}}: {{item.title}}\\n\\n{{item.description}}',launchPromptFile:'',launchExtraJson:'{}',collapsed:false});},
     addTrigger(){this.triggers.push({id:'',source:this.sources.length?this.sources[0].key:'',enabled:true,matchJson:'{}',actionRefs:[],firePolicy:'once-per-match',maxConcurrent:'',targetsJson:'',collapsed:false});},
     toggleRef(trigger,key){var idx=trigger.actionRefs.indexOf(key);if(idx>=0)trigger.actionRefs.splice(idx,1);else trigger.actionRefs.push(key);},
+    filteredRuns(){return this.runs.filter((r) => this.hiddenStatuses.indexOf(r.status) < 0);},
+    toggleStatus(s){var idx=this.hiddenStatuses.indexOf(s);if(idx>=0)this.hiddenStatuses.splice(idx,1);else this.hiddenStatuses.push(s);},
+    statusBadgeClass(s){return {'badge-info':s==='running','badge-warning':['claimed','provisioning','launching'].indexOf(s)>=0,'badge-error':s==='failed','badge-ghost':s==='stopped','badge-success':s==='succeeded'};},
     fmtDate(iso){if(!iso)return '—';var d=new Date(iso),z=function(n){return String(n).padStart(2,'0');};return z(d.getMonth()+1)+'/'+z(d.getDate())+' '+z(d.getHours())+':'+z(d.getMinutes());},
     shortPath(p){if(!p)return '—';return p.split('/').slice(-2).join('/');},
     canClean(run){return ['claimed','provisioning','launching','running'].indexOf(run.status)>=0||(run.workspace&&!run.workspaceCleanedAt);},
