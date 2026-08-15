@@ -1,4 +1,5 @@
 import PQueue from "p-queue";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   createRunKey,
@@ -12,7 +13,9 @@ import {
   type WorkItem,
   type WorkSource,
   type WorkspaceProvider,
+  isActiveRun,
 } from "../domain/index.js";
+import type { ActionContext, ActionResult, LaunchWorkerActionRequest, RelayPluginRegistry } from "../plugins/index.js";
 
 export interface TriggerProvider {
   list(): Promise<readonly TriggerDefinition[]>;
@@ -25,6 +28,8 @@ export interface TaskRelayDependencies {
   workspaceProvider: WorkspaceProvider;
   agentLauncher: AgentLauncher;
   logger: RelayLogger;
+  actionPlugins?: RelayPluginRegistry;
+  actionExecutions?: ActionInvocationStore;
   now?: () => Date;
 }
 
@@ -34,6 +39,22 @@ export interface TickResult {
   runsClaimed: number;
   runsLaunched: number;
   skipped: number;
+  actionsExecuted: number;
+  actionsFailed: number;
+}
+
+export interface ActionInvocationClaim {
+  idempotencyKey: string;
+  triggerId: string;
+  sourceId: string;
+  itemId: string;
+  actionId: string;
+  claimedAt: string;
+}
+
+export interface ActionInvocationStore {
+  claimActionExecution(claim: ActionInvocationClaim): Promise<{ claimedAt: string } | undefined>;
+  finishActionExecution(id: string, claimedAt: string, transition: { status: "succeeded" | "failed" | "skipped"; completedAt: string; output?: unknown; error?: unknown }): Promise<unknown>;
 }
 
 export interface StopOptions {
@@ -99,6 +120,8 @@ export class TaskRelay {
       runsClaimed: 0,
       runsLaunched: 0,
       skipped: 0,
+      actionsExecuted: 0,
+      actionsFailed: 0,
     };
 
     const triggers = await this.dependencies.triggers.list();
@@ -138,7 +161,7 @@ export class TaskRelay {
     const maxConcurrent = normaliseConcurrency(trigger.maxConcurrent);
     const eligible: WorkItem[] = [];
     for (const item of items) {
-      if (isTerminalWorkItem(item)) {
+      if (isTerminalWorkItem(item) && !trigger.actions?.length) {
         result.skipped += 1;
         continue;
       }
@@ -151,15 +174,17 @@ export class TaskRelay {
         result.skipped += 1;
         continue;
       }
-      const alreadyActive = await this.dependencies.runStore.findActive({
-        repository: trigger.repository,
-        sourceId: source.id,
-        itemId: item.id,
-        triggerId: trigger.id,
-      });
-      if (alreadyActive) {
-        result.skipped += 1;
-        continue;
+      if (!trigger.actions?.length) {
+        const alreadyActive = await this.dependencies.runStore.findActive({
+          repository: trigger.repository,
+          sourceId: source.id,
+          itemId: item.id,
+          triggerId: trigger.id,
+        });
+        if (alreadyActive) {
+          result.skipped += 1;
+          continue;
+        }
       }
       eligible.push(item);
     }
@@ -169,10 +194,13 @@ export class TaskRelay {
     const queue = new PQueue({ concurrency: maxConcurrent });
     for (const item of eligible) {
       void queue.add(async () => {
-        const outcome = await this.dispatchItem(source, trigger, item);
-        result.runsClaimed += outcome.claimed ? 1 : 0;
-        result.runsLaunched += outcome.launched ? 1 : 0;
-        result.skipped += outcome.skipped ? 1 : 0;
+        if (trigger.actions?.length) await this.executeActions(source, trigger, item, result);
+        else {
+          const outcome = await this.dispatchItem(source, trigger, item);
+          result.runsClaimed += outcome.claimed ? 1 : 0;
+          result.runsLaunched += outcome.launched ? 1 : 0;
+          result.skipped += outcome.skipped ? 1 : 0;
+        }
       }).catch((error: unknown) => {
         this.dependencies.logger.error("Task relay dispatch failed unexpectedly", {
           triggerId: trigger.id,
@@ -189,7 +217,7 @@ export class TaskRelay {
     source: WorkSource,
     trigger: TriggerDefinition,
     item: WorkItem,
-  ): Promise<{ claimed: boolean; launched: boolean; skipped: boolean }> {
+  ): Promise<{ claimed: boolean; launched: boolean; skipped: boolean; run?: RunRecord }> {
     if (this.stopController.signal.aborted || isTerminalWorkItem(item)) {
       return { claimed: false, launched: false, skipped: true };
     }
@@ -242,7 +270,7 @@ export class TaskRelay {
       run.completedAt = this.now().toISOString();
       run.updatedAt = run.completedAt;
       await this.dependencies.runStore.update(run);
-      return { claimed: true, launched: false, skipped: false };
+      return { claimed: true, launched: false, skipped: false, run };
     }
     try {
       run.status = "provisioning";
@@ -276,7 +304,7 @@ export class TaskRelay {
         agentId: run.agent.agentId,
         model: run.agent.model,
       });
-      return { claimed: true, launched: true, skipped: false };
+      return { claimed: true, launched: true, skipped: false, run };
     } catch (error) {
       run.status = "failed";
       run.error = messageFor(error);
@@ -288,8 +316,122 @@ export class TaskRelay {
         runId: run.id,
         error: run.error,
       });
-      return { claimed: true, launched: false, skipped: false };
+      return { claimed: true, launched: false, skipped: false, run };
     }
+  }
+
+  private async executeActions(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, result: TickResult): Promise<void> {
+    const registry = this.dependencies.actionPlugins;
+    if (!registry) throw new Error(`Trigger ${trigger.id} declares actions, but no action registry is configured.`);
+    const outputs: Record<string, ActionResult> = {};
+    let haltPipeline = false;
+    for (const action of trigger.actions ?? []) {
+      if (this.stopController.signal.aborted || haltPipeline) break;
+      const plugin = registry.action(action.use);
+      if (!plugin) throw new Error(`Unknown action plugin '${action.use}' in trigger ${trigger.id}.`);
+      const config = registry.parseActionConfig(action.use, action.config ?? {});
+      const runs = plugin.target === "worker" ? await this.workerTargets(trigger, item) : [undefined];
+      if (plugin.target === "worker" && runs.length === 0) {
+        outputs[action.id] = { status: "skipped", message: "No matching workers." };
+        result.skipped += 1;
+        continue;
+      }
+      for (const run of runs) {
+        const executionId = actionExecutionId(trigger, item, action.id, run?.worker?.id);
+        const actionClaimedAt = await this.claimActionExecution(executionId, trigger, item, action.id);
+        if (!actionClaimedAt) {
+          this.dependencies.logger.debug("Trigger action deduplicated", { triggerId: trigger.id, actionId: action.id, itemId: item.id, workerId: run?.worker?.id });
+          result.skipped += 1;
+          continue;
+        }
+        try {
+          this.dependencies.logger.info("Trigger action started", { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, workerId: run?.worker?.id });
+          const context: ActionContext = {
+            executionId,
+            actionId: action.id,
+            triggerId: trigger.id,
+            repository: trigger.repository,
+            sourceId: source.id,
+            item,
+            outputs,
+            targets: trigger.targets?.workers,
+            worker: run?.worker,
+            run,
+            workers: {
+              launch: (request) => this.launchFromAction(source, trigger, item, action.id, request, result),
+              cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
+            },
+            signal: this.stopController.signal,
+          };
+          const actionResult = await plugin.execute(context, config);
+          outputs[action.id] = actionResult;
+          result.actionsExecuted += 1;
+          await this.finishActionExecution(executionId, actionClaimedAt, actionResult.status, actionResult.output);
+          this.dependencies.logger.info(`Trigger action ${actionResult.status}`, { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, workerId: run?.worker?.id });
+        } catch (error) {
+          result.actionsFailed += 1;
+          await this.finishActionExecution(executionId, actionClaimedAt, "failed", undefined, messageFor(error));
+          this.dependencies.logger.error("Trigger action failed", { triggerId: trigger.id, actionId: action.id, itemId: item.id, error: messageFor(error) });
+          if (!action.continueOnError) {
+            haltPipeline = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  private async launchFromAction(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, actionId: string, request: LaunchWorkerActionRequest, result: TickResult): Promise<ActionResult> {
+    const derived: TriggerDefinition = {
+      ...trigger,
+      id: `${trigger.id}:${actionId}`,
+      actions: undefined,
+      agent: { id: request.harness, model: request.model, promptTemplate: request.prompt, metadata: { modelProfile: request.modelProfile } },
+      metadata: { ...trigger.metadata, ...request.workspace },
+    };
+    const outcome = await this.dispatchItem(source, derived, item);
+    result.runsClaimed += outcome.claimed ? 1 : 0;
+    result.runsLaunched += outcome.launched ? 1 : 0;
+    if (!outcome.launched) return { status: "skipped", message: outcome.run?.error ?? "Worker was not launched." };
+    return { status: "succeeded", output: { runId: outcome.run?.id, workerId: outcome.run?.worker?.id } };
+  }
+
+  private async cleanupFromAction(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, workerId: string): Promise<ActionResult> {
+    const runs = await this.workerTargets(trigger, item, [workerId]);
+    const run = runs[0];
+    if (!run) return { status: "skipped", message: `Worker ${workerId} was not found or was already cleaned.` };
+    const wasActive = isActiveRun(run.status);
+    if (wasActive && run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
+    if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
+    const completedAt = this.now().toISOString();
+    const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;
+    const cleaned = await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, completedAt);
+    if (!cleaned) throw new Error(`Workspace was removed, but worker ${workerId} changed before cleanup was recorded.`);
+    if (stopped) await this.report(source, "stopped", stopped);
+    return { status: "succeeded", output: { workerId, runId: run.id, workspace: run.workspace?.path } };
+  }
+
+  private async workerTargets(trigger: TriggerDefinition, item: WorkItem, explicitWorkerIds?: readonly string[]): Promise<readonly RunRecord[]> {
+    if (!this.dependencies.runStore.findWorkerTargets) throw new Error("The configured run store cannot resolve worker action targets.");
+    const selector = trigger.targets?.workers;
+    return this.dependencies.runStore.findWorkerTargets({
+      repository: trigger.repository,
+      sourceId: item.sourceId,
+      itemId: item.id,
+      selection: selector?.runs ?? "all",
+      workerIds: explicitWorkerIds ?? selector?.workerIds,
+    });
+  }
+
+  private async claimActionExecution(id: string, trigger: TriggerDefinition, item: WorkItem, actionId: string): Promise<string | undefined> {
+    const claimedAt = this.now().toISOString();
+    if (!this.dependencies.actionExecutions) return claimedAt;
+    const claimed = await this.dependencies.actionExecutions.claimActionExecution({ idempotencyKey: id, triggerId: trigger.id, sourceId: item.sourceId, itemId: item.id, actionId, claimedAt });
+    return claimed?.claimedAt;
+  }
+
+  private async finishActionExecution(id: string, claimedAt: string, status: "succeeded" | "failed" | "skipped", output?: Record<string, unknown>, error?: string): Promise<void> {
+    await this.dependencies.actionExecutions?.finishActionExecution(id, claimedAt, { status, output, error, completedAt: this.now().toISOString() });
   }
 
   private async stopAndCleanupActiveRuns(): Promise<void> {
@@ -312,6 +454,7 @@ export class TaskRelay {
             status: "stopped",
             completedAt: this.now().toISOString(),
           });
+          if (run.workspace) await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, this.now().toISOString());
           if (source && stopped) await this.report(source, "stopped", stopped);
         } catch (error) {
           this.dependencies.logger.error("Could not stop active run", {
@@ -406,6 +549,20 @@ export class TaskRelay {
       return false;
     }
   }
+}
+
+function actionExecutionId(trigger: TriggerDefinition, item: WorkItem, actionId: string, workerId?: string): string {
+  const policy = trigger.firePolicy ?? "once-per-match";
+  const occurrence = policy === "every-poll"
+    ? randomUUID()
+    : policy === "on-change"
+      ? actionFingerprint(trigger, item)
+      : "item";
+  return JSON.stringify([trigger.repository.id, trigger.repository.root, trigger.id, item.sourceId, item.id, actionId, workerId ?? "", occurrence]);
+}
+
+function actionFingerprint(trigger: TriggerDefinition, item: WorkItem): string {
+  return createHash("sha256").update(JSON.stringify({ match: trigger.selector ?? {}, item })).digest("hex");
 }
 
 function normaliseConcurrency(value: number | undefined): number {

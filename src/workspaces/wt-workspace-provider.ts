@@ -1,5 +1,5 @@
 import path from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
 import { execa } from "execa";
 import type { RunRecord, Workspace } from "../domain/index.js";
 import type { WorktreeProvider, WorkspaceProviderOptions } from "./types.js";
@@ -45,11 +45,15 @@ export class WtWorkspaceProvider implements WorktreeProvider {
     if (ownership.createdBranch) {
       const configPath = await this.ensureRelayConfig(worktreeRoot);
       const removed = await execa("wt", ["--config", configPath, "-C", repository, "remove", branch, "--force", "-D", "--foreground", "-y", "--no-hooks"], { reject: false });
-      if (removed.exitCode === 0) return;
+      if (removed.exitCode === 0 && !await pathExists(space.path)) return;
     }
     // wt may not know a stale worktree; native Git provides a safe recovery path.
     const removed = await execa("git", ["worktree", "remove", "--force", space.path], { cwd: repository, reject: false });
-    if (removed.exitCode !== 0 || !ownership.createdBranch) return;
+    if (removed.exitCode !== 0 && await pathExists(space.path)) {
+      throw new Error(`Could not remove worktree ${space.path}: ${removed.stderr.trim() || `git exited with code ${removed.exitCode}`}`);
+    }
+    if (await pathExists(space.path)) throw new Error(`Git reported success, but worktree still exists at ${space.path}.`);
+    if (!ownership.createdBranch) return;
     if (await localBranchExists(repository, branch)) await execa("git", ["branch", "-D", branch], { cwd: repository });
   }
 
@@ -76,6 +80,15 @@ export class WtWorkspaceProvider implements WorktreeProvider {
     const template = path.join(worktreeRoot, "{{ branch | sanitize }}");
     await writeFile(configPath, `# Managed by Task Relay; do not edit.\nworktree-path = ${JSON.stringify(template)}\n`, "utf8");
     return configPath;
+  }
+}
+
+async function pathExists(value: string): Promise<boolean> {
+  try { await lstat(value); return true; }
+  catch (error) {
+    const code = error !== null && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (code === "ENOENT") return false;
+    throw error;
   }
 }
 

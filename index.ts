@@ -2,6 +2,8 @@ export * from "./src/domain/index.js";
 export * from "./src/core/index.js";
 export * from "./src/sources/index.js";
 export * from "./src/agents/index.js";
+export * from "./src/actions/index.js";
+export * from "./src/plugins/index.js";
 export * from "./src/runtime/index.js";
 export * from "./src/workspaces/index.js";
 export * from "./src/config/schema.js";

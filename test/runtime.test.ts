@@ -1,9 +1,34 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { execa } from "execa";
 import { describe, expect, it } from "vitest";
-import { TmuxExecutionAdapter } from "../src/runtime/execution-adapters.js";
+import { DirectProcessAdapter, TmuxExecutionAdapter } from "../src/runtime/execution-adapters.js";
 import type { AgentExecution, AgentExecutionResult } from "../src/agents/types.js";
 import type { WorkerHandle } from "../src/domain/index.js";
+
+describe("DirectProcessAdapter", () => {
+  it("does not resolve stop until the worker process has exited", async () => {
+    const adapter = new DirectProcessAdapter({ stopTimeoutMs: 500 });
+    const execution = await adapter.execute({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(),
+      env: {},
+      workerName: "stop-test",
+    });
+    expect(execution.pid).toBeTruthy();
+    const worker: WorkerHandle = { id: "direct-worker", startedAt: "now", metadata: { pid: execution.pid } };
+    try {
+      await delay(25);
+      await adapter.stop(worker);
+      expect(await adapter.reconcile(worker)).toMatchObject({ status: "failed" });
+    } finally {
+      if (execution.pid) {
+        try { process.kill(execution.pid, "SIGKILL"); } catch { /* already stopped */ }
+      }
+    }
+  });
+});
 
 describe("TmuxExecutionAdapter", () => {
   it("lets tmux allocate distinct windows for concurrent launches", async (context) => {

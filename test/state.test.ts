@@ -108,4 +108,98 @@ describe("RepositoryStateStore", () => {
       await rm(stateHome, { recursive: true, force: true });
     }
   });
+
+  it("persists idempotent action executions with structured results", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-actions-"));
+    const originalStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateHome;
+    try {
+      const repository: RepositoryScope = { id: "actions", root: join(stateHome, "repo") };
+      const store = new RepositoryStateStore(repository.root);
+      const claim = {
+        idempotencyKey: "linear:ENG-123:notify:v1",
+        triggerId: "notify-ready",
+        actionId: "slack",
+        sourceId: "linear",
+        itemId: "ENG-123",
+        claimedAt: "2026-01-01T00:00:00.000Z",
+        input: { channel: "agents", labels: ["relay:implement"] },
+      };
+
+      const [left, right] = await Promise.all([
+        store.claimActionExecution(claim),
+        new RepositoryStateStore(repository.root).claimActionExecution(claim),
+      ]);
+      const execution = left ?? right;
+      expect(execution).toMatchObject({ id: claim.idempotencyKey, status: "running", input: claim.input });
+      expect([left, right].filter(Boolean)).toHaveLength(1);
+
+      const finished = await store.finishActionExecution(claim.idempotencyKey, claim.claimedAt, {
+        status: "succeeded",
+        completedAt: "2026-01-01T00:01:00.000Z",
+        output: { messageId: "slack-42", delivered: true },
+      });
+      expect(finished).toMatchObject({ status: "succeeded", output: { messageId: "slack-42", delivered: true } });
+      expect(await store.finishActionExecution(claim.idempotencyKey, claim.claimedAt, {
+        status: "failed",
+        completedAt: "2026-01-01T00:02:00.000Z",
+        error: { message: "late result" },
+      })).toBeUndefined();
+      expect(await store.claimAction(claim)).toBeUndefined();
+      expect(await store.listActionExecutions({ sourceId: "linear", statuses: ["succeeded"] })).toHaveLength(1);
+    } finally {
+      if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = originalStateHome;
+      await rm(stateHome, { recursive: true, force: true });
+    }
+  });
+
+  it("finds worker targets by source item or explicit worker id without retrying cleaned workspaces", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-worker-targets-"));
+    const originalStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateHome;
+    try {
+      const repository: RepositoryScope = { id: "worker-targets", root: join(stateHome, "repo") };
+      const store = new RepositoryStateStore(repository.root);
+      const createRun = async (triggerId: string, claimedAt: string, workerId?: string) => {
+        const trigger: TriggerDefinition = { id: triggerId, sourceId: "linear", repository, enabled: true };
+        const identity = { repository, sourceId: "linear", itemId: "ENG-123", triggerId };
+        const run = await store.claim({
+          id: "unused",
+          identity,
+          item: { sourceId: "linear", id: "ENG-123", title: "Task" },
+          trigger,
+          agent: { agentId: "codex" },
+          claimedAt,
+          maxConcurrent: 5,
+        });
+        if (!run) throw new Error("Expected test run to be claimed");
+        if (!workerId) return run;
+        const withWorker = {
+          ...run,
+          status: "running" as const,
+          workspace: { path: join(stateHome, workerId) },
+          worker: { id: workerId, startedAt: claimedAt },
+        };
+        await store.update(withWorker);
+        return withWorker;
+      };
+
+      const active = await createRun("implementation", "2026-01-03T00:00:00.000Z", "worker-active");
+      const completed = await createRun("review", "2026-01-02T00:00:00.000Z", "worker-cleaned");
+      await store.finishActive(completed.identity, completed.claimedAt, { status: "succeeded", completedAt: "2026-01-02T00:01:00.000Z" });
+      await store.markWorkspaceCleaned(completed.identity, completed.claimedAt, "2026-01-02T00:02:00.000Z");
+      await createRun("notification", "2026-01-01T00:00:00.000Z");
+
+      expect(await store.findRunsForItem({ repository, sourceId: "linear", itemId: "ENG-123" })).toHaveLength(3);
+      expect((await store.findWorkerTargets({ repository, sourceId: "linear", itemId: "ENG-123", selection: "all" })).map((run) => run.worker?.id)).toEqual(["worker-active"]);
+      expect((await store.findWorkerTargets({ repository, workerIds: ["worker-cleaned"], includeCleaned: true, selection: "latest" })).map((run) => run.worker?.id)).toEqual(["worker-cleaned"]);
+      expect((await store.findWorkerTargets({ repository, sourceId: "linear", itemId: "ENG-123", selection: "active" })).map((run) => run.id)).toEqual([active.id]);
+      await expect(store.findWorkerTargets({ repository })).rejects.toThrow(/sourceId and itemId/);
+    } finally {
+      if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = originalStateHome;
+      await rm(stateHome, { recursive: true, force: true });
+    }
+  });
 });

@@ -27,6 +27,7 @@ export function templateValues(input: {
   const workspace = text(space.path ?? space.worktree ?? space.directory);
 
   return {
+    item: input.workItem,
     id: text(item.id),
     key: text(item.key ?? item.identifier ?? item.id),
     title: text(item.title),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseCommandItems } from "../src/sources/command-source.js";
-import { LinearMcpSource } from "../src/sources/linear-mcp-source.js";
+import { LinearMcpSource, isLinearTriggerSelector, parseLinearTriggerSelector } from "../src/sources/linear-mcp-source.js";
 import type { McpToolClient, McpToolResult } from "../src/sources/mcp-tool-client.js";
 import type { RunRecord, TriggerDefinition } from "../src/domain/index.js";
 
@@ -13,6 +13,86 @@ describe("command source protocol", () => {
 });
 
 describe("Linear source identity and lifecycle reporting", () => {
+  it("owns label, workflow-state, and state-type matching while using safe list filters", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const client: McpToolClient = {
+      async callTool(name, args): Promise<McpToolResult> {
+        calls.push({ name, args });
+        return {
+          structuredContent: [
+            {
+              id: "uuid-123",
+              identifier: "ENG-123",
+              title: "Eligible",
+              labels: ["relay:implement", "team:platform"],
+              status: { name: "In Progress", type: "started" },
+            },
+            {
+              id: "uuid-456",
+              identifier: "ENG-456",
+              title: "Excluded label",
+              labels: ["relay:implement", "relay:blocked"],
+              status: { name: "In Progress", type: "started" },
+            },
+            {
+              id: "uuid-789",
+              identifier: "ENG-789",
+              title: "Wrong state type",
+              labels: ["relay:implement", "team:platform"],
+              status: { name: "Done", type: "completed" },
+            },
+          ],
+        };
+      },
+    };
+    const source = new LinearMcpSource({ id: "linear", client });
+    const trigger = {
+      ...linearTrigger(),
+      selector: {
+        labels: { all: ["relay:implement", "team:platform"], any: ["team:platform", "team:api"], none: ["relay:blocked"] },
+        statuses: ["In Progress"],
+        statusTypes: ["started"],
+      },
+    };
+
+    const items = await source.discover({ trigger });
+
+    expect(items.map((item) => item.id)).toEqual(["ENG-123"]);
+    expect(items[0]?.metadata).toMatchObject({ linearStatus: "In Progress", linearStatusType: "started" });
+    expect(calls[0]).toEqual({
+      name: "list_issues",
+      args: { label: "relay:implement", state: "In Progress", limit: 50, includeArchived: false, orderBy: "updatedAt" },
+    });
+  });
+
+  it("keeps OR label matching local when it cannot be expressed as one Linear list filter", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const client: McpToolClient = {
+      async callTool(name, args): Promise<McpToolResult> {
+        calls.push({ name, args });
+        return { structuredContent: [{ id: "uuid-123", identifier: "ENG-123", title: "API task", labels: ["team:api"], status: "Todo" }] };
+      },
+    };
+    const source = new LinearMcpSource({ id: "linear", client });
+    const trigger = { ...linearTrigger(), selector: { labels: { any: ["team:api", "team:platform"] }, status: "Todo" } };
+
+    const [item] = await source.discover({ trigger });
+
+    expect(item?.id).toBe("ENG-123");
+    expect(calls[0]?.args).toEqual({ state: "Todo", limit: 50, includeArchived: false, orderBy: "updatedAt" });
+  });
+
+  it("normalises existing selector shorthands", () => {
+    expect(parseLinearTriggerSelector({ label: "relay:implement", excludeLabels: ["relay:running"], status: "Todo", statusType: "unstarted" })).toEqual({
+      label: "relay:implement",
+      statuses: ["Todo"],
+      statusTypes: ["unstarted"],
+      excludeLabels: ["relay:running"],
+    });
+    expect(isLinearTriggerSelector({ labels: { all: ["relay:implement"] }, statuses: ["Todo"] })).toBe(true);
+    expect(isLinearTriggerSelector({ labels: { all: [1] } })).toBe(false);
+  });
+
   it("uses the human identifier while retaining the provider id for writes", async () => {
     const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
     const client: McpToolClient = {

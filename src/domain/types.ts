@@ -61,6 +61,25 @@ export interface TriggerDefinition {
   reasoningEffort?: string;
   promptDelivery?: "stdin" | "argument" | "file";
   metadata?: Record<string, unknown>;
+  /** Ordered, source-neutral actions executed when this trigger matches. */
+  actions?: readonly TriggerActionDefinition[];
+  targets?: TriggerTargetDefinition;
+  firePolicy?: "once-per-match" | "once-per-item" | "on-change" | "every-poll";
+}
+
+export interface TriggerActionDefinition {
+  id: string;
+  use: string;
+  config?: unknown;
+  continueOnError?: boolean;
+}
+
+export interface TriggerTargetDefinition {
+  workers?: {
+    sourceItem?: "current";
+    runs?: "latest" | "active" | "all";
+    workerIds?: readonly string[];
+  };
 }
 
 /** All dimensions that make a dispatch unique. */
@@ -177,6 +196,22 @@ export interface RunStore {
   markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined>;
   update(run: RunRecord): Promise<void>;
   listActive?(repository: RepositoryScope): Promise<readonly RunRecord[]>;
+  /** Find workers created for a source item, regardless of the trigger that launched them. */
+  findRunsForItem?(query: {
+    repository: RepositoryScope;
+    sourceId: string;
+    itemId: string;
+    selection?: "latest" | "active" | "all";
+    includeCleaned?: boolean;
+  }): Promise<readonly RunRecord[]>;
+  findWorkerTargets?(query: {
+    repository: RepositoryScope;
+    sourceId?: string;
+    itemId?: string;
+    selection?: "latest" | "active" | "all";
+    workerIds?: readonly string[];
+    includeCleaned?: boolean;
+  }): Promise<readonly RunRecord[]>;
 }
 
 export interface AgentLaunchSpec {

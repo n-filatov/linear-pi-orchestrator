@@ -20,6 +20,7 @@ import type {
   AgentLaunchRequest,
   AgentLaunchResult,
   AgentModelProfile,
+  BuiltInHarnessId,
   CommandAgentProfile,
   PromptDeliveryMode,
   ResolvedAgentLaunch,
@@ -107,7 +108,7 @@ export function resolveAgentLaunch(input: {
 }
 
 export type CommandAgentLauncherOptions = {
-  /** Omit to use the built-in Codex and Claude profiles. */
+  /** Omit to use Relay's built-in command harness profiles. */
   profiles?: readonly CommandAgentProfile[];
   executor: AgentExecutionAdapter;
   /** Defaults supplied by the entry point's parsed CLI/config layer. */
@@ -261,14 +262,20 @@ Workspace: {{workspace}}
 Branch: {{branch}}
 `;
 
-/** Sensible opt-in defaults; callers may replace either profile completely. */
+/**
+ * Built-in command harness definitions. Models stay deliberately unconstrained
+ * strings: each harness/provider evolves its own model catalogue, and callers
+ * can pass a model directly without adding a Relay release.
+ *
+ * Callers may replace these profiles entirely or add arbitrary command-based
+ * profiles alongside them.
+ */
 export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
   return [
     {
       id: "codex",
       command: "codex",
       args: ["exec"],
-      defaultModel: "gpt-5.3-codex",
       modelArgument: "--model",
       promptDelivery: "argument",
     },
@@ -280,7 +287,30 @@ export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
       reasoningEffortArgument: "--effort",
       promptDelivery: "argument",
     },
+    {
+      id: "pi",
+      command: "pi",
+      modelArgument: "--model",
+      promptDelivery: "argument",
+    },
+    {
+      id: "opencode",
+      command: "opencode",
+      args: ["run"],
+      modelArgument: "--model",
+      promptDelivery: "argument",
+    },
   ];
+}
+
+/** Alias that uses the product vocabulary while retaining the v1 agent API. */
+export const builtInHarnessProfiles = builtInAgentProfiles;
+
+/** Resolve one shipped harness definition without exposing a mutable shared object. */
+export function builtInHarnessProfile(id: BuiltInHarnessId): CommandAgentProfile {
+  const profile = builtInAgentProfiles().find((candidate) => candidate.id === id);
+  if (!profile) throw new Error(`Unknown built-in harness: ${id}`);
+  return profile;
 }
 
 function workspaceDirectory(workspace: Workspace): string {

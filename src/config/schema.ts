@@ -153,3 +153,27 @@ export const relayConfigSchema = z.object({
 
 export type RelayConfig = z.infer<typeof relayConfigSchema>;
 export type RelayTrigger = z.infer<typeof triggerSchema>;
+
+// v2 is exported here as well as from `config/v2` so existing consumers have a
+// single configuration entry point during the migration.
+export {
+  actionDefinitionV2Schema,
+  firePolicySchema,
+  harnessDefinitionV2Schema,
+  inlineActionV2Schema,
+  legacyToV2,
+  normalizeRelayConfig,
+  pluginDefinitionSchema,
+  relayConfigV2Schema,
+  sourceDefinitionV2Schema,
+  triggerActionV2Schema,
+  triggerTargetsV2Schema,
+  triggerV2Schema,
+  workerTargetSelectorSchema,
+} from "./v2.js";
+export type {
+  RelayActionReference,
+  RelayConfigV2,
+  RelayTriggerV2,
+  WorkerTargetSelectorConfig,
+} from "./v2.js";

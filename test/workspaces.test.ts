@@ -1,9 +1,10 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { execa } from "execa";
+import { lstat } from "node:fs/promises";
 import type { RunRecord, Workspace } from "../src/domain/index.js";
 
 vi.mock("execa", () => ({ execa: vi.fn() }));
-vi.mock("node:fs/promises", () => ({ mkdir: vi.fn(), writeFile: vi.fn() }));
+vi.mock("node:fs/promises", () => ({ lstat: vi.fn(), mkdir: vi.fn(), writeFile: vi.fn() }));
 
 import { GitWorktreeProvider } from "../src/workspaces/git-worktree-provider.js";
 import { WtWorkspaceProvider } from "../src/workspaces/wt-workspace-provider.js";
@@ -32,8 +33,13 @@ function command(stdout = "", exitCode = 0): never {
 }
 
 const mockExeca = vi.mocked(execa);
+const mockLstat = vi.mocked(lstat);
 
-beforeEach(() => mockExeca.mockReset());
+beforeEach(() => {
+  mockExeca.mockReset();
+  mockLstat.mockReset();
+  mockLstat.mockRejectedValue(Object.assign(new Error("missing"), { code: "ENOENT" }));
+});
 
 function wasCalled(file: string, expectedArgs: readonly string[]): boolean {
   return mockExeca.mock.calls.some((call) => call[0] === file && Array.isArray(call[1]) && call[1].every((value, index) => value === expectedArgs[index]) && call[1].length === expectedArgs.length);
@@ -99,6 +105,20 @@ describe("GitWorktreeProvider cleanup ownership", () => {
     await expect(provider.cleanup(outside, run())).rejects.toThrow(/outside the configured Relay workspace root/);
     expect(mockExeca).not.toHaveBeenCalled();
   });
+
+  it("reports a failed native worktree removal instead of recording false success", async () => {
+    const provider = new GitWorktreeProvider({ worktreeRoot: workspaceRoot });
+    const space: Workspace = {
+      path: `${workspaceRoot}/relay-ENG-123`,
+      branch,
+      metadata: { repository, provider: "git-worktree", taskRelay: { createdWorkspace: true, createdBranch: true, worktreeRoot: workspaceRoot } },
+    };
+    mockExeca.mockResolvedValueOnce({ stdout: "", stderr: "worktree is busy", exitCode: 1 } as never);
+    mockLstat.mockResolvedValueOnce({} as never);
+
+    await expect(provider.cleanup(space, run())).rejects.toThrow(/worktree is busy/);
+    expect(wasCalled("git", ["branch", "-D", branch])).toBe(false);
+  });
 });
 
 describe("WtWorkspaceProvider cleanup ownership", () => {
@@ -152,6 +172,21 @@ describe("WtWorkspaceProvider cleanup ownership", () => {
 
     await expect(provider.provision(run())).rejects.toThrow(/outside the configured Relay workspace root/);
     expect(wasCalled("wt", ["--config", wtConfigPath, "-C", repository, "remove", branch, "--force", "-D", "--foreground", "-y", "--no-hooks"])).toBe(false);
+  });
+
+  it("reports failure when both wt and native Git leave the workspace behind", async () => {
+    const provider = new WtWorkspaceProvider({ worktreeRoot: workspaceRoot });
+    const space: Workspace = {
+      path: `${workspaceRoot}/relay-ENG-123`,
+      branch,
+      metadata: { repository, provider: "wt", taskRelay: { createdWorkspace: true, createdBranch: true, worktreeRoot: workspaceRoot } },
+    };
+    mockExeca
+      .mockResolvedValueOnce(command("", 1))
+      .mockResolvedValueOnce({ stdout: "", stderr: "still in use", exitCode: 1 } as never);
+    mockLstat.mockResolvedValue({} as never);
+
+    await expect(provider.cleanup(space, run())).rejects.toThrow(/still in use/);
   });
 });
 

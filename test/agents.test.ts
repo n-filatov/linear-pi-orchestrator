@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentLaunch, templateValues, type CommandAgentProfile } from "../src/agents/index.js";
+import {
+  CommandAgentLauncher,
+  builtInAgentProfiles,
+  builtInHarnessProfile,
+  resolveAgentLaunch,
+  templateValues,
+  type CommandAgentProfile,
+} from "../src/agents/index.js";
 import { agentProfiles } from "../src/app.js";
 import { relayConfigSchema } from "../src/config/schema.js";
 import type { TriggerDefinition } from "../src/domain/index.js";
@@ -16,6 +23,41 @@ const profile: CommandAgentProfile = {
 };
 
 describe("agent resolution", () => {
+  it("ships command harnesses for Codex, Claude, Pi, and OpenCode", () => {
+    expect(builtInAgentProfiles().map((profile) => profile.id)).toEqual(["codex", "claude", "pi", "opencode"]);
+    expect(builtInHarnessProfile("pi")).toMatchObject({ command: "pi", modelArgument: "--model", promptDelivery: "argument" });
+    expect(builtInHarnessProfile("opencode")).toMatchObject({ command: "opencode", args: ["run"], modelArgument: "--model" });
+  });
+
+  it("passes an arbitrary model string and custom prompt through a built-in harness", async () => {
+    const launches: Array<{ command: string; args: readonly string[]; stdin?: string }> = [];
+    const launcher = new CommandAgentLauncher({
+      executor: {
+        async execute(execution) {
+          launches.push(execution);
+          return { pid: 42 };
+        },
+      },
+    });
+
+    const result = await launcher.launchConfigured({
+      workItem: { sourceId: "linear", id: "ENG-123", title: "Review pull request" },
+      workspace: { path: "/repo/.task-relay/workspaces/ENG-123" },
+      prompt: "Review PR 123 using the repository conventions.",
+      overrides: { agent: "opencode", model: "gpt-5.6-terra" },
+    });
+
+    expect(result.resolved.modelId).toBe("gpt-5.6-terra");
+    expect(launches).toEqual([{
+      command: "opencode",
+      args: ["--model", "gpt-5.6-terra", "run", "Review PR 123 using the repository conventions."],
+      cwd: "/repo/.task-relay/workspaces/ENG-123",
+      env: { TASK_RELAY_MODEL: "gpt-5.6-terra" },
+      stdin: undefined,
+      workerName: "ENG-123",
+    }]);
+  });
+
   it("applies explicit run overrides before trigger and profile defaults", () => {
     const trigger = { id: "ready", sourceId: "queue", repository: { id: "repo", root: "/repo" }, enabled: true, agent: { id: "codex", model: "fast" } } satisfies TriggerDefinition;
     const resolved = resolveAgentLaunch({ profiles: [profile], trigger, overrides: { modelProfile: "deep", reasoningEffort: "xhigh" } });

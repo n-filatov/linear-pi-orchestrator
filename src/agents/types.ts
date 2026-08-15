@@ -42,6 +42,9 @@ export type CommandAgentProfile = AgentProfile & {
   };
 };
 
+/** Built-in command harnesses shipped by Relay. Custom profiles remain supported. */
+export type BuiltInHarnessId = "codex" | "claude" | "pi" | "opencode";
+
 export type AgentLaunchOverrides = {
   agent?: string;
   model?: string;
@@ -108,6 +111,7 @@ export interface AgentExecutionAdapter {
 }
 
 export type TemplateValues = {
+  item: WorkItem;
   id: string;
   key: string;
   title: string;

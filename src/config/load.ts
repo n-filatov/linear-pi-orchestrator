@@ -4,7 +4,7 @@ import { basename, dirname, resolve } from "node:path";
 import { cosmiconfig } from "cosmiconfig";
 import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
-import { relayConfigSchema, type RelayConfig } from "./schema.js";
+import { normalizeRelayConfig, type RelayConfigV2 } from "./schema.js";
 
 export const CONFIG_FILE = ".task-relay.yaml";
 export const LOCAL_CONFIG_FILE = ".task-relay.local.yaml";
@@ -37,14 +37,19 @@ async function yamlFile(path: string): Promise<unknown | undefined> {
   return loaded?.config;
 }
 
-export async function loadRelayConfig(start?: string): Promise<{ config: RelayConfig; projectRoot: string; configPath: string; localConfigPath?: string }> {
+/**
+ * Always returns the normalized v2 shape. Existing version: 1 files remain
+ * valid and are converted in memory; `relay config migrate` can later write
+ * the equivalent v2 document explicitly.
+ */
+export async function loadRelayConfig(start?: string): Promise<{ config: RelayConfigV2; projectRoot: string; configPath: string; localConfigPath?: string }> {
   const projectRoot = await findProjectRoot(start);
   const configPath = resolve(projectRoot, CONFIG_FILE);
   if (!existsSync(configPath)) throw new RelayConfigError(`No ${CONFIG_FILE} found for ${projectRoot}. Run 'relay init' first.`);
   const localPath = resolve(projectRoot, LOCAL_CONFIG_FILE);
   try {
     const merged = deepMerge(await yamlFile(configPath), existsSync(localPath) ? await yamlFile(localPath) : undefined);
-    const config = relayConfigSchema.parse(merged);
+    const config = normalizeRelayConfig(merged);
     return { config, projectRoot, configPath, localConfigPath: existsSync(localPath) ? localPath : undefined };
   } catch (error) {
     if (error instanceof ZodError) {
@@ -55,4 +60,4 @@ export async function loadRelayConfig(start?: string): Promise<{ config: RelayCo
   }
 }
 
-export function renderRelayConfig(config: RelayConfig): string { return stringify(config, { lineWidth: 0 }); }
+export function renderRelayConfig(config: RelayConfigV2): string { return stringify(config, { lineWidth: 0 }); }

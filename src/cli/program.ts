@@ -4,37 +4,70 @@ import { Command } from "commander";
 import { confirm, input, number, select } from "@inquirer/prompts";
 import { resolve } from "node:path";
 import { renderRelayConfig, findProjectRoot, loadRelayConfig, CONFIG_FILE, LOCAL_CONFIG_FILE } from "../config/load.js";
-import { relayConfigSchema, type RelayConfig, type RelayTrigger } from "../config/schema.js";
+import { relayConfigV2Schema, type RelayConfigV2, type RelayTriggerV2 } from "../config/schema.js";
 import { createEventLogger, eventLogPath, logEvent, readEvents, stateDirectory } from "../logging/events.js";
 import { errorTable, eventsTable, statusTable } from "../logging/tables.js";
 import { RepositoryStateStore } from "../state/store.js";
 import { writeFile } from "node:fs/promises";
 
-export type RelayCommandContext = { projectRoot: string; config: RelayConfig; store: RepositoryStateStore; logger: ReturnType<typeof createEventLogger>; write: (value: string) => void };
+export type RelayCommandContext = { projectRoot: string; config: RelayConfigV2; store: RepositoryStateStore; logger: ReturnType<typeof createEventLogger>; write: (value: string) => void };
 export type RelayCommandHandlers = {
   once?: (context: RelayCommandContext, options: { trigger?: string; task?: string }) => Promise<void>;
   watch?: (context: RelayCommandContext, options: { trigger?: string }) => Promise<void>;
   daemon?: (context: RelayCommandContext, action: "start" | "stop" | "status") => Promise<void>;
-  triggerTest?: (context: RelayCommandContext, trigger: RelayTrigger) => Promise<void>;
+  triggerTest?: (context: RelayCommandContext, trigger: RelayTriggerV2) => Promise<void>;
   cleanup?: (context: RelayCommandContext, target: string) => Promise<void>;
 };
-export type RelayCliOptions = { handlers?: RelayCommandHandlers; stdout?: NodeJS.WriteStream; stderr?: NodeJS.WriteStream; cwd?: () => string };
+export type RelayCliOptions = { handlers?: RelayCommandHandlers; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; cwd?: () => string };
 
-type InitOptions = { source?: string; agent?: string; label?: string; model?: string; maxConcurrent?: number; yes?: boolean; force?: boolean; dryRun?: boolean };
+type InitOptions = { source?: string; harness?: string; /** @deprecated use harness */ agent?: string; label?: string; model?: string; prompt?: string; maxConcurrent?: number; yes?: boolean; force?: boolean; dryRun?: boolean };
 
 function executable(command: string): boolean { try { execFileSync("which", [command], { stdio: "ignore" }); return true; } catch { return false; } }
-function gitValue(root: string, args: string[]): string | undefined { try { return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim() || undefined; } catch { return undefined; } }
-function defaultConfig(options: Required<Pick<InitOptions, "source" | "agent" | "label" | "maxConcurrent">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfig {
-  const agentCommand = options.agent === "claude" ? "claude" : "codex";
-  const agentArgs = options.agent === "claude" ? ["-p"] : ["exec"];
-  const provider = options.agent === "claude" ? "anthropic" : "openai";
-  return relayConfigSchema.parse({
-    version: 1, project: { name: projectName },
-    sources: { [options.source]: { type: "linear", enabled: true, pollIntervalMs: 30_000, mcp: { transport: "stdio", command: "npx", args: ["-y", "mcp-remote", "https://mcp.linear.app/mcp"], environment: {} }, reporting: { runningLabel: "relay:running", blockedLabel: "relay:blocked", doneLabel: "relay:done", inProgressState: "In Progress", commentOnLaunch: true, commentOnFailure: true } } },
-    agents: { [options.agent]: { provider, command: agentCommand, args: agentArgs, environment: {}, models: ["selected"], defaultModelProfile: "selected", modelArgument: "--model", ...(options.agent === "claude" ? { reasoningEffortArgument: "--effort" } : {}), promptDelivery: { mode: "argument" } } },
-    modelProfiles: { selected: { provider, ...(options.model ? { model: options.model } : {}), arguments: [] } },
-    triggers: [{ id: `${options.source}-${options.label.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "") || "tasks"}`, source: options.source, label: options.label, assignee: "me", match: { excludeLabels: ["relay:running", "relay:done", "relay:blocked"] }, agent: options.agent, model: "selected", enabled: true }],
-    workspace: { adapter: "wt", directory: ".task-relay/workspaces", baseBranch: branch, branchPrefix: "relay" }, execution: { maxConcurrent: options.maxConcurrent, retries: 2, adapter: "tmux", tmuxSession: `task-relay-${projectName.replace(/[^a-zA-Z0-9_.-]+/g, "-")}` }, logging: { level: "info", pretty: true },
+function gitValue(root: string, args: string[]): string | undefined { try { return execFileSync("git", ["-C", root, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined; } catch { return undefined; } }
+const BUILT_IN_HARNESSES = ["codex", "claude", "pi", "opencode"] as const;
+function firstAvailableHarness(): typeof BUILT_IN_HARNESSES[number] { return BUILT_IN_HARNESSES.find(executable) || "codex"; }
+function harnessChoices(): { name: string; value: typeof BUILT_IN_HARNESSES[number] }[] {
+  return BUILT_IN_HARNESSES.map((harness) => ({ name: `${harness[0].toUpperCase()}${harness.slice(1)}${executable(harness) ? " (found)" : " (not found)"}`, value: harness }));
+}
+function harnessAvailabilityRows(): [string, string][] { return BUILT_IN_HARNESSES.map((harness) => [harness, executable(harness) ? "available" : "not found"]); }
+export function defaultConfig(options: Required<Pick<InitOptions, "source" | "harness" | "label" | "maxConcurrent" | "prompt">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfigV2 {
+  const actionId = "implement";
+  return relayConfigV2Schema.parse({
+    version: 2,
+    project: { name: projectName },
+    sources: {
+      [options.source]: {
+        use: "linear",
+        enabled: true,
+        pollIntervalMs: 30_000,
+        with: {
+          mcp: { transport: "stdio", command: "npx", args: ["-y", "mcp-remote", "https://mcp.linear.app/mcp"], environment: {} },
+          reporting: { runningLabel: "relay:running", blockedLabel: "relay:blocked", doneLabel: "relay:done", inProgressState: "In Progress", commentOnLaunch: true, commentOnFailure: true },
+        },
+      },
+    },
+    harnesses: { [options.harness]: { use: options.harness } },
+    actions: {
+      [actionId]: {
+        use: "launch",
+        with: {
+          harness: options.harness,
+          ...(options.model ? { model: options.model } : {}),
+          prompt: options.prompt,
+        },
+      },
+    },
+    triggers: [{
+      id: `${options.source}-${options.label.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "") || "tasks"}`,
+      source: options.source,
+      match: { labels: { all: [options.label], none: ["relay:running", "relay:done", "relay:blocked"] }, assignee: "me" },
+      actions: [actionId],
+      fire: { policy: "once-per-match" },
+      maxConcurrent: options.maxConcurrent,
+    }],
+    workspace: { adapter: "wt", directory: ".task-relay/workspaces", baseBranch: branch, branchPrefix: "relay" },
+    execution: { maxConcurrent: options.maxConcurrent, retries: 2, adapter: "tmux", tmuxSession: `task-relay-${projectName.replace(/[^a-zA-Z0-9_.-]+/g, "-")}` },
+    logging: { level: "info", pretty: true },
   });
 }
 
@@ -54,20 +87,22 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   program.showSuggestionAfterError();
 
   program.command("init").description(`Create a commit-safe ${CONFIG_FILE} in this repository.`)
-    .option("--source <name>", "source name", "linear").option("--agent <name>", "agent preset: codex or claude")
-    .option("--label <label>", "source label to route").option("--model <profile>", "model profile and model name")
+    .option("--source <name>", "source name", "linear").option("--harness <name>", "agent harness: codex, claude, pi, or opencode")
+    .option("--agent <name>", "deprecated alias for --harness").option("--label <label>", "source label to route")
+    .option("--model <model>", "model passed to the selected harness").option("--prompt <template>", "launch prompt template")
     .option("--max-concurrent <count>", "maximum simultaneous runs", (value) => Number(value)).option("--yes", "accept inferred defaults")
     .option("--force", "replace an existing config").option("--dry-run", "print config without writing")
     .action(async (init: InitOptions) => {
       const projectRoot = await findProjectRoot(cwd()); const target = resolve(projectRoot, CONFIG_FILE);
       if (existsSync(target) && !init.force) throw new Error(`${target} already exists. Use --force to replace it.`);
-      const inferredAgent = init.agent || (executable("codex") ? "codex" : executable("claude") ? "claude" : "codex");
-      const defaults = { source: init.source || "linear", agent: inferredAgent, label: init.label || "relay:implement", model: init.model, maxConcurrent: init.maxConcurrent || 2 };
+      const inferredHarness = init.harness || init.agent || firstAvailableHarness();
+      const defaults = { source: init.source || "linear", harness: inferredHarness, label: init.label || "relay:implement", model: init.model, prompt: init.prompt || "Implement {{item.id}}: {{item.title}}\n\n{{item.description}}", maxConcurrent: init.maxConcurrent || 2 };
       const answers = init.yes ? defaults : {
         source: await input({ message: "Source name", default: defaults.source }),
-        agent: await select({ message: "Agent", default: defaults.agent, choices: [{ name: `Codex${executable("codex") ? " (found)" : " (not found)"}`, value: "codex" }, { name: `Claude${executable("claude") ? " (found)" : " (not found)"}`, value: "claude" }] }),
+        harness: await select({ message: "Agent harness", default: defaults.harness, choices: harnessChoices() }),
         label: await input({ message: "Trigger label", default: defaults.label }),
         model: (await input({ message: "Model ID (leave empty to use the agent default)", default: defaults.model || "" })).trim() || undefined,
+        prompt: (await input({ message: "Prompt template", default: defaults.prompt })).trim() || defaults.prompt,
         maxConcurrent: await number({ message: "Maximum concurrent runs", default: defaults.maxConcurrent, min: 1, max: 32 }),
       };
       const repoName = gitValue(projectRoot, ["config", "--get", "remote.origin.url"])?.split("/").pop()?.replace(/\.git$/, "") || resolve(projectRoot).split("/").pop() || "project";
@@ -75,7 +110,7 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       const branch = remoteBranch || gitValue(projectRoot, ["branch", "--show-current"]) || "main";
       const resolvedAnswers = { ...answers, maxConcurrent: answers.maxConcurrent ?? defaults.maxConcurrent };
       const config = defaultConfig(resolvedAnswers, repoName, branch); const document = `# Task Relay configuration. Safe to commit: do not put credentials here.\n# Personal machine-only changes belong in ${LOCAL_CONFIG_FILE}; keep it untracked and never store secrets in Relay YAML.\n${renderRelayConfig(config)}`;
-      print(statusTable([["Repository", projectRoot], ["Project", repoName], ["Base branch", branch], ["Codex", executable("codex") ? "available" : "not found"], ["Claude", executable("claude") ? "available" : "not found"], ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"]]));
+      print(statusTable([["Repository", projectRoot], ["Project", repoName], ["Base branch", branch], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"]]));
       if (!init.yes && !init.dryRun && !(await confirm({ message: `Write ${CONFIG_FILE}?`, default: true }))) return;
       if (init.dryRun) { print(document); return; }
       await writeFile(target, document); print(`Created ${target}`);
@@ -84,10 +119,10 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   program.command("doctor").description("Check repository configuration and required local executables.").action(async () => {
     const root = await findProjectRoot(cwd()); let configuration = "missing";
     try { await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
-    print(statusTable([["Project root", root], ["Configuration", configuration], ["codex", executable("codex") ? "available" : "not found"], ["claude", executable("claude") ? "available" : "not found"], ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)]]));
+    print(statusTable([["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)]]));
   });
 
-  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });
+  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });
 
   program.command("runs").description("List persisted runs.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); if (flags.json) print(JSON.stringify(runs, null, 2)); else print(eventsTable(runs.map((run) => ({ project: context.config.project.name || context.projectRoot, timestamp: run.claimedAt, level: run.status === "failed" ? "error" : "info", task: run.item.id, trigger: run.trigger.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event: run.status, error: run.error })))); });
 

@@ -4,7 +4,12 @@ import { execa } from "execa";
 import type { AgentExecution, AgentExecutionAdapter, AgentExecutionResult } from "../agents/types.js";
 import type { WorkerCompletion, WorkerHandle } from "../domain/index.js";
 
-export type DirectProcessAdapterOptions = { extendEnv?: boolean; windowsHide?: boolean };
+export type DirectProcessAdapterOptions = {
+  extendEnv?: boolean;
+  windowsHide?: boolean;
+  /** Grace period before an unresponsive worker is force-terminated. */
+  stopTimeoutMs?: number;
+};
 
 /** Starts an agent directly and returns as soon as the child has a PID. */
 export class DirectProcessAdapter implements AgentExecutionAdapter {
@@ -54,14 +59,16 @@ export class DirectProcessAdapter implements AgentExecutionAdapter {
   async stop(worker: WorkerHandle): Promise<void> {
     const pid = numberMetadata(worker, "pid");
     if (!pid) return;
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch (error) {
-      const code = error !== null && typeof error === "object" && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-      if (code !== "ESRCH") throw error;
+    if (!signalProcess(pid, "SIGTERM")) return;
+    if (await waitForProcessExit(pid, this.options.stopTimeoutMs ?? 5_000)) {
+      this.children.delete(pid);
+      return;
     }
+    if (!signalProcess(pid, "SIGKILL")) return;
+    if (!await waitForProcessExit(pid, 1_000)) {
+      throw new Error(`Worker process ${pid} did not exit after SIGTERM and SIGKILL.`);
+    }
+    this.children.delete(pid);
   }
 }
 
@@ -69,6 +76,7 @@ export type TmuxExecutionAdapterOptions = {
   session: string;
   shell?: string;
   environment?: Readonly<Record<string, string>>;
+  stopTimeoutMs?: number;
 };
 
 /**
@@ -134,9 +142,18 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     const targetId = typeof tmux.target === "string" ? tmux.target : undefined;
     const index = typeof tmux.index === "string" ? tmux.index : undefined;
     const window = typeof tmux.window === "string" ? tmux.window : undefined;
-    if (!session) return;
+    if (!session) throw new Error(`Worker ${worker.id} has no tmux session metadata.`);
     const target = targetId || (index ? `${session}:${index}` : window ? `${session}:${window}` : undefined);
-    if (target) await execa("tmux", ["kill-window", "-t", target], { reject: false });
+    if (!target) throw new Error(`Worker ${worker.id} has no tmux window target metadata.`);
+    const removed = await execa("tmux", ["kill-window", "-t", target], { reject: false });
+    if (removed.exitCode !== 0 && await this.windowExists(session, target)) {
+      throw new Error(`Could not stop tmux worker ${worker.id}: ${removed.stderr.trim() || `tmux exited with code ${removed.exitCode}`}`);
+    }
+    const deadline = Date.now() + (this.options.stopTimeoutMs ?? 5_000);
+    while (await this.windowExists(session, target)) {
+      if (Date.now() >= deadline) throw new Error(`Tmux worker ${worker.id} did not stop within the configured timeout.`);
+      await delay(50);
+    }
   }
 
   private async ensureSession(): Promise<void> {
@@ -157,9 +174,11 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     return value === "0" ? { status: "succeeded" } : { status: "failed", error: `Worker exited with code ${value}.` };
   }
 
-  private async windowExists(session: string, target: string): Promise<boolean> {
-    const windows = await execa("tmux", ["list-windows", "-t", session, "-F", "#{window_id}"], { reject: false });
-    return windows.exitCode === 0 && windows.stdout.split("\n").includes(target);
+  private async windowExists(_session: string, target: string): Promise<boolean> {
+    // This accepts a window id, session:index, or session:name and therefore
+    // remains compatible with worker metadata written by earlier versions.
+    const window = await execa("tmux", ["display-message", "-p", "-t", target, "#{window_id}"], { reject: false });
+    return window.exitCode === 0 && window.stdout.trim().length > 0;
   }
 }
 
@@ -202,4 +221,34 @@ function tmuxMetadata(worker: WorkerHandle): { session?: string; target?: string
     target: typeof tmux.target === "string" ? tmux.target : undefined,
     exitKey: typeof tmux.exitKey === "string" ? tmux.exitKey : undefined,
   };
+}
+
+function signalProcess(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error) {
+    const code = error !== null && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      const code = error !== null && typeof error === "object" && "code" in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      if (code === "ESRCH") return true;
+      throw error;
+    }
+    await delay(50);
+  } while (Date.now() < deadline);
+  return false;
 }

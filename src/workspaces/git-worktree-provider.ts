@@ -1,4 +1,5 @@
 import path from "node:path";
+import { lstat } from "node:fs/promises";
 import { execa } from "execa";
 import type { RunRecord, Workspace } from "../domain/index.js";
 import type { WorktreeProvider, WorkspaceProviderOptions } from "./types.js";
@@ -31,7 +32,11 @@ export class GitWorktreeProvider implements WorktreeProvider {
     const ownership = cleanupOwnership(space, run, "git-worktree", this.worktreeRoot(repository));
     if (!ownership.createdWorkspace) return;
     const removed = await execa("git", ["worktree", "remove", "--force", space.path], { cwd: repository, reject: false });
-    if (removed.exitCode !== 0 || !ownership.createdBranch || !space.branch) return;
+    if (removed.exitCode !== 0 && await pathExists(space.path)) {
+      throw new Error(`Could not remove worktree ${space.path}: ${removed.stderr.trim() || `git exited with code ${removed.exitCode}`}`);
+    }
+    if (await pathExists(space.path)) throw new Error(`Git reported success, but worktree still exists at ${space.path}.`);
+    if (!ownership.createdBranch || !space.branch) return;
     if (await localBranchExists(repository, space.branch)) await execa("git", ["branch", "-D", space.branch], { cwd: repository });
   }
 
@@ -48,6 +53,15 @@ export class GitWorktreeProvider implements WorktreeProvider {
       if (line === `branch refs/heads/${branch}`) return currentPath;
     }
     return undefined;
+  }
+}
+
+async function pathExists(value: string): Promise<boolean> {
+  try { await lstat(value); return true; }
+  catch (error) {
+    const code = error !== null && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (code === "ENOENT") return false;
+    throw error;
   }
 }
 
