@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { execa } from "execa";
 import type { AgentExecution, AgentExecutionAdapter, AgentExecutionResult } from "../agents/types.js";
@@ -231,9 +234,21 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
   private async exitCompletion(session: string, exitKey: string): Promise<WorkerCompletion | undefined> {
     const option = await execa("tmux", ["show-options", "-gv", `@${exitKey}`], { reject: false });
     const value = option.stdout.trim();
-    if (option.exitCode !== 0 || !/^-?\d+$/.test(value)) return undefined;
-    await execa("tmux", ["set-option", "-gu", `@${exitKey}`], { reject: false });
-    return value === "0" ? { status: "succeeded" } : { status: "failed", error: `Worker exited with code ${value}.` };
+    if (option.exitCode === 0 && /^-?\d+$/.test(value)) {
+      await execa("tmux", ["set-option", "-gu", `@${exitKey}`], { reject: false });
+      await rm(join(tmpdir(), exitKey), { force: true });
+      return value === "0" ? { status: "succeeded" } : { status: "failed", error: `Worker exited with code ${value}.` };
+    }
+    // Fallback: temp file written by the shell command. This survives session
+    // destruction when all windows close before the polling loop can read the option.
+    try {
+      const fileValue = (await readFile(join(tmpdir(), exitKey), "utf8")).trim();
+      if (/^-?\d+$/.test(fileValue)) {
+        await rm(join(tmpdir(), exitKey), { force: true });
+        return fileValue === "0" ? { status: "succeeded" } : { status: "failed", error: `Worker exited with code ${fileValue}.` };
+      }
+    } catch { /* file not written yet */ }
+    return undefined;
   }
 
   private async windowExists(_session: string, target: string): Promise<boolean> {
@@ -255,7 +270,11 @@ function tmuxShellCommand(execution: AgentExecution, exitKey: string): string {
   const stdin = execution.stdin === undefined ? "" : `printf %s ${shellQuote(execution.stdin)} | `;
   // Store the exit code before letting tmux close the window. The unique option
   // is also available to a freshly restarted relay during reconciliation.
-  return `${env.join(" ")}${env.length ? " " : ""}${stdin}${command}; task_relay_status=$?; tmux set-option -g @${exitKey} "\$task_relay_status"; exit "\$task_relay_status"`;
+  const exitFile = shellQuote(join(tmpdir(), exitKey));
+  // Write the exit code to a temp file AND a tmux global option. The file
+  // survives session destruction (both windows closing simultaneously), while
+  // the option is preferred for reconciliation by a restarted relay.
+  return `${env.join(" ")}${env.length ? " " : ""}${stdin}${command}; task_relay_status=$?; printf '%s' "\$task_relay_status" > ${exitFile}; tmux set-option -g @${exitKey} "\$task_relay_status"; exit "\$task_relay_status"`;
 }
 
 function shellQuote(value: string): string {
