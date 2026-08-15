@@ -125,6 +125,16 @@ describe("Task Relay configuration", () => {
       expect(config.harnesses[harness]).toEqual({ use: harness });
       expect(config.actions.implement).toMatchObject({ use: "launch", with: { harness, model: "gpt-5.6-terra", mode: "interactive" } });
       expect(config.triggers[0].actions).toEqual(["implement"]);
+      expect(config.triggers[0].fire).toEqual({ policy: "every-poll" });
+      expect(config.actions["cleanup-completed-worker"]).toMatchObject({ use: "cleanup", with: { activeWorker: "stop" } });
+      expect(config.triggers[1]).toMatchObject({
+        id: "linear-cleanup-terminal",
+        source: "linear",
+        match: { statusTypes: ["completed", "canceled"] },
+        targets: { workers: { sourceItem: "current", runs: "all" } },
+        actions: ["cleanup-completed-worker"],
+        fire: { policy: "once-per-item" },
+      });
     }
   });
 });

@@ -56,7 +56,7 @@ function triggerOverrides(trigger?: TriggerDefinition): AgentLaunchOverrides {
     model: agent?.model,
     modelProfile: stringField(metadata, "modelProfile", "modelProfileId"),
     reasoningEffort: stringField(metadata, "reasoningEffort", "effort"),
-    promptDelivery: stringField(metadata, "promptDelivery") as PromptDeliveryMode | undefined,
+    promptDelivery: trigger?.promptDelivery ?? stringField(metadata, "promptDelivery") as PromptDeliveryMode | undefined,
   };
 }
 

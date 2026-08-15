@@ -178,6 +178,36 @@ describe("generic action execution", () => {
     expect(store.runs.get(workerRun.id)).toMatchObject({ status: "stopped", workspaceCleanedAt: "2026-08-15T12:00:00.000Z" });
   });
 
+  it("cleans a reopened worker generation even when its worker ID is reused", async () => {
+    const store = new MemoryRunStore();
+    const item: WorkItem = { sourceId: "linear", id: "ENG-123", title: "Done", terminal: true };
+    const launchedTrigger: TriggerDefinition = { id: "implementation", sourceId: "linear", repository, enabled: true };
+    const identity = { repository, sourceId: "linear", itemId: item.id, triggerId: launchedTrigger.id };
+    const run = (claimedAt: string): RunRecord => ({
+      id: createRunKey(identity), identity, item, trigger: launchedTrigger, agent: { agentId: "codex" },
+      status: "running", claimedAt, updatedAt: claimedAt,
+      workspace: { path: "/workspace/ENG-123" }, worker: { id: "worker-from-implementation", startedAt: claimedAt },
+    });
+    const cleaned: string[] = [];
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    const ledger = new MemoryActionLedger();
+    const activeRelay = relay({
+      trigger: baseTrigger([{ id: "cleanup", use: "cleanup", config: {} }]), items: [item], runStore: store, registry, actionLedger: ledger,
+      agent: { resolve: async () => ({ agentId: "codex" }), launch: async () => ({ id: "unused", startedAt: "now" }), stop: async () => {} },
+      workspace: { provision: async () => ({ path: "/workspace" }), cleanup: async (workspace) => { cleaned.push(workspace.path); } },
+    });
+
+    const first = run("first");
+    store.runs.set(first.id, first);
+    await activeRelay.tick();
+    const reopened = run("reopened");
+    store.runs.set(reopened.id, reopened);
+    await activeRelay.tick();
+
+    expect(cleaned).toEqual(["/workspace/ENG-123", "/workspace/ENG-123"]);
+  });
+
   it("runs ordered custom actions with previous output and does not repeat a successful action", async () => {
     const store = new MemoryRunStore();
     const ledger = new MemoryActionLedger();
@@ -204,6 +234,36 @@ describe("generic action execution", () => {
     expect(events).toEqual(["first", "second:worker-42"]);
     expect((await activeRelay.tick()).actionsExecuted).toBe(0);
     expect(events).toEqual(["first", "second:worker-42"]);
+  });
+
+  it("re-runs an on-change action when Linear supplies a newer issue revision", async () => {
+    const store = new MemoryRunStore();
+    const ledger = new MemoryActionLedger();
+    let item: WorkItem = { sourceId: "linear", id: "ENG-124", title: "Reopen", metadata: { linearUpdatedAt: "2026-08-15T12:00:00.000Z" } };
+    let executions = 0;
+    const action: ActionPlugin = {
+      kind: "action", use: "record", configSchema: z.object({}),
+      async execute() { executions += 1; return { status: "succeeded" }; },
+    };
+    const registry = new RelayPluginRegistry().registerAction(action);
+    const activeRelay = new TaskRelay({
+      triggers: { list: async () => [{ ...baseTrigger([{ id: "record", use: "record", config: {} }]), firePolicy: "on-change" }] },
+      sources: [{ id: "linear", discover: async () => [item], report: async () => {} }],
+      runStore: store,
+      workspaceProvider: { provision: async () => ({ path: "/workspace" }) },
+      agentLauncher: { resolve: async () => ({ agentId: "codex" }), launch: async () => ({ id: "unused", startedAt: "now" }) },
+      actionPlugins: registry,
+      actionExecutions: ledger,
+      logger,
+      now: () => new Date("2026-08-15T12:00:00.000Z"),
+    });
+
+    await activeRelay.tick();
+    await activeRelay.tick();
+    item = { ...item, metadata: { linearUpdatedAt: "2026-08-15T12:01:00.000Z" } };
+    await activeRelay.tick();
+
+    expect(executions).toBe(2);
   });
 
   it("retries failed and skipped actions on a later poll", async () => {

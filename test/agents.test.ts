@@ -93,6 +93,19 @@ describe("agent resolution", () => {
     expect(resolved.reasoningEffort).toBe("xhigh");
   });
 
+  it("honors interactive delivery declared by a launch trigger", () => {
+    const trigger = {
+      id: "ready",
+      sourceId: "queue",
+      repository: { id: "repo", root: "/repo" },
+      enabled: true,
+      agent: { id: "codex" },
+      promptDelivery: "interactive",
+    } satisfies TriggerDefinition;
+
+    expect(resolveAgentLaunch({ profiles: [builtInHarnessProfile("codex")], trigger }).promptDelivery).toBe("interactive");
+  });
+
   it("renders a stable slug in workspace branch templates", () => {
     const values = templateValues({ workItem: { sourceId: "queue", id: "A-1", title: "Fix Auth Redirect!" }, workspace: { path: "/work" } });
     expect(values.slug).toBe("fix-auth-redirect");

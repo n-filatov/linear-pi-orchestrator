@@ -6,12 +6,14 @@
   "type": "module",
   "bin": {
     "relay": "./bin/relay.js",
+    "relay-dev": "./bin/relay-dev.js",
     "task-relay": "./bin/relay.js"
   },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "start": "tsx src/cli/main.ts"
+    "start": "tsx src/cli/main.ts",
+    "dev:cli": "node bin/relay-dev.js"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

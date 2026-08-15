@@ -337,7 +337,7 @@ export class TaskRelay {
         continue;
       }
       for (const run of runs) {
-        const executionId = actionExecutionId(trigger, item, action.id, run?.worker?.id);
+        const executionId = actionExecutionId(trigger, item, action.id, run?.worker?.id, run?.claimedAt);
         const actionClaimedAt = await this.claimActionExecution(executionId, trigger, item, action.id);
         if (!actionClaimedAt) {
           this.dependencies.logger.debug("Trigger action deduplicated", { triggerId: trigger.id, actionId: action.id, itemId: item.id, workerId: run?.worker?.id });
@@ -402,12 +402,14 @@ export class TaskRelay {
     const run = runs[0];
     if (!run) return { status: "skipped", message: `Worker ${workerId} was not found or was already cleaned.` };
     const wasActive = isActiveRun(run.status);
+    const completedAt = this.now().toISOString();
+    // Mark stopped before killing the window so the concurrent wait() observer
+    // loses the finishActive race and emits nothing instead of run.failed.
+    const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;
     if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) {
       await this.dependencies.agentLauncher.stop?.(run.worker, run);
     }
     if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
-    const completedAt = this.now().toISOString();
-    const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;
     const cleaned = await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, completedAt);
     if (!cleaned) throw new Error(`Workspace was removed, but worker ${workerId} changed before cleanup was recorded.`);
     if (stopped) await this.report(source, "stopped", stopped);
@@ -451,12 +453,13 @@ export class TaskRelay {
       for (const run of await this.dependencies.runStore.listActive(repository)) {
         const source = this.sources.get(run.identity.sourceId);
         try {
-          if (run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
-          if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
+          // Mark stopped before killing the window (same race-prevention as cleanupFromAction).
           const stopped = await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, {
             status: "stopped",
             completedAt: this.now().toISOString(),
           });
+          if (run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
+          if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
           if (run.workspace) await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, this.now().toISOString());
           if (source && stopped) await this.report(source, "stopped", stopped);
         } catch (error) {
@@ -554,14 +557,17 @@ export class TaskRelay {
   }
 }
 
-function actionExecutionId(trigger: TriggerDefinition, item: WorkItem, actionId: string, workerId?: string): string {
+function actionExecutionId(trigger: TriggerDefinition, item: WorkItem, actionId: string, workerId?: string, workerGeneration?: string): string {
   const policy = trigger.firePolicy ?? "once-per-match";
   const occurrence = policy === "every-poll"
     ? randomUUID()
     : policy === "on-change"
       ? actionFingerprint(trigger, item)
       : "item";
-  return JSON.stringify([trigger.repository.id, trigger.repository.root, trigger.id, item.sourceId, item.id, actionId, workerId ?? "", occurrence]);
+  // A persistent worker can be reopened with the same logical worker ID. A
+  // worker-target action such as cleanup must run once for each launch
+  // generation, not once forever for that ID.
+  return JSON.stringify([trigger.repository.id, trigger.repository.root, trigger.id, item.sourceId, item.id, actionId, workerId ?? "", workerGeneration ?? "", occurrence]);
 }
 
 function actionFingerprint(trigger: TriggerDefinition, item: WorkItem): string {
