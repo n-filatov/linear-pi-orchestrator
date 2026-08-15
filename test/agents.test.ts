@@ -53,8 +53,9 @@ describe("agent resolution", () => {
       args: ["--model", "gpt-5.6-terra", "run", "Review PR 123 using the repository conventions."],
       cwd: "/repo/.task-relay/workspaces/ENG-123",
       env: { TASK_RELAY_MODEL: "gpt-5.6-terra" },
+      interactiveInput: undefined,
       stdin: undefined,
-      workerName: "ENG-123",
+      workerName: "ENG-123 Review pull request",
     }]);
   });
 

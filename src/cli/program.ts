@@ -9,6 +9,7 @@ import { createEventLogger, eventLogPath, logEvent, readEvents, stateDirectory }
 import { errorTable, eventsTable, statusTable } from "../logging/tables.js";
 import { RepositoryStateStore } from "../state/store.js";
 import { writeFile } from "node:fs/promises";
+import { addPluginCommands } from "./plugin-commands.js";
 
 export type RelayCommandContext = { projectRoot: string; config: RelayConfigV2; store: RepositoryStateStore; logger: ReturnType<typeof createEventLogger>; write: (value: string) => void };
 export type RelayCommandHandlers = {
@@ -191,6 +192,8 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       });
       await server.stop();
     });
+
+  addPluginCommands(program, print);
 
   program.configureOutput({ writeOut: (text) => output.write(text), writeErr: (text) => error.write(text) });
   return program;
