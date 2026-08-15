@@ -35,12 +35,14 @@ export function createEventLogger(projectRoot: string, level: string = "info", p
   mkdirSync(directory, { recursive: true });
   const file = pino.destination({ dest: eventLogPath(projectRoot), sync: true, mkdir: true });
   const destination = prettyOutput
-    ? pino.multistream([{ level, stream: file }, { level, stream: createPrettyStream() }])
+    // The watch table is the live progress UI. Keep the console reserved for
+    // warnings and errors; the complete structured lifecycle stays in JSONL.
+    ? pino.multistream([{ level, stream: file }, { level: "warn", stream: createPrettyStream() }])
     : file;
   return pino({ level, base: undefined, timestamp: pino.stdTimeFunctions.isoTime }, destination);
 }
 
-/** A pino-pretty stream for live command output; JSONL remains the source for tables. */
+/** A pino-pretty stream for exceptional live command output. */
 export function createPrettyStream() { return pretty({ colorize: Boolean(process.stdout.isTTY), singleLine: true }); }
 
 export function logEvent(logger: Logger, event: RelayEvent): void {

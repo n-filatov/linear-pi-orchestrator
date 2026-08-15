@@ -70,7 +70,11 @@ describe("v2 app/config integration", () => {
 
     const tick = await run(root, "once", "--trigger", "ready");
     expect(tick.errors).toBe("");
-    expect(tick.output).toContain("Tick complete: 1 actions");
+    expect(tick.output).toContain("Tick: 1 discovered | 1 actions");
+    expect(tick.output).toContain("Ticket");
+    expect(tick.output).toContain("Title");
+    expect(tick.output).toContain("TASK-1");
+    expect(tick.output).toContain("Config action task");
     // App composition resolves the project root through realpath(), which can
     // differ from macOS's `/var` spelling used by mkdtemp(). Use the same
     // normalized root when reading its repository-scoped state.

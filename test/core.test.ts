@@ -55,10 +55,17 @@ describe("TaskRelay", () => {
     expect(first.runsLaunched).toBe(2);
     expect(first.skipped).toBe(1);
     expect(launched).toEqual(["TASK-1", "TASK-2"]);
+    expect(first.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ item: { id: "TASK-1", title: "Task 1" }, status: "launched", workerId: "TASK-1" }),
+      expect.objectContaining({ item: { id: "TASK-3", title: "Task 3" }, status: "skipped", reason: "Another relay claimed the ticket or the worker limit was reached." }),
+    ]));
 
     const second = await relay.tick();
     expect(second.runsLaunched).toBe(0);
     expect(launched).toHaveLength(2);
+    expect(second.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ item: { id: "TASK-1", title: "Task 1" }, status: "skipped", reason: "Worker TASK-1 is already active." }),
+    ]));
   });
 
   it("does not launch when the source cannot persist the claim", async () => {

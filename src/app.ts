@@ -15,6 +15,7 @@ import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js"
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
+import { tickTable, type TickTableRow } from "./logging/tables.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
@@ -43,7 +44,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
     },
     once: async (context, options) => {
       const runtime = await composeRuntime(context, options);
-      try { writeTickSummary(context, await runtime.relay.tick()); }
+      try { await writeTickSummary(context, await runtime.relay.tick()); }
       finally { await runtime.relay.stop(); }
     },
     watch: async (context, options) => {
@@ -56,7 +57,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       context.write(`Watching ${context.config.project.name || context.projectRoot} every ${interval}ms. Press Ctrl-C to stop.`);
       try {
         while (!stopping) {
-          writeTickSummary(context, await runtime.relay.tick());
+          await writeTickSummary(context, await runtime.relay.tick());
           if (!stopping) await delay(interval);
         }
       } finally {
@@ -350,7 +351,7 @@ class EventingRunStore implements RunStore {
   async markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined> { const run = await this.store.markWorkspaceCleaned(identity, claimedAt, cleanedAt); if (run) this.write(run, "run.workspace.cleaned"); return run; }
   async update(run: RunRecord): Promise<void> { await this.store.update(run); this.write(run, `run.${run.status}`); }
   private write(run: RunRecord, event: string): void {
-    const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };
+    const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, title: run.item.title, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };
     if (run.error) this.logger.error(fields, event); else this.logger.info(fields, event);
   }
 }
@@ -361,4 +362,28 @@ function stringValue(value: unknown): string | undefined { return typeof value =
 function stringArray(value: unknown): string[] { return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : []; }
 function stringRecord(value: unknown): Record<string, string> { return Object.fromEntries(Object.entries(asRecord(value)).filter((entry): entry is [string, string] => typeof entry[1] === "string")); }
 function eventName(message: string): string { return message.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, ""); }
-function writeTickSummary(context: RelayCommandContext, result: TickResult): void { context.write(`Tick complete: ${result.actionsExecuted} actions, ${result.runsLaunched} workers launched, ${result.actionsFailed} action failures, ${result.skipped} skipped, ${result.itemsDiscovered} discovered.`); }
+async function writeTickSummary(context: RelayCommandContext, result: TickResult): Promise<void> {
+  const activeRuns = await context.store.listActive({ id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot });
+  const rows: TickTableRow[] = result.items.map((outcome) => ({
+    ticket: outcome.item.id,
+    title: outcome.item.title,
+    trigger: outcome.triggerId,
+    worker: outcome.workerId,
+    status: outcome.status,
+    detail: outcome.reason,
+  }));
+  const representedWorkers = new Set(rows.map((row) => row.worker).filter((worker): worker is string => Boolean(worker)));
+  for (const run of activeRuns) {
+    if (run.worker && representedWorkers.has(run.worker.id)) continue;
+    rows.push({
+      ticket: run.item.id,
+      title: run.item.title,
+      trigger: run.identity.triggerId,
+      worker: run.worker?.id,
+      status: "running",
+      detail: run.status === "running" ? "Active worker." : `Worker is ${run.status}.`,
+    });
+  }
+  context.write(`Tick: ${result.itemsDiscovered} discovered | ${result.actionsExecuted} actions | ${result.runsLaunched} workers launched | ${result.actionsFailed} action failures | ${result.skipped} skipped`);
+  context.write(rows.length ? tickTable(rows) : "No matching tickets or running workers.");
+}

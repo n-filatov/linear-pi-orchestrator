@@ -41,6 +41,16 @@ export interface TickResult {
   skipped: number;
   actionsExecuted: number;
   actionsFailed: number;
+  /** Per-item outcomes retained for human-readable watch output. */
+  items: TickItemOutcome[];
+}
+
+export interface TickItemOutcome {
+  item: Pick<WorkItem, "id" | "title">;
+  triggerId: string;
+  status: "launched" | "skipped" | "failed" | "action";
+  reason?: string;
+  workerId?: string;
 }
 
 export interface ActionInvocationClaim {
@@ -122,6 +132,7 @@ export class TaskRelay {
       skipped: 0,
       actionsExecuted: 0,
       actionsFailed: 0,
+      items: [],
     };
 
     const triggers = await this.dependencies.triggers.list();
@@ -163,6 +174,7 @@ export class TaskRelay {
     for (const item of items) {
       if (isTerminalWorkItem(item) && !trigger.actions?.length) {
         result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", "Ticket is terminal.");
         continue;
       }
       if (item.sourceId !== source.id) {
@@ -170,8 +182,10 @@ export class TaskRelay {
           expectedSourceId: source.id,
           itemSourceId: item.sourceId,
           itemId: item.id,
+          title: item.title,
         });
         result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", `Source '${item.sourceId}' does not match '${source.id}'.`);
         continue;
       }
       if (!trigger.actions?.length) {
@@ -183,6 +197,7 @@ export class TaskRelay {
         });
         if (alreadyActive) {
           result.skipped += 1;
+          this.recordItemOutcome(result, trigger, item, "skipped", `Worker ${alreadyActive.worker?.id ?? "run"} is already active.`);
           continue;
         }
       }
@@ -200,12 +215,14 @@ export class TaskRelay {
           result.runsClaimed += outcome.claimed ? 1 : 0;
           result.runsLaunched += outcome.launched ? 1 : 0;
           result.skipped += outcome.skipped ? 1 : 0;
+          this.recordItemOutcome(result, trigger, item, outcome.launched ? "launched" : outcome.failed ? "failed" : "skipped", outcome.reason, outcome.run?.worker?.id);
         }
       }).catch((error: unknown) => {
         this.dependencies.logger.error("Task relay dispatch failed unexpectedly", {
           triggerId: trigger.id,
           sourceId: source.id,
           itemId: item.id,
+          title: item.title,
           error: messageFor(error),
         });
       });
@@ -217,17 +234,18 @@ export class TaskRelay {
     source: WorkSource,
     trigger: TriggerDefinition,
     item: WorkItem,
-  ): Promise<{ claimed: boolean; launched: boolean; skipped: boolean; run?: RunRecord }> {
+  ): Promise<{ claimed: boolean; launched: boolean; skipped: boolean; failed?: boolean; reason?: string; run?: RunRecord }> {
     if (this.stopController.signal.aborted || isTerminalWorkItem(item)) {
-      return { claimed: false, launched: false, skipped: true };
+      return { claimed: false, launched: false, skipped: true, reason: this.stopController.signal.aborted ? "Relay is stopping." : "Ticket is terminal." };
     }
     if (item.sourceId !== source.id) {
       this.dependencies.logger.warn("Source returned an item with a mismatched source id", {
         expectedSourceId: source.id,
         itemSourceId: item.sourceId,
         itemId: item.id,
+        title: item.title,
       });
-      return { claimed: false, launched: false, skipped: true };
+      return { claimed: false, launched: false, skipped: true, reason: `Source '${item.sourceId}' does not match '${source.id}'.` };
     }
 
     const identity = {
@@ -236,8 +254,9 @@ export class TaskRelay {
       itemId: item.id,
       triggerId: trigger.id,
     };
-    if (await this.dependencies.runStore.findActive(identity)) {
-      return { claimed: false, launched: false, skipped: true };
+    const activeRun = await this.dependencies.runStore.findActive(identity);
+    if (activeRun) {
+      return { claimed: false, launched: false, skipped: true, reason: `Worker ${activeRun.worker?.id ?? "run"} is already active.` };
     }
 
     let agent;
@@ -247,9 +266,10 @@ export class TaskRelay {
       this.dependencies.logger.error("Agent resolution failed", {
         triggerId: trigger.id,
         itemId: item.id,
+        title: item.title,
         error: messageFor(error),
       });
-      return { claimed: false, launched: false, skipped: true };
+      return { claimed: false, launched: false, skipped: true, reason: `Agent resolution failed: ${messageFor(error)}` };
     }
 
     const claimedAt = this.now().toISOString();
@@ -262,7 +282,7 @@ export class TaskRelay {
       claimedAt,
       maxConcurrent: normaliseConcurrency(trigger.maxConcurrent),
     });
-    if (!run) return { claimed: false, launched: false, skipped: true };
+    if (!run) return { claimed: false, launched: false, skipped: true, reason: "Another relay claimed the ticket or the worker limit was reached." };
 
     if (!await this.report(source, "claimed", run)) {
       run.status = "failed";
@@ -270,7 +290,7 @@ export class TaskRelay {
       run.completedAt = this.now().toISOString();
       run.updatedAt = run.completedAt;
       await this.dependencies.runStore.update(run);
-      return { claimed: true, launched: false, skipped: false, run };
+      return { claimed: true, launched: false, skipped: false, failed: true, reason: run.error, run };
     }
     try {
       run.status = "provisioning";
@@ -301,6 +321,7 @@ export class TaskRelay {
         triggerId: trigger.id,
         sourceId: source.id,
         itemId: item.id,
+        title: item.title,
         agentId: run.agent.agentId,
         model: run.agent.model,
       });
@@ -314,9 +335,11 @@ export class TaskRelay {
       await this.report(source, "failed", run, run.error);
       this.dependencies.logger.error("Task relay failed to launch work", {
         runId: run.id,
+        itemId: item.id,
+        title: item.title,
         error: run.error,
       });
-      return { claimed: true, launched: false, skipped: false, run };
+      return { claimed: true, launched: false, skipped: false, failed: true, reason: run.error, run };
     }
   }
 
@@ -334,18 +357,20 @@ export class TaskRelay {
       if (plugin.target === "worker" && runs.length === 0) {
         outputs[action.id] = { status: "skipped", message: "No matching workers." };
         result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", `${action.id}: No matching workers.`);
         continue;
       }
       for (const run of runs) {
         const executionId = actionExecutionId(trigger, item, action.id, run?.worker?.id, run?.claimedAt);
         const actionClaimedAt = await this.claimActionExecution(executionId, trigger, item, action.id);
         if (!actionClaimedAt) {
-          this.dependencies.logger.debug("Trigger action deduplicated", { triggerId: trigger.id, actionId: action.id, itemId: item.id, workerId: run?.worker?.id });
+          this.dependencies.logger.debug("Trigger action deduplicated", { triggerId: trigger.id, actionId: action.id, itemId: item.id, title: item.title, workerId: run?.worker?.id });
           result.skipped += 1;
+          this.recordItemOutcome(result, trigger, item, "skipped", `${action.id}: action was already completed or is running.`, run?.worker?.id);
           continue;
         }
         try {
-          this.dependencies.logger.info("Trigger action started", { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, workerId: run?.worker?.id });
+          this.dependencies.logger.info("Trigger action started", { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, title: item.title, workerId: run?.worker?.id });
           const context: ActionContext = {
             executionId,
             actionId: action.id,
@@ -367,11 +392,18 @@ export class TaskRelay {
           outputs[action.id] = actionResult;
           result.actionsExecuted += 1;
           await this.finishActionExecution(executionId, actionClaimedAt, actionResult.status, actionResult.output);
-          this.dependencies.logger.info(`Trigger action ${actionResult.status}`, { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, workerId: run?.worker?.id });
+          this.dependencies.logger.info(`Trigger action ${actionResult.status}`, { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, title: item.title, workerId: run?.worker?.id });
+          if (actionResult.status === "skipped") {
+            result.skipped += 1;
+            if (action.use !== "launch") this.recordItemOutcome(result, trigger, item, "skipped", `${action.id}: ${actionResult.message ?? "Action skipped."}`, run?.worker?.id);
+          } else if (action.use !== "launch") {
+            this.recordItemOutcome(result, trigger, item, "action", `${action.id}: completed.`, run?.worker?.id);
+          }
         } catch (error) {
           result.actionsFailed += 1;
           await this.finishActionExecution(executionId, actionClaimedAt, "failed", undefined, messageFor(error));
-          this.dependencies.logger.error("Trigger action failed", { triggerId: trigger.id, actionId: action.id, itemId: item.id, error: messageFor(error) });
+          this.dependencies.logger.error("Trigger action failed", { triggerId: trigger.id, actionId: action.id, itemId: item.id, title: item.title, error: messageFor(error) });
+          this.recordItemOutcome(result, trigger, item, "failed", `${action.id}: ${messageFor(error)}`, run?.worker?.id);
           if (!action.continueOnError) {
             haltPipeline = true;
             break;
@@ -393,7 +425,8 @@ export class TaskRelay {
     const outcome = await this.dispatchItem(source, derived, item);
     result.runsClaimed += outcome.claimed ? 1 : 0;
     result.runsLaunched += outcome.launched ? 1 : 0;
-    if (!outcome.launched) return { status: "skipped", message: outcome.run?.error ?? "Worker was not launched." };
+    this.recordItemOutcome(result, derived, item, outcome.launched ? "launched" : outcome.failed ? "failed" : "skipped", outcome.reason, outcome.run?.worker?.id);
+    if (!outcome.launched) return { status: "skipped", message: outcome.reason ?? outcome.run?.error ?? "Worker was not launched." };
     return { status: "succeeded", output: { runId: outcome.run?.id, workerId: outcome.run?.worker?.id } };
   }
 
@@ -439,6 +472,10 @@ export class TaskRelay {
     await this.dependencies.actionExecutions?.finishActionExecution(id, claimedAt, { status, output, error, completedAt: this.now().toISOString() });
   }
 
+  private recordItemOutcome(result: TickResult, trigger: TriggerDefinition, item: WorkItem, status: TickItemOutcome["status"], reason?: string, workerId?: string): void {
+    result.items.push({ item: { id: item.id, title: item.title }, triggerId: trigger.id, status, reason, workerId });
+  }
+
   private async stopAndCleanupActiveRuns(): Promise<void> {
     if (!this.dependencies.runStore.listActive) {
       this.dependencies.logger.warn("Run store cannot enumerate active runs for cleanup");
@@ -465,6 +502,8 @@ export class TaskRelay {
         } catch (error) {
           this.dependencies.logger.error("Could not stop active run", {
             runId: run.id,
+            itemId: run.item.id,
+            title: run.item.title,
             error: messageFor(error),
           });
         }
@@ -476,6 +515,8 @@ export class TaskRelay {
     const observer = this.observeWorker(source, run).catch((error: unknown) => {
       this.dependencies.logger.error("Task relay worker observation failed unexpectedly", {
         runId: run.id,
+        itemId: run.item.id,
+        title: run.item.title,
         error: messageFor(error),
       });
     });
@@ -549,6 +590,8 @@ export class TaskRelay {
       // A failed notification must not undo a successfully claimed or launched run.
       this.dependencies.logger.warn("Work source event reporting failed", {
         runId: run.id,
+        itemId: run.item.id,
+        title: run.item.title,
         type,
         error: messageFor(reportError),
       });
