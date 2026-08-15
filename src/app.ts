@@ -364,14 +364,17 @@ function stringRecord(value: unknown): Record<string, string> { return Object.fr
 function eventName(message: string): string { return message.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, ""); }
 async function writeTickSummary(context: RelayCommandContext, result: TickResult): Promise<void> {
   const activeRuns = await context.store.listActive({ id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot });
-  const rows: TickTableRow[] = result.items.map((outcome) => ({
-    ticket: outcome.item.id,
-    title: outcome.item.title,
-    trigger: outcome.triggerId,
-    worker: outcome.workerId,
-    status: outcome.status,
-    detail: outcome.reason,
-  }));
+  const suppressedSkips = result.items.filter((outcome) => outcome.status === "skipped" && outcome.reason?.endsWith("No matching workers."));
+  const rows: TickTableRow[] = result.items
+    .filter((outcome) => !(outcome.status === "skipped" && outcome.reason?.endsWith("No matching workers.")))
+    .map((outcome) => ({
+      ticket: outcome.item.id,
+      title: outcome.item.title,
+      trigger: outcome.triggerId,
+      worker: outcome.workerId,
+      status: outcome.status,
+      detail: outcome.reason,
+    }));
   const representedWorkers = new Set(rows.map((row) => row.worker).filter((worker): worker is string => Boolean(worker)));
   for (const run of activeRuns) {
     if (run.worker && representedWorkers.has(run.worker.id)) continue;
@@ -384,6 +387,7 @@ async function writeTickSummary(context: RelayCommandContext, result: TickResult
       detail: run.status === "running" ? "Active worker." : `Worker is ${run.status}.`,
     });
   }
-  context.write(`Tick: ${result.itemsDiscovered} discovered | ${result.actionsExecuted} actions | ${result.runsLaunched} workers launched | ${result.actionsFailed} action failures | ${result.skipped} skipped`);
+  const suppressedNote = suppressedSkips.length ? ` (${suppressedSkips.length} cleanup no-ops hidden)` : "";
+  context.write(`Tick: ${result.itemsDiscovered} discovered | ${result.actionsExecuted} actions | ${result.runsLaunched} workers launched | ${result.actionsFailed} action failures | ${result.skipped} skipped${suppressedNote}`);
   context.write(rows.length ? tickTable(rows) : "No matching tickets or running workers.");
 }
