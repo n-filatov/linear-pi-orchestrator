@@ -92,6 +92,12 @@ export interface WorkerHandle {
   metadata?: Record<string, unknown>;
 }
 
+/** The terminal result observed for a worker after it has been launched. */
+export interface WorkerCompletion {
+  status: "succeeded" | "failed";
+  error?: string;
+}
+
 /** Durable lifecycle state for a dispatched work item. */
 export interface RunRecord {
   /** Deterministic serialized form of `identity`; generated with createRunKey. */
@@ -106,6 +112,8 @@ export interface RunRecord {
   updatedAt: string;
   workspace?: Workspace;
   worker?: WorkerHandle;
+  /** Set after the persisted workspace has been safely removed. */
+  workspaceCleanedAt?: string;
   completedAt?: string;
   error?: string;
 }
@@ -147,6 +155,15 @@ export interface RunClaim {
   trigger: TriggerDefinition;
   agent: AgentResolution;
   claimedAt: string;
+  /** Enforced by the store while it holds its cross-process lock. */
+  maxConcurrent: number;
+}
+
+/** A terminal transition that must apply to one specific active run generation. */
+export interface RunTerminalTransition {
+  status: "succeeded" | "failed" | "stopped";
+  completedAt: string;
+  error?: string;
 }
 
 export interface RunStore {
@@ -154,6 +171,10 @@ export interface RunStore {
   countActive(identity: Pick<RunIdentity, "repository" | "sourceId" | "triggerId">): Promise<number>;
   /** Atomically creates a claimed run, or returns undefined when another process won. */
   claim(claim: RunClaim): Promise<RunRecord | undefined>;
+  /** Atomically terminally transitions an active run only if its generation still matches. */
+  finishActive(identity: RunIdentity, claimedAt: string, transition: RunTerminalTransition): Promise<RunRecord | undefined>;
+  /** Atomically records workspace removal without changing the run's terminal result. */
+  markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined>;
   update(run: RunRecord): Promise<void>;
   listActive?(repository: RepositoryScope): Promise<readonly RunRecord[]>;
 }
@@ -170,6 +191,10 @@ export interface AgentLaunchSpec {
 export interface AgentLauncher {
   resolve(profile: AgentProfile | undefined, item: WorkItem, trigger: TriggerDefinition): Promise<AgentResolution>;
   launch(spec: AgentLaunchSpec): Promise<WorkerHandle>;
+  /** Wait for a locally launched worker. Undefined means this launcher cannot observe exits. */
+  wait?(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined>;
+  /** Check a persisted worker after a relay process has restarted. */
+  reconcile?(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle, run: RunRecord): Promise<void>;
 }
 

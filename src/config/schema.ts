@@ -31,7 +31,7 @@ export const sourceSchema = z.discriminatedUnion("type", [
     enabled: z.boolean().default(true),
     pollIntervalMs: z.number().int().positive().default(30_000),
     mcp: mcpTransportSchema.optional(),
-    tools: z.object({ listIssues: z.string().optional(), saveIssue: z.string().optional(), saveComment: z.string().optional() }).strict().default({}),
+    tools: z.object({ listIssues: z.string().optional(), getIssue: z.string().optional(), saveIssue: z.string().optional(), saveComment: z.string().optional() }).strict().default({}),
     reporting: z.object({ runningLabel: z.string().optional(), blockedLabel: z.string().optional(), doneLabel: z.string().optional(), inProgressState: z.string().optional(), commentOnLaunch: z.boolean().default(true), commentOnFailure: z.boolean().default(true) }).strict().default({}),
   }).strict(),
   z.object({
@@ -44,11 +44,14 @@ export const sourceSchema = z.discriminatedUnion("type", [
 ]);
 
 export const agentSchema = z.object({
+  /** Optional provider guard used to reject incompatible model profiles. */
+  provider: z.string().min(1).optional(),
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
   environment: z.record(z.string(), z.string()).default({}),
-  /** Models this launcher accepts; profiles may provide the concrete selection. */
+  /** Model profile ids this launcher accepts; empty means all provider-compatible profiles. */
   models: z.array(z.string().min(1)).default([]),
+  /** Optional raw model id used when no model profile is selected. */
   defaultModel: z.string().min(1).optional(),
   defaultModelProfile: identifier.optional(),
   defaultReasoningEffort: z.string().min(1).optional(),
@@ -114,13 +117,32 @@ export const relayConfigSchema = z.object({
   }).strict().default({}),
 }).strict().superRefine((config, context) => {
   for (const [agentId, agent] of Object.entries(config.agents)) {
-    if (agent.defaultModelProfile && !config.modelProfiles[agent.defaultModelProfile]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "defaultModelProfile"], message: `unknown model profile '${agent.defaultModelProfile}'` });
-    if (agent.defaultModel && agent.models.length > 0 && !agent.models.includes(agent.defaultModel)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "defaultModel"], message: "must be included in agents.<name>.models when models is specified" });
+    for (const [modelIndex, profileId] of agent.models.entries()) {
+      const profile = config.modelProfiles[profileId];
+      if (!profile) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "models", modelIndex], message: `unknown model profile '${profileId}'` });
+      else if (agent.provider && profile.provider !== agent.provider) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "models", modelIndex], message: `provider '${profile.provider}' is incompatible with agent provider '${agent.provider}'` });
+    }
+    if (agent.defaultModelProfile) {
+      const profile = config.modelProfiles[agent.defaultModelProfile];
+      if (!profile) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "defaultModelProfile"], message: `unknown model profile '${agent.defaultModelProfile}'` });
+      else {
+        if (agent.models.length > 0 && !agent.models.includes(agent.defaultModelProfile)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "defaultModelProfile"], message: `model profile '${agent.defaultModelProfile}' is not allowed by this agent` });
+        if (agent.provider && profile.provider !== agent.provider) context.addIssue({ code: z.ZodIssueCode.custom, path: ["agents", agentId, "defaultModelProfile"], message: `provider '${profile.provider}' is incompatible with agent provider '${agent.provider}'` });
+      }
+    }
   }
   for (const [index, trigger] of config.triggers.entries()) {
     if (!config.sources[trigger.source]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "source"], message: `unknown source '${trigger.source}'` });
     if (!config.agents[trigger.agent]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "agent"], message: `unknown agent '${trigger.agent}'` });
-    if (trigger.model && !config.modelProfiles[trigger.model]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "model"], message: `unknown model profile '${trigger.model}'` });
+    if (trigger.model) {
+      const profile = config.modelProfiles[trigger.model];
+      const agent = config.agents[trigger.agent];
+      if (!profile) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "model"], message: `unknown model profile '${trigger.model}'` });
+      else if (agent) {
+        if (agent.models.length > 0 && !agent.models.includes(trigger.model)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "model"], message: `model profile '${trigger.model}' is not allowed by agent '${trigger.agent}'` });
+        if (agent.provider && profile.provider !== agent.provider) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "model"], message: `provider '${profile.provider}' is incompatible with agent '${trigger.agent}' provider '${agent.provider}'` });
+      }
+    }
   }
   const ids = new Set<string>();
   for (const [index, trigger] of config.triggers.entries()) {

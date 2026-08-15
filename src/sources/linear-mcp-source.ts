@@ -22,6 +22,7 @@ export interface LinearMcpSourceConfig {
   /** Linear MCP tool names are owned by this adapter and can vary by server. */
   tools?: {
     listIssues?: string;
+    getIssue?: string;
     saveIssue?: string;
     saveComment?: string;
   };
@@ -58,6 +59,7 @@ export class LinearMcpSource implements WorkSource {
     this.id = config.id;
     this.tools = {
       listIssues: config.tools?.listIssues ?? "list_issues",
+      getIssue: config.tools?.getIssue ?? "get_issue",
       saveIssue: config.tools?.saveIssue ?? "save_issue",
       saveComment: config.tools?.saveComment ?? "save_comment",
     };
@@ -79,9 +81,9 @@ export class LinearMcpSource implements WorkSource {
   }
 
   public async report(event: SourceEvent): Promise<void> {
-    const issueId = event.run.item.id;
+    const issueId = linearIssueId(event.run.item);
     if (event.type === "claimed") {
-      await this.markRunning(issueId, event.run.item);
+      await this.markRunning(issueId);
       return;
     }
     if (event.type === "launched") {
@@ -93,43 +95,64 @@ export class LinearMcpSource implements WorkSource {
       }
       return;
     }
+    if (event.type === "succeeded") {
+      await this.markSucceeded(issueId);
+      return;
+    }
     if (event.type === "failed") {
-      await this.markFailed(issueId, event.run.item);
+      await this.markFailed(issueId);
       if (this.config.reporting?.commentOnFailure) {
         await this.config.client.callTool(this.tools.saveComment, {
           issueId,
-          body: `Task Relay failed to launch this work item.\n\n${event.error ?? "Unknown error"}`,
+          body: `Task Relay run failed.\n\n${event.error ?? "Unknown error"}`,
         });
       }
       return;
     }
-    if (event.type === "stopped") await this.clearRunning(issueId, event.run.item);
+    if (event.type === "stopped") await this.clearRunning(issueId);
   }
 
   public async close(): Promise<void> {
     await this.config.client.close?.();
   }
 
-  private async markRunning(issueId: string, item: WorkItem): Promise<void> {
+  private async markRunning(issueId: string): Promise<void> {
     const reporting = this.config.reporting;
     if (!reporting?.runningLabel && !reporting?.inProgressState) return;
-    const oldLabels = readStringArray(item.metadata?.linearLabels);
-    const labels = reporting.runningLabel ? [...new Set([...oldLabels, reporting.runningLabel])] : oldLabels;
-    const args: Record<string, unknown> = { id: issueId, labels };
+    const args: Record<string, unknown> = { id: issueId };
+    if (reporting.runningLabel) {
+      const oldLabels = await this.currentLabels(issueId);
+      args.labels = [...new Set([...oldLabels, reporting.runningLabel])];
+    }
     if (reporting.inProgressState) args.state = reporting.inProgressState;
     await this.config.client.callTool(this.tools.saveIssue, args);
   }
 
-  private async markFailed(issueId: string, item: WorkItem): Promise<void> {
+  private async markFailed(issueId: string): Promise<void> {
     const reporting = this.config.reporting;
-    const labels = readStringArray(item.metadata?.linearLabels).filter((label) => label !== reporting?.runningLabel);
+    if (!reporting?.runningLabel && !reporting?.blockedLabel) return;
+    const labels = (await this.currentLabels(issueId)).filter((label) => label !== reporting?.runningLabel);
     if (reporting?.blockedLabel) labels.push(reporting.blockedLabel);
     await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
   }
 
-  private async clearRunning(issueId: string, item: WorkItem): Promise<void> {
-    const labels = readStringArray(item.metadata?.linearLabels).filter((label) => label !== this.config.reporting?.runningLabel);
+  private async markSucceeded(issueId: string): Promise<void> {
+    const reporting = this.config.reporting;
+    if (!reporting?.runningLabel && !reporting?.doneLabel) return;
+    const labels = (await this.currentLabels(issueId)).filter((label) => label !== reporting?.runningLabel);
+    if (reporting?.doneLabel) labels.push(reporting.doneLabel);
     await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
+  }
+
+  private async clearRunning(issueId: string): Promise<void> {
+    if (!this.config.reporting?.runningLabel) return;
+    const labels = (await this.currentLabels(issueId)).filter((label) => label !== this.config.reporting?.runningLabel);
+    await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
+  }
+
+  private async currentLabels(issueId: string): Promise<string[]> {
+    const response = await this.config.client.callTool(this.tools.getIssue, { id: issueId });
+    return normaliseLabels(readIssue(readMcpJson(response)).labels);
   }
 }
 
@@ -151,8 +174,15 @@ function readIssues(value: unknown): LinearIssue[] {
   throw new Error("Linear list_issues result must be an issue array or { issues: [...] }");
 }
 
+function readIssue(value: unknown): LinearIssue {
+  if (isRecord(value) && isRecord(value.issue)) return value.issue;
+  if (isRecord(value)) return value;
+  throw new Error("Linear get_issue result must be an issue object or { issue: {...} }");
+}
+
 function toWorkItem(sourceId: string, issue: LinearIssue): WorkItem {
-  const id = readOptionalString(issue.id) ?? readOptionalString(issue.identifier);
+  const id = readOptionalString(issue.identifier) ?? readOptionalString(issue.id);
+  const providerId = readOptionalString(issue.id) ?? id;
   const title = readOptionalString(issue.title);
   if (!id || !title) throw new Error("Linear issue is missing id or title");
   const statusType = readOptionalString(issue.statusType)?.toLowerCase();
@@ -167,10 +197,16 @@ function toWorkItem(sourceId: string, issue: LinearIssue): WorkItem {
     state: terminal ? "terminal" : "open",
     terminal,
     metadata: {
+      linearIssueId: providerId,
+      linearIdentifier: id,
       linearLabels: normaliseLabels(issue.labels),
       linearAssignee: issue.assignee,
     },
   };
+}
+
+function linearIssueId(item: WorkItem): string {
+  return readOptionalString(item.metadata?.linearIssueId) ?? item.id;
 }
 
 function normaliseLabels(value: unknown): string[] {

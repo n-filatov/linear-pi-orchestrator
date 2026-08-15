@@ -23,4 +23,28 @@ describe("Task Relay configuration", () => {
       triggers: [{ id: "ready", source: "queue", label: "ready", agent: "missing", model: "default" }],
     })).toThrow(/unknown agent/);
   });
+
+  it("rejects a model profile that is incompatible with the selected agent", () => {
+    expect(() => relayConfigSchema.parse({
+      version: 1,
+      sources: { queue: { type: "command", discover: { command: "find-tasks" } } },
+      agents: { codex: { provider: "openai", command: "codex", models: ["codex-default"] } },
+      modelProfiles: {
+        "codex-default": { provider: "openai", model: "gpt-codex" },
+        "claude-balanced": { provider: "anthropic", model: "sonnet" },
+      },
+      triggers: [{ id: "ready", source: "queue", label: "ready", agent: "codex", model: "claude-balanced" }],
+    })).toThrow(/not allowed by agent|incompatible/);
+  });
+
+  it("accepts an explicitly allowed provider-compatible model profile", () => {
+    const config = relayConfigSchema.parse({
+      version: 1,
+      sources: { queue: { type: "command", discover: { command: "find-tasks" } } },
+      agents: { codex: { provider: "openai", command: "codex", models: ["codex-deep"], defaultModelProfile: "codex-deep" } },
+      modelProfiles: { "codex-deep": { provider: "openai", model: "gpt-codex", reasoningEffort: "high" } },
+      triggers: [{ id: "ready", source: "queue", label: "ready", agent: "codex", model: "codex-deep" }],
+    });
+    expect(config.triggers[0].model).toBe("codex-deep");
+  });
 });

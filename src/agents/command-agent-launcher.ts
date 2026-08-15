@@ -5,8 +5,10 @@ import type {
   AgentLauncher as DomainAgentLauncher,
   AgentProfile,
   AgentResolution,
+  RunRecord,
   TriggerDefinition,
   WorkItem,
+  WorkerCompletion,
   WorkerHandle,
   Workspace,
 } from "../domain/index.js";
@@ -170,6 +172,14 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
     await this.options.executor.stop(worker);
   }
 
+  async wait(worker: WorkerHandle, _run: RunRecord): Promise<WorkerCompletion | undefined> {
+    return this.options.executor.wait?.(worker);
+  }
+
+  async reconcile(worker: WorkerHandle, _run: RunRecord): Promise<WorkerCompletion | undefined> {
+    return this.options.executor.reconcile?.(worker);
+  }
+
   async launchConfigured(request: AgentLaunchRequest): Promise<AgentLaunchResult> {
     const resolved = this.resolveLaunch(request.overrides, request.trigger);
     const delivery = promptDelivery(resolved.agent, request.overrides?.promptDelivery ?? triggerOverrides(request.trigger).promptDelivery);
@@ -287,7 +297,7 @@ function workerHandle(
   item: WorkItem,
   workspace: Workspace,
   resolved: ResolvedAgentLaunch,
-  execution: { pid?: number; tmux?: { session: string; window: string; index?: string } },
+  execution: { pid?: number; tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string } },
 ): WorkerHandle {
   return {
     id: `${itemKey(item)}:${resolved.agentId}`,
@@ -300,6 +310,7 @@ function workerHandle(
       reasoningEffort: resolved.reasoningEffort,
       pid: execution.pid,
       tmux: execution.tmux,
+      persistent: execution.tmux !== undefined,
     },
   };
 }

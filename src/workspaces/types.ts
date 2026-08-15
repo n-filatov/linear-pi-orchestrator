@@ -5,6 +5,8 @@ export type WorkspaceProviderOptions = {
   branchTemplate?: string;
   /** Preferred base ref; fallback candidates are checked automatically. */
   baseBranch?: string;
+  /** Directory containing worktrees that Task Relay is allowed to remove. */
+  worktreeRoot?: string;
 };
 
 export type WorktreeProvider = WorkspaceProvider & {

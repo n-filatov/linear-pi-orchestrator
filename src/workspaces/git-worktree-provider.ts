@@ -2,9 +2,9 @@ import path from "node:path";
 import { execa } from "execa";
 import type { RunRecord, Workspace } from "../domain/index.js";
 import type { WorktreeProvider, WorkspaceProviderOptions } from "./types.js";
-import { branchForRun, localBranchExists, resolveBaseBranch, workspace } from "./worktree-utils.js";
+import { branchForRun, cleanupOwnership, localBranchExists, resolveBaseBranch, workspace } from "./worktree-utils.js";
 
-export type GitWorktreeProviderOptions = WorkspaceProviderOptions & { worktreeRoot?: string };
+export type GitWorktreeProviderOptions = WorkspaceProviderOptions;
 
 /** Native Git alternative for installations that do not use the `wt` helper. */
 export class GitWorktreeProvider implements WorktreeProvider {
@@ -14,21 +14,29 @@ export class GitWorktreeProvider implements WorktreeProvider {
     const repository = run.identity.repository.root;
     const branch = branchForRun(run, this.options.branchTemplate);
     const existing = await this.findPath(repository, branch, signal);
-    if (existing) return workspace(run, existing, branch, "git-worktree");
+    const worktreeRoot = this.worktreeRoot(repository);
+    if (existing) return workspace(run, existing, branch, "git-worktree", { createdWorkspace: false, createdBranch: false, worktreeRoot });
 
-    const destination = path.join(this.options.worktreeRoot ?? path.join(repository, ".task-relay-worktrees"), safeSegment(branch));
+    const destination = path.join(worktreeRoot, safeSegment(branch));
     const exists = await localBranchExists(repository, branch);
     const args = exists
       ? ["worktree", "add", destination, branch]
       : ["worktree", "add", "-b", branch, destination, await resolveBaseBranch(repository, triggerBase(run) ?? this.options.baseBranch)];
     await execa("git", args, { cwd: repository, cancelSignal: signal });
-    return workspace(run, destination, branch, "git-worktree");
+    return workspace(run, destination, branch, "git-worktree", { createdWorkspace: true, createdBranch: !exists, worktreeRoot });
   }
 
   async cleanup(space: Workspace, run: RunRecord): Promise<void> {
     const repository = run.identity.repository.root;
-    await execa("git", ["worktree", "remove", "--force", space.path], { cwd: repository, reject: false });
-    if (space.branch && await localBranchExists(repository, space.branch)) await execa("git", ["branch", "-D", space.branch], { cwd: repository });
+    const ownership = cleanupOwnership(space, run, "git-worktree", this.worktreeRoot(repository));
+    if (!ownership.createdWorkspace) return;
+    const removed = await execa("git", ["worktree", "remove", "--force", space.path], { cwd: repository, reject: false });
+    if (removed.exitCode !== 0 || !ownership.createdBranch || !space.branch) return;
+    if (await localBranchExists(repository, space.branch)) await execa("git", ["branch", "-D", space.branch], { cwd: repository });
+  }
+
+  private worktreeRoot(repository: string): string {
+    return path.resolve(this.options.worktreeRoot ?? path.join(repository, ".task-relay", "workspaces"));
   }
 
   private async findPath(repository: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {

@@ -48,6 +48,10 @@ export interface StopOptions {
 export class TaskRelay {
   private readonly sources = new Map<string, WorkSource>();
   private readonly now: () => Date;
+  /** Generations this relay is already waiting on; do not reconcile them too. */
+  private readonly locallyObservedRuns = new Set<string>();
+  /** Local workers whose source lifecycle notifications must finish before close. */
+  private readonly nonPersistentObservers = new Set<Promise<void>>();
   private activeTick: Promise<TickResult> | undefined;
   private stopController = new AbortController();
 
@@ -80,6 +84,11 @@ export class TaskRelay {
       await this.stopAndCleanupActiveRuns();
     }
 
+    // Direct-process observers can still report a terminal result using this
+    // source. Tmux workers persist their outcome for later reconciliation and
+    // intentionally do not hold `relay once` open.
+    await Promise.all([...this.nonPersistentObservers]);
+
     await Promise.all([...this.sources.values()].map(async (source) => source.close?.()));
   }
 
@@ -93,6 +102,7 @@ export class TaskRelay {
     };
 
     const triggers = await this.dependencies.triggers.list();
+    await this.reconcilePersistedRuns(triggers);
     for (const trigger of triggers) {
       if (this.stopController.signal.aborted) break;
       if (!trigger.enabled) continue;
@@ -126,17 +136,6 @@ export class TaskRelay {
 
     result.itemsDiscovered += items.length;
     const maxConcurrent = normaliseConcurrency(trigger.maxConcurrent);
-    const active = await this.dependencies.runStore.countActive({
-      repository: trigger.repository,
-      sourceId: trigger.sourceId,
-      triggerId: trigger.id,
-    });
-    const remainingCapacity = Math.max(0, maxConcurrent - active);
-    if (remainingCapacity === 0) {
-      result.skipped += items.length;
-      return;
-    }
-
     const eligible: WorkItem[] = [];
     for (const item of items) {
       if (isTerminalWorkItem(item)) {
@@ -165,10 +164,10 @@ export class TaskRelay {
       eligible.push(item);
     }
 
-    const queue = new PQueue({ concurrency: remainingCapacity });
-    const candidates = eligible.slice(0, remainingCapacity);
-    result.skipped += eligible.length - candidates.length;
-    for (const item of candidates) {
+    // The store, not this preliminary queue, owns the cross-process capacity
+    // decision. A full-size local queue keeps a relay from over-provisioning.
+    const queue = new PQueue({ concurrency: maxConcurrent });
+    for (const item of eligible) {
       void queue.add(async () => {
         const outcome = await this.dispatchItem(source, trigger, item);
         result.runsClaimed += outcome.claimed ? 1 : 0;
@@ -233,6 +232,7 @@ export class TaskRelay {
       trigger,
       agent,
       claimedAt,
+      maxConcurrent: normaliseConcurrency(trigger.maxConcurrent),
     });
     if (!run) return { claimed: false, launched: false, skipped: true };
 
@@ -267,6 +267,7 @@ export class TaskRelay {
       run.updatedAt = this.now().toISOString();
       await this.dependencies.runStore.update(run);
       await this.report(source, "launched", run);
+      this.startObservingWorker(source, run);
       this.dependencies.logger.info("Task relay launched work", {
         runId: run.id,
         triggerId: trigger.id,
@@ -307,11 +308,11 @@ export class TaskRelay {
         try {
           if (run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
           if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
-          run.status = "stopped";
-          run.completedAt = this.now().toISOString();
-          run.updatedAt = run.completedAt;
-          await this.dependencies.runStore.update(run);
-          if (source) await this.report(source, "stopped", run);
+          const stopped = await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, {
+            status: "stopped",
+            completedAt: this.now().toISOString(),
+          });
+          if (source && stopped) await this.report(source, "stopped", stopped);
         } catch (error) {
           this.dependencies.logger.error("Could not stop active run", {
             runId: run.id,
@@ -320,6 +321,69 @@ export class TaskRelay {
         }
       }
     }
+  }
+
+  private startObservingWorker(source: WorkSource, run: RunRecord): void {
+    const observer = this.observeWorker(source, run).catch((error: unknown) => {
+      this.dependencies.logger.error("Task relay worker observation failed unexpectedly", {
+        runId: run.id,
+        error: messageFor(error),
+      });
+    });
+    if (isPersistentWorker(run)) return;
+    this.nonPersistentObservers.add(observer);
+    void observer.then(() => this.nonPersistentObservers.delete(observer));
+  }
+
+  private async observeWorker(source: WorkSource, run: RunRecord): Promise<void> {
+    const generation = runGeneration(run);
+    this.locallyObservedRuns.add(generation);
+    try {
+      const completion = await this.dependencies.agentLauncher.wait?.(run.worker!, run);
+      if (!completion) return;
+      await this.finishObservedRun(source, run, completion.status, completion.error);
+    } catch (error) {
+      await this.finishObservedRun(source, run, "failed", `Worker observation failed: ${messageFor(error)}`);
+    } finally {
+      this.locallyObservedRuns.delete(generation);
+    }
+  }
+
+  /**
+   * A process restart loses in-memory child handles. Runs that never reached a
+   * worker cannot recover, while adapter-specific reconciliation can determine
+   * whether an already-running persisted worker has since exited.
+   */
+  private async reconcilePersistedRuns(triggers: readonly TriggerDefinition[]): Promise<void> {
+    if (!this.dependencies.runStore.listActive) return;
+    const repositories = new Map<string, TriggerDefinition["repository"]>();
+    for (const trigger of triggers) repositories.set(`${trigger.repository.id}\u0000${trigger.repository.root}`, trigger.repository);
+    for (const repository of repositories.values()) {
+      for (const run of await this.dependencies.runStore.listActive(repository)) {
+        if (this.locallyObservedRuns.has(runGeneration(run))) continue;
+        const source = this.sources.get(run.identity.sourceId);
+        if (!source) continue;
+        if (!run.worker) {
+          await this.finishObservedRun(source, run, "failed", "Relay restarted before the worker was launched.");
+          continue;
+        }
+        try {
+          const completion = await this.dependencies.agentLauncher.reconcile?.(run.worker, run);
+          if (completion) await this.finishObservedRun(source, run, completion.status, completion.error);
+        } catch (error) {
+          await this.finishObservedRun(source, run, "failed", `Worker reconciliation failed: ${messageFor(error)}`);
+        }
+      }
+    }
+  }
+
+  private async finishObservedRun(source: WorkSource, observed: RunRecord, status: "succeeded" | "failed", error?: string): Promise<void> {
+    const current = await this.dependencies.runStore.finishActive(observed.identity, observed.claimedAt, {
+      status,
+      error,
+      completedAt: this.now().toISOString(),
+    });
+    if (current) await this.report(source, status, current, error);
   }
 
   private async report(source: WorkSource, type: SourceEvent["type"], run: RunRecord, error?: string): Promise<boolean> {
@@ -354,4 +418,12 @@ function normaliseConcurrency(value: number | undefined): number {
 
 function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function runGeneration(run: Pick<RunRecord, "id" | "claimedAt">): string {
+  return `${run.id}\u0000${run.claimedAt}`;
+}
+
+function isPersistentWorker(run: RunRecord): boolean {
+  return run.worker?.metadata?.persistent === true;
 }

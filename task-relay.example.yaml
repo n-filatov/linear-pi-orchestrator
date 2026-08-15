@@ -22,14 +22,18 @@ sources:
 
 agents:
   codex:
+    provider: openai
     command: codex
     args: [exec]
+    models: [codex-default]
     defaultModelProfile: codex-default
     modelArgument: --model
     promptDelivery: { mode: argument }
   claude:
+    provider: anthropic
     command: claude
     args: [-p]
+    models: [claude-balanced]
     defaultModelProfile: claude-balanced
     modelArgument: --model
     reasoningEffortArgument: --effort

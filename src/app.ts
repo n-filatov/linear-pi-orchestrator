@@ -5,7 +5,7 @@ import pRetry from "p-retry";
 import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js";
 import type { RelayConfig, RelayTrigger } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, TriggerDefinition, WorkSource } from "./domain/index.js";
+import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerDefinition, WorkSource } from "./domain/index.js";
 import { CommandAgentLauncher, type CommandAgentProfile, type AgentModelProfile } from "./agents/index.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
@@ -59,21 +59,24 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
     cleanup: async (context, target) => {
       const candidates = (await context.store.listRuns()).filter((run) => run.id === target || run.item.id.toLowerCase() === target.toLowerCase());
       if (candidates.length === 0) throw new Error(`No run found for '${target}'.`);
-      const active = candidates.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
-      if (active.length === 0) throw new Error(`No active run found for '${target}'.`);
-      if (active.length > 1) throw new Error(`More than one active run matches '${target}'. Use the exact run id from 'relay runs --json'.`);
-      const run = active[0];
+      const removable = candidates.filter((run) => run.workspace && !run.workspaceCleanedAt);
+      if (removable.length === 0) throw new Error(`No removable workspace found for '${target}'.`);
+      if (removable.length > 1) throw new Error(`More than one run with a workspace matches '${target}'. Use the exact run id from 'relay runs --json'.`);
+      const run = removable[0];
+      const wasActive = ["claimed", "provisioning", "launching", "running"].includes(run.status);
       const runtime = await composeRuntime(context, { trigger: run.identity.triggerId });
       try {
-        if (run.worker) await runtime.launcher.stop(run.worker);
+        if (wasActive && run.worker) await runtime.launcher.stop(run.worker);
         if (run.workspace) await runtime.workspace.cleanup(run.workspace, run);
-        run.status = "stopped";
-        run.completedAt = new Date().toISOString();
-        run.updatedAt = run.completedAt;
-        await runtime.runStore.update(run);
+        const stopped = wasActive ? await runtime.runStore.finishActive(run.identity, run.claimedAt, {
+          status: "stopped",
+          completedAt: new Date().toISOString(),
+        }) : undefined;
+        const cleaned = await runtime.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, new Date().toISOString());
+        if (!cleaned) throw new Error(`Workspace was removed, but run ${run.id} was replaced before cleanup state could be recorded.`);
         const source = runtime.sources.get(run.identity.sourceId);
-        if (source) await source.report({ type: "stopped", sourceId: source.id, run, occurredAt: run.completedAt });
-        context.write(`Cleaned ${run.item.id}: worker stopped and workspace removed.`);
+        if (source && stopped) await source.report({ type: "stopped", sourceId: source.id, run: stopped, occurredAt: stopped.completedAt! });
+        context.write(`Cleaned ${run.item.id}: ${stopped ? "worker stopped and " : ""}workspace removed.`);
       } finally { await runtime.relay.stop(); }
     },
   };
@@ -102,7 +105,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const launcher = new CommandAgentLauncher({ profiles: agentProfiles(context.config), executor });
   const workspace = context.config.workspace.adapter === "git-worktree"
     ? new GitWorktreeProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) })
-    : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate });
+    : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) });
   const eventStore = new EventingRunStore(context.store, context.logger, repository.id);
   const triggerProvider: TriggerProvider = { list: async () => triggers };
   const relay = new TaskRelay({ triggers: triggerProvider, sources: sources.values(), runStore: eventStore, workspaceProvider: workspace, agentLauncher: launcher, logger: relayLogger(context.logger, repository.id) });
@@ -127,14 +130,15 @@ function domainTrigger(config: RelayConfig, trigger: RelayTrigger, repository: R
   };
 }
 
-function agentProfiles(config: RelayConfig): CommandAgentProfile[] {
-  const models: AgentModelProfile[] = Object.entries(config.modelProfiles).map(([id, profile]) => ({ id, model: profile.model, args: profile.arguments, reasoningEffort: profile.reasoningEffort }));
+export function agentProfiles(config: RelayConfig): CommandAgentProfile[] {
   return Object.entries(config.agents).map(([id, agent]) => ({
     id,
     command: agent.command,
     args: agent.args,
     environment: agent.environment,
-    models,
+    models: Object.entries(config.modelProfiles)
+      .filter(([profileId, profile]) => (agent.models.length === 0 || agent.models.includes(profileId)) && (!agent.provider || profile.provider === agent.provider))
+      .map(([profileId, profile]): AgentModelProfile => ({ id: profileId, model: profile.model, args: profile.arguments, reasoningEffort: profile.reasoningEffort })),
     defaultModel: agent.defaultModel,
     defaultModelProfile: agent.defaultModelProfile,
     defaultReasoningEffort: agent.defaultReasoningEffort,
@@ -198,6 +202,8 @@ class EventingRunStore implements RunStore {
   countActive(identity: Pick<RunIdentity, "repository" | "sourceId" | "triggerId">) { return this.store.countActive(identity); }
   listActive(repository: RepositoryScope) { return this.store.listActive?.(repository) ?? Promise.resolve([]); }
   async claim(claim: RunClaim): Promise<RunRecord | undefined> { const run = await this.store.claim(claim); if (run) this.write(run, "task.claimed"); return run; }
+  async finishActive(identity: RunIdentity, claimedAt: string, transition: RunTerminalTransition): Promise<RunRecord | undefined> { const run = await this.store.finishActive(identity, claimedAt, transition); if (run) this.write(run, `run.${run.status}`); return run; }
+  async markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined> { const run = await this.store.markWorkspaceCleaned(identity, claimedAt, cleanedAt); if (run) this.write(run, "run.workspace.cleaned"); return run; }
   async update(run: RunRecord): Promise<void> { await this.store.update(run); this.write(run, `run.${run.status}`); }
   private write(run: RunRecord, event: string): void {
     const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };

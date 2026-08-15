@@ -46,14 +46,18 @@ sources:
 
 agents:
   codex:
+    provider: openai
     command: codex
     args: [exec]
+    models: [codex-default]
     defaultModelProfile: codex-default
     modelArgument: --model
     promptDelivery: { mode: argument }
   claude:
+    provider: anthropic
     command: claude
     args: [-p]
+    models: [claude-balanced]
     defaultModelProfile: claude-balanced
     modelArgument: --model
     reasoningEffortArgument: --effort
@@ -97,7 +101,7 @@ logging:
   pretty: true
 ```
 
-The CLI validates all trigger references: every source, agent, and model profile named by a trigger must exist. Configuration errors name the exact YAML path.
+The CLI validates all trigger references: every source, agent, and model profile named by a trigger must exist. An agent's `models` list is an allow-list of model profile ids, and its optional `provider` rejects profiles for another provider. Configuration errors name the exact YAML path.
 
 ## Commands and observability
 
@@ -118,7 +122,9 @@ relay daemon start|stop|status
 
 Every event is structured JSONL under `${XDG_STATE_HOME:-~/.local/state}/task-relay/<repo>-<hash>/events.jsonl`, with fields such as `project`, `trigger`, `source`, `task`, `agent`, `model`, `runId`, `event`, `error`, and `duration`. Human tables are rendered directly from those JSON records, never from colored terminal text. Persistent run state is stored beside the log, keyed by repository, source, work item, and trigger, with an atomic write lock to coordinate concurrent CLI processes.
 
-`trigger test` performs source discovery without claiming work. `once` performs one complete dispatch tick, `watch` keeps polling in the foreground, and `daemon` manages a repository-scoped background watcher.
+`trigger test` performs source discovery without claiming work. `once` performs one complete dispatch tick, `watch` keeps polling in the foreground, and `daemon` manages a repository-scoped background watcher. Worker exits transition runs to `succeeded` or `failed`, release trigger capacity, and are reconciled from persisted process/tmux metadata after a restart.
+
+Workspace cleanup is ownership-aware. Relay records whether it created the worktree and branch, refuses paths outside the configured workspace directory, and will not force-delete an adopted or legacy workspace. The `wt` adapter uses a Relay-owned Worktrunk config inside that directory, leaving global Worktrunk settings untouched. Completed runs can still be cleaned with `relay cleanup <task-or-run>` without signaling an already-exited process; their terminal result is preserved with a recorded cleanup timestamp.
 
 ## Development
 

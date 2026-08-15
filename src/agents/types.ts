@@ -1,4 +1,4 @@
-import type { AgentLaunchSpec, AgentProfile, TriggerDefinition, WorkItem, WorkerHandle, Workspace } from "../domain/index.js";
+import type { AgentLaunchSpec, AgentProfile, TriggerDefinition, WorkItem, WorkerCompletion, WorkerHandle, Workspace } from "../domain/index.js";
 
 /** The supported ways an agent can receive the rendered task prompt. */
 export type PromptDeliveryMode = "stdin" | "argument" | "file";
@@ -97,11 +97,13 @@ export type AgentExecution = {
 
 export type AgentExecutionResult = {
   pid?: number;
-  tmux?: { session: string; window: string; index?: string };
+  tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string };
 };
 
 export interface AgentExecutionAdapter {
   execute(execution: AgentExecution): Promise<AgentExecutionResult>;
+  wait?(worker: WorkerHandle): Promise<WorkerCompletion | undefined>;
+  reconcile?(worker: WorkerHandle): Promise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle): Promise<void>;
 }
 
