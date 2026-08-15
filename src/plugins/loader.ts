@@ -13,7 +13,7 @@ export async function loadRelayPlugin(specifier: string, projectRoot: string): P
   return candidate;
 }
 
-function isPlugin(value: unknown): value is RelayPlugin {
+export function isPlugin(value: unknown): value is RelayPlugin {
   if (!value || typeof value !== "object") return false;
   const plugin = value as Partial<RelayPlugin>;
   return (plugin.kind === "source" || plugin.kind === "action" || plugin.kind === "harness")
