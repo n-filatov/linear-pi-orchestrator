@@ -70,6 +70,7 @@ const executionSchema = z.object({
   retries: z.number().int().min(0).max(10).default(2),
   adapter: z.enum(["process", "tmux"]).default("process"),
   tmuxSession: z.string().min(1).optional(),
+  tmuxWindowName: z.string().min(1).optional(),
 }).strict().default({});
 
 const loggingSchema = z.object({

@@ -11,6 +11,7 @@ const launchConfigSchema = z.object({
   model: z.string().min(1).optional(),
   modelProfile: z.string().min(1).optional(),
   prompt: z.string().min(1).optional(),
+  promptFile: z.string().min(1).optional(),
   workspace: z.record(z.string(), z.unknown()).optional(),
 }).strict();
 
