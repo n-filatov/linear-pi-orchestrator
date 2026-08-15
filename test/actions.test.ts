@@ -279,7 +279,7 @@ describe("generic action execution", () => {
     const registry = new RelayPluginRegistry();
     for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
     const activeRelay = relay({
-      trigger: baseTrigger([{ id: "review", use: "launch", config: { harness: "opencode", model: "gpt-5.6-terra", prompt: "Review {{item.id}} carefully." } }]),
+      trigger: baseTrigger([{ id: "review", use: "launch", config: { harness: "opencode", mode: "interactive", model: "gpt-5.6-terra", prompt: "Review {{item.id}} carefully." } }]),
       items: [item], runStore: store, registry, actionLedger: ledger, agent,
     });
 
@@ -288,6 +288,7 @@ describe("generic action execution", () => {
     expect(result.runsLaunched).toBe(1);
     expect(resolvedProfiles).toEqual([{ id: "opencode", model: "gpt-5.6-terra", promptTemplate: "Review {{item.id}} carefully.", metadata: { modelProfile: undefined } }]);
     expect(launchedPrompts).toEqual(["Review {{item.id}} carefully."]);
+    expect([...store.runs.values()][0]?.trigger.promptDelivery).toBe("interactive");
   });
 });
 

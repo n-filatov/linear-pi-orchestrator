@@ -14,6 +14,16 @@ curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/ma
 
 The installer verifies the release checksum and installs `relay` to `~/.local/bin`, so it does not need `sudo`. If that directory is not already on your `PATH`, the installer prints the exact command to add it.
 
+After the first installation, update or check for a new release with:
+
+```bash
+relay update
+relay update --check
+relay update v0.2.0
+```
+
+The updater compares the installed executable with the published SHA-256 digest, smoke-tests the downloaded replacement, and only then atomically replaces the running binary. Restart an existing `relay watch` or daemon process afterward so it uses the new executable.
+
 To install a specific release or choose another destination:
 
 ```bash
@@ -82,6 +92,7 @@ actions:
     use: launch
     with:
       harness: codex
+      mode: interactive
       model: gpt-5.6-sol
       prompt: |
         Implement {{item.id}}: {{item.title}}
@@ -92,6 +103,7 @@ actions:
     use: launch
     with:
       harness: claude
+      mode: interactive
       model: claude-opus-5
       prompt: |
         Review the pull request for {{item.id}}.
@@ -150,6 +162,8 @@ logging:
 
 The Linear plugin owns `labels`, `statuses`, and other Linear fields. A GitHub or internal-queue plugin may define completely different match fields.
 
+`mode: interactive` starts the harness's terminal UI (`claude`, `codex`, `pi`, or `opencode`) in a detached tmux window, pastes the rendered prompt into that live session, and submits it. It requires `execution.adapter: tmux`; use `relay attach <task-or-run>` to enter the session. `mode: oneshot` retains the non-interactive behavior (`claude -p`, `codex exec`, and equivalent commands) and exits when the command finishes.
+
 The cleanup trigger does not need a worker ID in YAML. `targets.workers.sourceItem: current` resolves workers associated with the current source item; `runs` can be `latest`, `active`, or `all`. Cleanup only removes Relay-owned workspaces/branches and is idempotent once a worker has `workspaceCleanedAt`.
 
 ## Custom plugins
@@ -195,6 +209,8 @@ relay logs --task ENG-123 --follow
 relay trigger test implement-linear-issue
 relay once --trigger implement-linear-issue
 relay watch --trigger implement-linear-issue
+relay attach ENG-123              # enter the latest matching tmux worker
+relay update [version] [--check]
 relay cleanup '<worker-id>'
 relay daemon start|stop|status
 ```

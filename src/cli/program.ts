@@ -17,10 +17,12 @@ export type RelayCommandHandlers = {
   daemon?: (context: RelayCommandContext, action: "start" | "stop" | "status") => Promise<void>;
   triggerTest?: (context: RelayCommandContext, trigger: RelayTriggerV2) => Promise<void>;
   cleanup?: (context: RelayCommandContext, target: string) => Promise<void>;
+  attach?: (context: RelayCommandContext, target: string) => Promise<void>;
+  update?: (options: { check?: boolean; version?: string }) => Promise<string>;
 };
 export type RelayCliOptions = { handlers?: RelayCommandHandlers; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; cwd?: () => string };
 
-type InitOptions = { source?: string; harness?: string; /** @deprecated use harness */ agent?: string; label?: string; model?: string; prompt?: string; maxConcurrent?: number; yes?: boolean; force?: boolean; dryRun?: boolean };
+type InitOptions = { source?: string; harness?: string; /** @deprecated use harness */ agent?: string; label?: string; model?: string; mode?: "oneshot" | "interactive"; prompt?: string; maxConcurrent?: number; yes?: boolean; force?: boolean; dryRun?: boolean };
 
 function executable(command: string): boolean { try { execFileSync("which", [command], { stdio: "ignore" }); return true; } catch { return false; } }
 function gitValue(root: string, args: string[]): string | undefined { try { return execFileSync("git", ["-C", root, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined; } catch { return undefined; } }
@@ -30,7 +32,7 @@ function harnessChoices(): { name: string; value: typeof BUILT_IN_HARNESSES[numb
   return BUILT_IN_HARNESSES.map((harness) => ({ name: `${harness[0].toUpperCase()}${harness.slice(1)}${executable(harness) ? " (found)" : " (not found)"}`, value: harness }));
 }
 function harnessAvailabilityRows(): [string, string][] { return BUILT_IN_HARNESSES.map((harness) => [harness, executable(harness) ? "available" : "not found"]); }
-export function defaultConfig(options: Required<Pick<InitOptions, "source" | "harness" | "label" | "maxConcurrent" | "prompt">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfigV2 {
+export function defaultConfig(options: Required<Pick<InitOptions, "source" | "harness" | "label" | "maxConcurrent" | "mode" | "prompt">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfigV2 {
   const actionId = "implement";
   return relayConfigV2Schema.parse({
     version: 2,
@@ -52,6 +54,7 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
         use: "launch",
         with: {
           harness: options.harness,
+          mode: options.mode,
           ...(options.model ? { model: options.model } : {}),
           prompt: options.prompt,
         },
@@ -89,19 +92,21 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   program.command("init").description(`Create a commit-safe ${CONFIG_FILE} in this repository.`)
     .option("--source <name>", "source name", "linear").option("--harness <name>", "agent harness: codex, claude, pi, or opencode")
     .option("--agent <name>", "deprecated alias for --harness").option("--label <label>", "source label to route")
-    .option("--model <model>", "model passed to the selected harness").option("--prompt <template>", "launch prompt template")
+    .option("--model <model>", "model passed to the selected harness").option("--mode <mode>", "worker mode: interactive or oneshot")
+    .option("--prompt <template>", "launch prompt template")
     .option("--max-concurrent <count>", "maximum simultaneous runs", (value) => Number(value)).option("--yes", "accept inferred defaults")
     .option("--force", "replace an existing config").option("--dry-run", "print config without writing")
     .action(async (init: InitOptions) => {
       const projectRoot = await findProjectRoot(cwd()); const target = resolve(projectRoot, CONFIG_FILE);
       if (existsSync(target) && !init.force) throw new Error(`${target} already exists. Use --force to replace it.`);
       const inferredHarness = init.harness || init.agent || firstAvailableHarness();
-      const defaults = { source: init.source || "linear", harness: inferredHarness, label: init.label || "relay:implement", model: init.model, prompt: init.prompt || "Implement {{item.id}}: {{item.title}}\n\n{{item.description}}", maxConcurrent: init.maxConcurrent || 2 };
+      const defaults = { source: init.source || "linear", harness: inferredHarness, label: init.label || "relay:implement", model: init.model, mode: init.mode || "interactive" as const, prompt: init.prompt || "Implement {{item.id}}: {{item.title}}\n\n{{item.description}}", maxConcurrent: init.maxConcurrent || 2 };
       const answers = init.yes ? defaults : {
         source: await input({ message: "Source name", default: defaults.source }),
         harness: await select({ message: "Agent harness", default: defaults.harness, choices: harnessChoices() }),
         label: await input({ message: "Trigger label", default: defaults.label }),
         model: (await input({ message: "Model ID (leave empty to use the agent default)", default: defaults.model || "" })).trim() || undefined,
+        mode: await select({ message: "Worker mode", default: defaults.mode, choices: [{ name: "Interactive tmux session", value: "interactive" as const }, { name: "One-shot background command", value: "oneshot" as const }] }),
         prompt: (await input({ message: "Prompt template", default: defaults.prompt })).trim() || defaults.prompt,
         maxConcurrent: await number({ message: "Maximum concurrent runs", default: defaults.maxConcurrent, min: 1, max: 32 }),
       };
@@ -141,6 +146,8 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   trigger.command("test <id>").description("Preview matching tasks without making changes.").action(async (id) => { const context = await resolveContext(cwd, print); const selected = context.config.triggers.find((entry) => entry.id === id); if (!selected) throw new Error(`Unknown trigger '${id}'.`); if (!options.handlers?.triggerTest) noHandler("trigger test"); await options.handlers.triggerTest(context, selected); });
   program.command("once").description("Process one source poll.").option("--trigger <id>").option("--task <id>").action(async (flags) => { const context = await resolveContext(cwd, print); if (!options.handlers?.once) noHandler("once"); await options.handlers.once(context, flags); });
   program.command("watch").description("Run continuous polling in the foreground.").option("--trigger <id>").action(async (flags) => { const context = await resolveContext(cwd, print); if (!options.handlers?.watch) noHandler("watch"); await options.handlers.watch(context, flags); });
+  program.command("update [version]").description("Check for or install a Task Relay CLI update.").option("--check", "check without installing").action(async (version: string | undefined, flags: { check?: boolean }) => { if (!options.handlers?.update) noHandler("update"); print(await options.handlers.update({ check: flags.check, version: version ?? "latest" })); });
+  program.command("attach <task-or-run>").description("Attach to an interactive tmux worker.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.attach) noHandler("attach"); await options.handlers.attach(context, target); });
   program.command("cleanup <task-or-run>").description("Stop a worker and remove its isolated workspace.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.cleanup) noHandler("cleanup"); await options.handlers.cleanup(context, target); });
   const daemon = program.command("daemon").description("Control the registered background runtime.");
   for (const action of ["start", "stop", "status"] as const) daemon.command(action).action(async () => { const context = await resolveContext(cwd, print); if (!options.handlers?.daemon) noHandler(`daemon ${action}`); await options.handlers.daemon(context, action); });

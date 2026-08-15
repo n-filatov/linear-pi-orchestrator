@@ -48,6 +48,7 @@ export const agentSchema = z.object({
   provider: z.string().min(1).optional(),
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
+  interactiveArgs: z.array(z.string()).optional(),
   environment: z.record(z.string(), z.string()).default({}),
   /** Model profile ids this launcher accepts; empty means all provider-compatible profiles. */
   models: z.array(z.string().min(1)).default([]),
@@ -58,7 +59,7 @@ export const agentSchema = z.object({
   modelArgument: z.string().min(1).optional(),
   reasoningEffortArgument: z.string().min(1).optional(),
   promptDelivery: z.object({
-    mode: z.enum(["stdin", "argument", "file"]),
+    mode: z.enum(["stdin", "argument", "file", "interactive"]),
     /** Zero-based insertion index when mode is argument; omitted appends the prompt. */
     argumentIndex: z.number().int().min(0).optional(),
     /** Output path when mode is file, relative to the isolated workspace unless absolute. */

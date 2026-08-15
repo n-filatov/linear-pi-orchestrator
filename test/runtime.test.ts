@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { execa } from "execa";
 import { describe, expect, it } from "vitest";
@@ -63,6 +66,48 @@ describe("TmuxExecutionAdapter", () => {
       });
       await expect(Promise.all([adapter.wait(handle(left)), adapter.wait(handle(right))]))
         .resolves.toEqual([{ status: "succeeded" }, { status: "succeeded" }]);
+    } finally {
+      await execa("tmux", ["kill-session", "-t", session], { reject: false });
+    }
+  });
+
+  it("pastes and submits the initial prompt to a live terminal", async (context) => {
+    const session = `task-relay-interactive-${randomUUID()}`;
+    const directory = await mkdtemp(join(tmpdir(), "task-relay-interactive-"));
+    const output = join(directory, "prompt.txt");
+    const adapter = new TmuxExecutionAdapter({ session, interactivePromptDelayMs: 25 });
+    try {
+      const probe = await execa("tmux", ["has-session", "-t", session], { reject: false });
+      if (probe.stderr.includes("Operation not permitted")) return context.skip();
+      const terminalProgram = [
+        "const fs = require(\"node:fs\");",
+        "process.stdout.write(\"\\u001b[?2004h\");",
+        "process.stdin.setRawMode(true); process.stdin.resume();",
+        "let value = \"\";",
+        "process.stdin.on(\"data\", (chunk) => {",
+        "  value += chunk.toString();",
+        "  if (!/[\\r\\n]$/.test(value)) return;",
+        "  const prompt = value.replace(/\\u001b\\[200~/g, \"\").replace(/\\u001b\\[201~/g, \"\").slice(0, -1);",
+        "  fs.writeFileSync(process.argv[1], prompt); process.exit(0);",
+        "});",
+      ].join("\n");
+      const execution = await adapter.execute({
+        command: process.execPath,
+        args: ["-e", terminalProgram, output],
+        cwd: process.cwd(),
+        env: {},
+        interactiveInput: "Implement ENG-124\n\nPreserve this multiline prompt.",
+        workerName: "ENG-124",
+      });
+      const worker: WorkerHandle = { id: "interactive-worker", startedAt: "now", metadata: { tmux: execution.tmux, interactive: true } };
+
+      const completion = await adapter.wait(worker);
+      if (completion?.status === "failed") {
+        const pane = await execa("tmux", ["capture-pane", "-p", "-S", "-", "-t", execution.tmux!.target!], { reject: false });
+        throw new Error(`${completion.error}\n${pane.stdout}\n${pane.stderr}`);
+      }
+      expect(completion).toEqual({ status: "succeeded" });
+      await expect(readFile(output, "utf8")).resolves.toBe("Implement ENG-124\n\nPreserve this multiline prompt.");
     } finally {
       await execa("tmux", ["kill-session", "-t", session], { reject: false });
     }

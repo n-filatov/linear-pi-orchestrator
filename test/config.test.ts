@@ -120,10 +120,10 @@ describe("Task Relay configuration", () => {
 
   it("builds a friendly v2 init configuration for every built-in harness name", () => {
     for (const harness of ["codex", "claude", "pi", "opencode"] as const) {
-      const config = defaultConfig({ source: "linear", harness, label: "relay:implement", model: "gpt-5.6-terra", prompt: "Implement {{item.id}}", maxConcurrent: 2 }, "example", "main");
+      const config = defaultConfig({ source: "linear", harness, label: "relay:implement", model: "gpt-5.6-terra", mode: "interactive", prompt: "Implement {{item.id}}", maxConcurrent: 2 }, "example", "main");
       expect(config.version).toBe(2);
       expect(config.harnesses[harness]).toEqual({ use: harness });
-      expect(config.actions.implement).toMatchObject({ use: "launch", with: { harness, model: "gpt-5.6-terra" } });
+      expect(config.actions.implement).toMatchObject({ use: "launch", with: { harness, model: "gpt-5.6-terra", mode: "interactive" } });
       expect(config.triggers[0].actions).toEqual(["implement"]);
     }
   });

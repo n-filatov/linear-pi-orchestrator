@@ -73,6 +73,7 @@ export interface ActionContext {
 
 export interface LaunchWorkerActionRequest {
   harness: string;
+  mode?: "oneshot" | "interactive";
   model?: string;
   modelProfile?: string;
   prompt?: string;

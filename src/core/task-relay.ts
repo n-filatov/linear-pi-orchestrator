@@ -387,6 +387,7 @@ export class TaskRelay {
       id: `${trigger.id}:${actionId}`,
       actions: undefined,
       agent: { id: request.harness, model: request.model, promptTemplate: request.prompt, metadata: { modelProfile: request.modelProfile } },
+      promptDelivery: request.mode === "interactive" ? "interactive" : undefined,
       metadata: { ...trigger.metadata, ...request.workspace },
     };
     const outcome = await this.dispatchItem(source, derived, item);
@@ -401,7 +402,9 @@ export class TaskRelay {
     const run = runs[0];
     if (!run) return { status: "skipped", message: `Worker ${workerId} was not found or was already cleaned.` };
     const wasActive = isActiveRun(run.status);
-    if (wasActive && run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
+    if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) {
+      await this.dependencies.agentLauncher.stop?.(run.worker, run);
+    }
     if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
     const completedAt = this.now().toISOString();
     const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;

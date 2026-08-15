@@ -17,6 +17,9 @@ export class DirectProcessAdapter implements AgentExecutionAdapter {
   constructor(private readonly options: DirectProcessAdapterOptions = {}) {}
 
   async execute(execution: AgentExecution): Promise<AgentExecutionResult> {
+    if (execution.interactiveInput !== undefined) {
+      throw new Error("Interactive workers require the tmux execution adapter.");
+    }
     const child = execa(execution.command, [...execution.args], {
       cwd: execution.cwd,
       env: execution.env,
@@ -77,6 +80,8 @@ export type TmuxExecutionAdapterOptions = {
   shell?: string;
   environment?: Readonly<Record<string, string>>;
   stopTimeoutMs?: number;
+  /** Delay before pasting into a newly started terminal UI. Defaults to 500ms. */
+  interactivePromptDelayMs?: number;
 };
 
 /**
@@ -105,6 +110,16 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     ], { env: this.options.environment });
     const [target = "", index = "", actualWindow = window, panePid = ""] = created.stdout.trim().split("\t");
     const parsedPid = Number(panePid);
+    if (execution.interactiveInput !== undefined) {
+      try {
+        await this.prepareInteractiveWindow(target);
+        await this.deliverInteractiveInput(target, execution.interactiveInput);
+      } catch (error) {
+        await execa("tmux", ["kill-window", "-t", target], { reject: false });
+        await execa("tmux", ["set-option", "-gu", `@${exitKey}`], { reject: false });
+        throw error;
+      }
+    }
     return {
       ...(Number.isInteger(parsedPid) && parsedPid > 0 ? { pid: parsedPid } : {}),
       tmux: { session: this.options.session, window: actualWindow, index, target, exitKey },
@@ -156,6 +171,23 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     }
   }
 
+  async attach(worker: WorkerHandle): Promise<void> {
+    const tmux = recordMetadata(worker, "tmux");
+    const session = typeof tmux.session === "string" ? tmux.session : undefined;
+    const target = typeof tmux.target === "string" ? tmux.target : undefined;
+    const index = typeof tmux.index === "string" ? tmux.index : undefined;
+    const window = typeof tmux.window === "string" ? tmux.window : undefined;
+    if (!session || !target) throw new Error(`Worker ${worker.id} has no attachable tmux target.`);
+    if (!await this.windowExists(session, target)) throw new Error(`Tmux worker ${worker.id} is no longer available.`);
+
+    if (process.env.TMUX) {
+      await execa("tmux", ["switch-client", "-t", target], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+      return;
+    }
+    const attachTarget = `${session}:${index ?? window ?? ""}`.replace(/:$/, "");
+    await execa("tmux", ["attach-session", "-t", attachTarget], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+  }
+
   private async ensureSession(): Promise<void> {
     const existing = await execa("tmux", ["has-session", "-t", this.options.session], { reject: false });
     if (existing.exitCode === 0) return;
@@ -163,6 +195,36 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     if (created.exitCode !== 0) {
       const afterRace = await execa("tmux", ["has-session", "-t", this.options.session], { reject: false });
       if (afterRace.exitCode !== 0) throw new Error(`Could not create tmux session ${this.options.session}.`);
+    }
+  }
+
+  private async prepareInteractiveWindow(target: string): Promise<void> {
+    const configured = await execa("tmux", ["set-window-option", "-t", target, "remain-on-exit", "on"], { reject: false });
+    if (configured.exitCode !== 0) {
+      throw new Error(`Could not retain interactive tmux window: ${configured.stderr.trim() || `tmux exited with code ${configured.exitCode}`}`);
+    }
+  }
+
+  private async deliverInteractiveInput(target: string, input: string): Promise<void> {
+    const promptDelayMs = this.options.interactivePromptDelayMs ?? 500;
+    if (promptDelayMs > 0) await delay(promptDelayMs);
+    if (!await this.windowExists(this.options.session, target)) {
+      throw new Error("Interactive worker exited before Relay could deliver its prompt.");
+    }
+
+    const buffer = `task-relay-prompt-${randomUUID()}`;
+    const loaded = await execa("tmux", ["load-buffer", "-b", buffer, "-"], { input, reject: false });
+    if (loaded.exitCode !== 0) {
+      throw new Error(`Could not load the interactive prompt into tmux: ${loaded.stderr.trim() || `tmux exited with code ${loaded.exitCode}`}`);
+    }
+    const pasted = await execa("tmux", ["paste-buffer", "-p", "-d", "-b", buffer, "-t", target], { reject: false });
+    if (pasted.exitCode !== 0) {
+      await execa("tmux", ["delete-buffer", "-b", buffer], { reject: false });
+      throw new Error(`Could not paste the interactive prompt into worker: ${pasted.stderr.trim() || `tmux exited with code ${pasted.exitCode}`}`);
+    }
+    const submitted = await execa("tmux", ["send-keys", "-t", target, "Enter"], { reject: false });
+    if (submitted.exitCode !== 0) {
+      throw new Error(`Could not submit the interactive prompt to worker: ${submitted.stderr.trim() || `tmux exited with code ${submitted.exitCode}`}`);
     }
   }
 
