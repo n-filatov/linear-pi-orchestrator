@@ -136,7 +136,11 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
       const completion = await this.exitCompletion(tmux.session, tmux.exitKey);
       if (completion) return completion;
       if (!await this.windowExists(tmux.session, tmux.target)) {
-        return { status: "failed", error: "Tmux worker exited without recording an exit status." };
+        // Window is gone. Retry exitCompletion — the shell may have written the
+        // exit marker (tmux option or temp file) just as the window was closing.
+        await delay(50);
+        const final = await this.exitCompletion(tmux.session, tmux.exitKey);
+        return final ?? { status: "failed", error: "Tmux worker exited without recording an exit status." };
       }
       // A detached tmux launch must not keep `relay once` alive solely for
       // polling. Its persisted exit marker is reconciled by the next relay.

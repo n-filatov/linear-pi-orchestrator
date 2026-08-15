@@ -39,7 +39,7 @@ describe("TmuxExecutionAdapter", () => {
     const adapter = new TmuxExecutionAdapter({ session });
     const execution = (workerName: string): AgentExecution => ({
       command: "sh",
-      args: ["-c", "sleep 0.05"],
+      args: ["-c", "sleep 0.5"],
       cwd: process.cwd(),
       env: {},
       workerName,
