@@ -3,3 +3,6 @@ dist/
 .env
 .DS_Store
 *.log
+.task-relay.local.yaml
+.task-relay/workspaces/
+.task-relay-prompt.md

@@ -1,89 +1,132 @@
-# Linear Pi Orchestrator
+# Task Relay
 
-Pi extension that starts a dedicated tmux + `wt` worktree + Pi worker for Linear issues using the existing Linear MCP OAuth connection.
+Task Relay is a repository-scoped CLI that turns source events into isolated coding-agent workspaces. Sources and triggers decide *which* task is eligible; an agent and model profile decide *how* it runs. The execution engine owns the actual source polling, workspace provisioning, and agent launch so each run can be audited and retried independently.
 
-## Install
+This project is the migration target for the former Pi extension. It deliberately has no Pi peer dependency, extension metadata, or global Pi configuration. Existing workflows should move to a committed `.task-relay.yaml` beside the repository they automate.
 
-Global install for local development:
+## Start in a repository
+
+Install the package globally (or run it from this checkout), then initialize from the repository you want to automate:
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-ln -sf "$PWD/index.ts" ~/.pi/agent/extensions/linear-pi-orchestrator.ts
+relay init
+relay doctor
+relay watch
 ```
 
-Then restart Pi or run `/reload`.
+`init` detects the repository name, its default branch, and the availability of `codex`, `claude`, `wt`, and `tmux`. It uses a small interactive wizard; for automation use:
 
-You can also install it as a Pi package from this repo once it is pushed to GitHub.
-
-## Commands
-
-- `/linear-start CRM-123` — start one worker manually.
-- `/linear-watch start` — start a detached background watcher daemon for issues with the configured label.
-- `/linear-watch start pi:frontend` — set watched label to `pi:frontend` and start the background watcher daemon.
-- `/linear-watch foreground pi:frontend` — run the watcher in the current Pi process instead of the daemon.
-- `/linear-watch stop` — stop the foreground watcher and this repo's daemon.
-- `/linear-watch once` — run one polling tick.
-- `/linear-watch once pi:backend` — set watched label to `pi:backend` and run one tick.
-- `/linear-watch status` — show watcher state/config paths and recent logs.
-- `/linear-watch logs` — show recent watcher logs.
-- `/linear-watch-bar on|off|toggle|status|refresh` — control the footer status item (`Linear: ...`).
-- `/linear-status` — show recorded workers.
-- `/linear-cleanup` — show a picker of running workers and clean the selected tmux window + worktree.
-- `/linear-cleanup done` — clean workers whose Linear issue is done/canceled or has `pi:done`.
-- `/linear-cleanup CRM-123` — clean one worker by issue id.
-- `/linear-cleanup all` — clean all recorded workers.
-
-## Files
-
-First use creates a global defaults file plus per-repository runtime files:
-
-- global defaults: `~/.pi/linear-pi/config.json`
-- per-repo config/state/logs/pid: `~/.pi/linear-pi/repos/<repo-name>-<hash>/`
-
-## Cleanup behavior
-
-`/linear-cleanup` without arguments opens an interactive picker of recorded running workers, then kills the selected tmux window and removes its `wt` worktree after confirmation.
-
-`/linear-cleanup done` checks recorded workers for the current repository, fetches each issue through Linear MCP, and removes the worker when the Linear issue has `pi:done`, `statusType: completed`, `statusType: canceled`, `status: Done`, or `status: Canceled`.
-
-For every cleaned worker it kills the tmux window, runs `wt remove <branch> --force -D --foreground -y --no-hooks`, removes the trigger/running labels from Linear so the watcher does not immediately recreate it, and removes the worker from local state. When cleaning a done/canceled issue, it also ensures the `pi:done` label is present.
-
-## Default behavior
-
-The watcher searches Linear MCP server `linear` for issues labeled with the current repository's `triggerLabel` (default `pi:implement`) and, by default, assigned to the authenticated Linear user (`assignee: "me"`). All `/linear-watch`, `/linear-start`, `/linear-cleanup`, `/linear-status`, and footer status commands resolve the current Pi session's git repository root and use that repository's scoped config/state/log/pid files. This lets one window show/control only the frontend daemon and another window show/control only the backend daemon. The watcher skips issues already labeled `pi:running`, `pi:done`, or `pi:blocked`, and issues whose Linear status is done/canceled.
-
-Security guard: workers only start for issues with the trigger label and, unless disabled, assigned to `watchAssignee` (`me` by default). This applies to both `/linear-watch` and manual `/linear-start`. The current Linear MCP tools do not expose who added a label, so the extension cannot verify the label actor; assignment-to-you is the enforceable guard.
-
-You can change the watched label from Pi:
-
-```text
-/linear-watch start pi:frontend
-/linear-watch once pi:backend
+```bash
+relay init --yes --source linear --agent codex --label relay:implement \
+  --model your-model-id --max-concurrent 2
 ```
 
-`/linear-watch start` runs as a detached daemon for the current repository by default, so it survives `/clear` and lets the current Pi session continue running other commands. `/linear-watch status` prints that repo's daemon pid, watched label, repo root, required assignee, poll interval, worker count, config/state paths, log path, and recent in-memory logs when available. The footer status item is enabled per repo by default and can be controlled with `/linear-watch-bar on|off|toggle|status|refresh`; it shows compact current-repo daemon/worker state such as `Linear: 🟢 frontend daemon 12345 · 2 workers`.
+It refuses to overwrite `.task-relay.yaml` unless `--force` is supplied. `--dry-run` prints the generated commit-safe YAML without writing it. Generated configuration contains no credentials. If you need a machine-specific override, use the optional `.task-relay.local.yaml` and keep it untracked; prefer inherited environment variables or connector-managed authentication over storing secrets in Relay YAML.
 
-For each issue it:
+## Example: Linear routes for Codex and Claude
 
-1. creates branch `feat/<issue-id-and-title-slug>` with `wt switch --create ... --base origin/main`,
-2. creates/uses tmux session `linear-pi`,
-3. opens a new tmux window,
-4. starts `pi --name <ISSUE-ID> <generated prompt>` from the worktree,
-5. comments back on the Linear issue.
+```yaml
+version: 1
+project:
+  name: payments-api
 
-## Useful env overrides
+sources:
+  linear:
+    type: linear
+    pollIntervalMs: 30000
+    mcp:
+      transport: stdio
+      command: npx
+      args: [-y, mcp-remote, https://mcp.linear.app/mcp]
+    reporting:
+      runningLabel: relay:running
+      blockedLabel: relay:blocked
+      doneLabel: relay:done
+      inProgressState: In Progress
 
-- `LINEAR_PI_MCP_SERVER=linear`
-- `LINEAR_PI_TRIGGER_LABEL=pi:implement`
-- `LINEAR_PI_TMUX_SESSION=linear-pi`
-- `LINEAR_PI_REPO_ROOT=/Users/nikita.filatov/Development/frontend` (initial/default value; commands update this to the active Pi session's git root)
-- `LINEAR_PI_BASE_BRANCH=origin/main`
-- `LINEAR_PI_BRANCH_PREFIX=feat`
-- `LINEAR_PI_NODE_BIN_DIR=/Users/nikita.filatov/.local/share/nvm/v23.11.1/bin`
-- `LINEAR_PI_POLL_INTERVAL_MS=30000`
-- `LINEAR_PI_REQUIRE_ASSIGNEE_ME=true`
-- `LINEAR_PI_WATCH_ASSIGNEE=me`
+agents:
+  codex:
+    command: codex
+    args: [exec]
+    defaultModelProfile: codex-default
+    modelArgument: --model
+    promptDelivery: { mode: argument }
+  claude:
+    command: claude
+    args: [-p]
+    defaultModelProfile: claude-balanced
+    modelArgument: --model
+    reasoningEffortArgument: --effort
+    promptDelivery: { mode: argument }
 
-## Notes
+modelProfiles:
+  codex-default:
+    provider: openai
+    # model omitted: use the default configured in Codex
+  claude-balanced:
+    provider: anthropic
+    model: sonnet
 
-This uses Linear through MCP, not a Linear personal API key. If auth expires, authenticate the existing `linear` MCP server in Pi, then retry.
+triggers:
+  - id: linear-implementation
+    source: linear
+    label: relay:implement
+    assignee: me
+    match: { excludeLabels: [relay:running, relay:done, relay:blocked] }
+    agent: codex
+    model: codex-default
+  - id: linear-review
+    source: linear
+    label: relay:review
+    assignee: me
+    match: { excludeLabels: [relay:running, relay:done, relay:blocked] }
+    agent: claude
+    model: claude-balanced
+
+workspace:
+  directory: .task-relay/workspaces
+  baseBranch: main
+  branchPrefix: relay
+execution:
+  maxConcurrent: 2
+  retries: 2
+  adapter: tmux
+  tmuxSession: task-relay
+logging:
+  level: info
+  pretty: true
+```
+
+The CLI validates all trigger references: every source, agent, and model profile named by a trigger must exist. Configuration errors name the exact YAML path.
+
+## Commands and observability
+
+```bash
+relay doctor                    # config + local executable checks
+relay status                    # repository state summary
+relay runs                      # persisted run table
+relay logs                      # table rendered from JSONL events
+relay logs --level error
+relay logs --task ENG-123 --follow
+relay logs --run '<run-id>' --json
+relay trigger test linear-review
+relay once --trigger linear-implementation
+relay watch --trigger linear-implementation
+relay cleanup ENG-123
+relay daemon start|stop|status
+```
+
+Every event is structured JSONL under `${XDG_STATE_HOME:-~/.local/state}/task-relay/<repo>-<hash>/events.jsonl`, with fields such as `project`, `trigger`, `source`, `task`, `agent`, `model`, `runId`, `event`, `error`, and `duration`. Human tables are rendered directly from those JSON records, never from colored terminal text. Persistent run state is stored beside the log, keyed by repository, source, work item, and trigger, with an atomic write lock to coordinate concurrent CLI processes.
+
+`trigger test` performs source discovery without claiming work. `once` performs one complete dispatch tick, `watch` keeps polling in the foreground, and `daemon` manages a repository-scoped background watcher.
+
+## Development
+
+```bash
+npm install
+npm run check
+npm test
+npm start -- doctor
+```
+
+The public CLI composition seam is `createRelayProgram({ handlers })` in `src/cli/program.ts`. Runtime code injects handlers for one-shot dispatch, continuous watch, daemon control, and trigger tests, while configuration, state, logging, and table rendering remain reusable infrastructure.
