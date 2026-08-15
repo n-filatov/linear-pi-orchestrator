@@ -140,7 +140,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const executor = context.config.execution.adapter === "tmux"
     ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${repository.id}` })
     : new DirectProcessAdapter();
-  const launcher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor });
+  const launcher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName });
   const workspace = context.config.workspace.adapter === "git-worktree"
     ? new GitWorktreeProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) })
     : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) });

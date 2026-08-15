@@ -115,6 +115,8 @@ export type CommandAgentLauncherOptions = {
   cliDefaults?: AgentCliDefaults;
   environment?: Readonly<Record<string, string | undefined>>;
   promptFileName?: string;
+  /** Handlebars template for the tmux window name. Available: {{item.id}}, {{item.title}}, {{slug}}, etc. */
+  windowNameTemplate?: string;
 };
 
 /** Launches configured command agents without ever constructing a shell command. */
@@ -232,7 +234,10 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       env: environment,
       stdin: delivery.mode === "stdin" ? request.prompt : undefined,
       interactiveInput: delivery.mode === "interactive" ? request.prompt : undefined,
-      workerName: itemKey(request.workItem),
+      workerName: renderTemplate(
+        this.options.windowNameTemplate ?? "{{item.id}} {{item.title}}",
+        templateValues({ workItem: request.workItem, workspace: request.workspace }),
+      ),
     });
 
     return {

@@ -170,6 +170,28 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   const daemon = program.command("daemon").description("Control the registered background runtime.");
   for (const action of ["start", "stop", "status"] as const) daemon.command(action).action(async () => { const context = await resolveContext(cwd, print); if (!options.handlers?.daemon) noHandler(`daemon ${action}`); await options.handlers.daemon(context, action); });
 
+  program.command("dashboard").description("Open a local web dashboard for workers and configuration.")
+    .option("--port <port>", "port to listen on", "3001")
+    .option("--no-open", "do not open the browser automatically")
+    .action(async (flags: { port?: string; open?: boolean }) => {
+      const { DashboardServer } = await import("../dashboard/server.js");
+      const context = await resolveContext(cwd, print);
+      const server = new DashboardServer(context, options.handlers ?? {});
+      const port = flags.port ? Number(flags.port) : 3001;
+      const url = await server.start(port);
+      print(`Dashboard running at ${url}  (Ctrl-C to stop)`);
+      if (flags.open !== false) {
+        const open = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+        const { execa } = await import("execa");
+        await execa(open, [url], { reject: false });
+      }
+      await new Promise<void>((resolve) => {
+        process.once("SIGINT", resolve);
+        process.once("SIGTERM", resolve);
+      });
+      await server.stop();
+    });
+
   program.configureOutput({ writeOut: (text) => output.write(text), writeErr: (text) => error.write(text) });
   return program;
 }
