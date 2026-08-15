@@ -4,6 +4,23 @@ Task Relay is a repository-scoped automation engine for coding agents. It is not
 
 The built-ins provide Linear, coding-agent launch, worker cleanup, and the common harnesses (`codex`, `claude`, `pi`, and `opencode`). Other source providers and actions can be added as explicit trusted packages or local modules. Custom CLI harnesses are supported through the built-in `command` harness definition; externally loaded `HarnessPlugin` execution is a future extension seam.
 
+## Install
+
+On macOS (Apple Silicon or Intel) and Linux x64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | sh
+```
+
+The installer verifies the release checksum and installs `relay` to `~/.local/bin`, so it does not need `sudo`. If that directory is not already on your `PATH`, the installer prints the exact command to add it.
+
+To install a specific release or choose another destination:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | RELAY_VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | INSTALL_DIR="$HOME/bin" sh
+```
+
 ## Start in a repository
 
 ```bash

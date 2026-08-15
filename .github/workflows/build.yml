@@ -20,6 +20,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npm test
 
   # ── Build native binaries ───────────────────────────────────────────────────
   build:
@@ -91,6 +92,10 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum task-relay-* > checksums.txt
+
       - name: Resolve release metadata
         id: meta
         run: |
@@ -110,25 +115,16 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          files: dist/task-relay-*
+          files: |
+            dist/task-relay-*
+            dist/checksums.txt
           generate_release_notes: ${{ steps.meta.outputs.prerelease == 'false' }}
           body: |
             ## Install
 
-            **macOS (Apple Silicon)**
+            macOS and Linux:
             ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-macos-arm64 -o relay
-            chmod +x relay && sudo mv relay /usr/local/bin/
+            curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/main/install.sh | RELAY_VERSION=${{ steps.meta.outputs.tag }} sh
             ```
 
-            **macOS (Intel)**
-            ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-macos-x64 -o relay
-            chmod +x relay && sudo mv relay /usr/local/bin/
-            ```
-
-            **Linux (x64)**
-            ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-linux-x64 -o relay
-            chmod +x relay && sudo mv relay /usr/local/bin/
-            ```
+            The installer detects the platform, verifies the SHA-256 checksum, and installs `relay` under `~/.local/bin` by default.
