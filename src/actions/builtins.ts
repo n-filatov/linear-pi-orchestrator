@@ -1,4 +1,5 @@
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { execa } from "execa";
 import Handlebars from "handlebars";
 import { z } from "zod";
@@ -11,8 +12,12 @@ const launchConfigSchema = z.object({
   model: z.string().min(1).optional(),
   modelProfile: z.string().min(1).optional(),
   prompt: z.string().min(1).optional(),
+  promptFile: z.string().min(1).optional(),
   workspace: z.record(z.string(), z.unknown()).optional(),
-}).strict();
+}).strict().refine(
+  (data) => !(data.prompt && data.promptFile),
+  { message: "Specify either 'prompt' or 'promptFile', not both." },
+);
 
 const cleanupConfigSchema = z.object({
   activeWorker: z.enum(["stop", "skip"]).default("stop"),
@@ -34,7 +39,23 @@ export function builtInActionPlugins(): readonly ActionPlugin[] {
     kind: "action",
     use: "launch",
     configSchema: launchConfigSchema,
-    execute: (context, config) => context.workers.launch(config),
+    execute: async (context, config) => {
+      let prompt = config.prompt;
+      if (config.promptFile) {
+        const filePath = path.isAbsolute(config.promptFile)
+          ? config.promptFile
+          : path.resolve(context.repository.root, config.promptFile);
+        prompt = await readFile(filePath, "utf8");
+      }
+      return context.workers.launch({
+        harness: config.harness,
+        mode: config.mode,
+        model: config.model,
+        modelProfile: config.modelProfile,
+        prompt,
+        workspace: config.workspace,
+      });
+    },
   };
   const cleanup: ActionPlugin<CleanupActionConfig> = {
     kind: "action",

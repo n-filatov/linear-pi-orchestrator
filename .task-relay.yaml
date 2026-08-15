@@ -1,0 +1,88 @@
+# Task Relay configuration. Safe to commit: do not put credentials here.
+# Personal machine-only changes belong in .task-relay.local.yaml; keep it untracked and never store secrets in Relay YAML.
+version: 2
+project:
+  name: linear-pi-orchestrator
+sources:
+  linear:
+    use: linear
+    with:
+      mcp:
+        transport: stdio
+        command: npx
+        args:
+          - -y
+          - mcp-remote
+          - https://mcp.linear.app/mcp
+        environment: {}
+      reporting:
+        runningLabel: relay:running
+        blockedLabel: relay:blocked
+        doneLabel: relay:done
+        inProgressState: In Progress
+        commentOnLaunch: true
+        commentOnFailure: true
+    enabled: true
+    pollIntervalMs: 30000
+harnesses:
+  codex:
+    use: codex
+actions:
+  implement:
+    use: launch
+    with:
+      harness: codex
+      mode: interactive
+      promptFile: .task-relay/prompts/implement.md
+    enabled: true
+  cleanup-completed-worker:
+    use: cleanup
+    with:
+      activeWorker: stop
+    enabled: true
+triggers:
+  - id: linear-relay-implement
+    source: linear
+    enabled: true
+    match:
+      labels:
+        all:
+          - relay-implement
+        none:
+          - relay:running
+          - relay:done
+          - relay:blocked
+      assignee: me
+    actions:
+      - implement
+    fire:
+      policy: every-poll
+    maxConcurrent: 10
+  - id: linear-cleanup-terminal
+    source: linear
+    enabled: true
+    match:
+      statusTypes:
+        - completed
+        - canceled
+    actions:
+      - cleanup-completed-worker
+    targets:
+      workers:
+        sourceItem: current
+        runs: all
+    fire:
+      policy: once-per-item
+workspace:
+  adapter: wt
+  directory: .task-relay/workspaces
+  baseBranch: main
+  branchPrefix: relay
+execution:
+  maxConcurrent: 10
+  retries: 2
+  adapter: tmux
+  tmuxSession: task-relay-linear-pi-orchestrator
+logging:
+  level: info
+  pretty: true

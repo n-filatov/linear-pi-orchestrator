@@ -1,3 +1,6 @@
+import { writeFile, mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { builtInActionPlugins } from "../src/actions/builtins.js";
@@ -318,6 +321,50 @@ describe("generic action execution", () => {
 
     expect(result.actionsFailed).toBe(1);
     expect(afterFailure).toBe(0);
+  });
+
+  it("launch action reads promptFile relative to the repository root and passes its content as prompt template", async () => {
+    const store = new MemoryRunStore();
+    const ledger = new MemoryActionLedger();
+    const item: WorkItem = { sourceId: "linear", id: "ENG-999", title: "Prompt file" };
+    const tmpDir = await mkdir(path.join(os.tmpdir(), `relay-test-${Date.now()}`), { recursive: true }).then(() => path.join(os.tmpdir(), `relay-test-${Date.now() - 1}`));
+    const promptsDir = path.join(os.tmpdir(), `relay-prompts-${Date.now()}`);
+    await mkdir(promptsDir, { recursive: true });
+    const promptPath = path.join(promptsDir, "implement.md");
+    await writeFile(promptPath, "Implement {{key}}: {{title}}\n\n{{description}}", "utf8");
+    const launchedPrompts: string[] = [];
+    const agent: AgentLauncher = {
+      async resolve(profile) { return { agentId: profile?.id ?? "codex" }; },
+      async launch(spec) { launchedPrompts.push(spec.trigger.agent?.promptTemplate ?? ""); return { id: "w", startedAt: "now" }; },
+    };
+    const repoRoot = os.tmpdir();
+    const relPath = path.relative(repoRoot, promptPath);
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    const activeRelay = new TaskRelay({
+      triggers: { list: async () => [{ ...baseTrigger([{ id: "impl", use: "launch", config: { harness: "codex", promptFile: relPath } }]), repository: { id: "r", root: repoRoot } }] },
+      sources: [source([item])],
+      runStore: store,
+      workspaceProvider: { provision: async () => ({ path: "/workspace" }) },
+      agentLauncher: agent,
+      actionPlugins: registry,
+      actionExecutions: ledger,
+      logger,
+      now: () => new Date("2026-08-15T12:00:00.000Z"),
+    });
+
+    const result = await activeRelay.tick();
+
+    expect(result.runsLaunched).toBe(1);
+    expect(launchedPrompts).toEqual(["Implement {{key}}: {{title}}\n\n{{description}}"]);
+    void tmpDir;
+  });
+
+  it("launch action rejects config with both prompt and promptFile", () => {
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    expect(() => registry.parseActionConfig("launch", { harness: "codex", prompt: "inline", promptFile: "prompts/impl.md" }))
+      .toThrow("Specify either 'prompt' or 'promptFile', not both.");
   });
 
   it("launch action passes harness, model, and custom prompt to the worker launch", async () => {
