@@ -59,7 +59,7 @@ export interface TriggerDefinition {
   model?: string;
   modelProfile?: string;
   reasoningEffort?: string;
-  promptDelivery?: "stdin" | "argument" | "file";
+  promptDelivery?: "stdin" | "argument" | "file" | "interactive";
   metadata?: Record<string, unknown>;
   /** Ordered, source-neutral actions executed when this trigger matches. */
   actions?: readonly TriggerActionDefinition[];

@@ -1,7 +1,7 @@
 import type { AgentLaunchSpec, AgentProfile, TriggerDefinition, WorkItem, WorkerCompletion, WorkerHandle, Workspace } from "../domain/index.js";
 
 /** The supported ways an agent can receive the rendered task prompt. */
-export type PromptDeliveryMode = "stdin" | "argument" | "file";
+export type PromptDeliveryMode = "stdin" | "argument" | "file" | "interactive";
 
 export type AgentModelProfile = {
   /** Stable configuration key, such as `fast` or `deep`. */
@@ -24,6 +24,8 @@ export type CommandAgentProfile = AgentProfile & {
   id: string;
   command: string;
   args?: readonly string[];
+  /** Args used when starting a long-lived interactive terminal session. */
+  interactiveArgs?: readonly string[];
   environment?: Readonly<Record<string, string>>;
   models?: readonly AgentModelProfile[];
   defaultModel?: string;
@@ -95,6 +97,8 @@ export type AgentExecution = {
   cwd: string;
   env: Readonly<Record<string, string | undefined>>;
   stdin?: string;
+  /** Initial text pasted into a live terminal and submitted after launch. */
+  interactiveInput?: string;
   workerName: string;
 };
 
@@ -108,6 +112,7 @@ export interface AgentExecutionAdapter {
   wait?(worker: WorkerHandle): Promise<WorkerCompletion | undefined>;
   reconcile?(worker: WorkerHandle): Promise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle): Promise<void>;
+  attach?(worker: WorkerHandle): Promise<void>;
 }
 
 export type TemplateValues = {

@@ -58,6 +58,33 @@ describe("agent resolution", () => {
     }]);
   });
 
+  it("starts the interactive Claude CLI without print mode and delivers the prompt to its terminal", async () => {
+    const launches: Array<{ command: string; args: readonly string[]; interactiveInput?: string }> = [];
+    const launcher = new CommandAgentLauncher({
+      executor: {
+        async execute(execution) {
+          launches.push(execution);
+          return { pid: 43, tmux: { session: "relay", window: "ENG-124", target: "@1" } };
+        },
+      },
+    });
+
+    const result = await launcher.launchConfigured({
+      workItem: { sourceId: "linear", id: "ENG-124", title: "Implement feature" },
+      workspace: { path: "/repo/.task-relay/workspaces/ENG-124" },
+      prompt: "Implement ENG-124\n\nPreserve this multiline prompt.",
+      overrides: { agent: "claude", model: "opus", promptDelivery: "interactive" },
+    });
+
+    expect(launches).toEqual([expect.objectContaining({
+      command: "claude",
+      args: ["--model", "opus"],
+      stdin: undefined,
+      interactiveInput: "Implement ENG-124\n\nPreserve this multiline prompt.",
+    })]);
+    expect(result.worker.metadata).toMatchObject({ interactive: true, persistent: true });
+  });
+
   it("applies explicit run overrides before trigger and profile defaults", () => {
     const trigger = { id: "ready", sourceId: "queue", repository: { id: "repo", root: "/repo" }, enabled: true, agent: { id: "codex", model: "fast" } } satisfies TriggerDefinition;
     const resolved = resolveAgentLaunch({ profiles: [profile], trigger, overrides: { modelProfile: "deep", reasoningEffort: "xhigh" } });

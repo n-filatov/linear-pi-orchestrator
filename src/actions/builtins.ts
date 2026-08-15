@@ -7,6 +7,7 @@ import type { ActionPlugin } from "../plugins/index.js";
 
 const launchConfigSchema = z.object({
   harness: z.string().min(1),
+  mode: z.enum(["oneshot", "interactive"]).default("oneshot"),
   model: z.string().min(1).optional(),
   modelProfile: z.string().min(1).optional(),
   prompt: z.string().min(1).optional(),

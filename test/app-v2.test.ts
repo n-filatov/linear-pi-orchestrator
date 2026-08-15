@@ -127,5 +127,16 @@ describe("v2 app/config integration", () => {
       triggers: [{ id: "duplicate", source: "queue", actions: ["notify", "notify"] }],
     }));
     await expect(run(duplicateRoot, "trigger", "test", "duplicate")).rejects.toThrow(/action id 'notify' more than once/);
+
+    const processRoot = await mkdtemp(join(tmpdir(), "task-relay-interactive-process-"));
+    await writeFile(join(processRoot, ".task-relay.yaml"), stringify({
+      version: 2,
+      sources: { queue: { use: "command", with: { discover: { command: process.execPath } } } },
+      harnesses: { claude: { use: "claude" } },
+      actions: { implement: { use: "launch", with: { harness: "claude", mode: "interactive" } } },
+      triggers: [{ id: "interactive", source: "queue", actions: ["implement"] }],
+      execution: { adapter: "process" },
+    }));
+    await expect(run(processRoot, "trigger", "test", "interactive")).rejects.toThrow(/interactive mode.*requires execution\.adapter: tmux/);
   });
 });

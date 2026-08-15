@@ -173,6 +173,11 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
     await this.options.executor.stop(worker);
   }
 
+  async attach(worker: WorkerHandle): Promise<void> {
+    if (!this.options.executor.attach) throw new Error("The configured execution adapter does not provide attachable workers.");
+    await this.options.executor.attach(worker);
+  }
+
   async wait(worker: WorkerHandle, _run: RunRecord): Promise<WorkerCompletion | undefined> {
     return this.options.executor.wait?.(worker);
   }
@@ -201,7 +206,10 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       prompt: request.prompt,
       promptFile,
     });
-    const args = [...renderTemplates(resolved.agent.args, values), ...renderTemplates(resolved.modelProfile?.args, values)];
+    const profileArgs = delivery.mode === "interactive"
+      ? resolved.agent.interactiveArgs ?? resolved.agent.args
+      : resolved.agent.args;
+    const args = [...renderTemplates(profileArgs, values), ...renderTemplates(resolved.modelProfile?.args, values)];
     if (resolved.reasoningEffort && resolved.agent.reasoningEffortArgument) args.unshift(renderTemplate(resolved.agent.reasoningEffortArgument, values), resolved.reasoningEffort);
     if (resolved.modelId && resolved.agent.modelArgument) args.unshift(renderTemplate(resolved.agent.modelArgument, values), resolved.modelId);
     if (delivery.mode === "argument") {
@@ -223,6 +231,7 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       cwd: workspacePath,
       env: environment,
       stdin: delivery.mode === "stdin" ? request.prompt : undefined,
+      interactiveInput: delivery.mode === "interactive" ? request.prompt : undefined,
       workerName: itemKey(request.workItem),
     });
 
@@ -276,6 +285,7 @@ export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
       id: "codex",
       command: "codex",
       args: ["exec"],
+      interactiveArgs: [],
       modelArgument: "--model",
       promptDelivery: "argument",
     },
@@ -283,6 +293,7 @@ export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
       id: "claude",
       command: "claude",
       args: ["-p"],
+      interactiveArgs: [],
       modelArgument: "--model",
       reasoningEffortArgument: "--effort",
       promptDelivery: "argument",
@@ -290,6 +301,7 @@ export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
     {
       id: "pi",
       command: "pi",
+      interactiveArgs: [],
       modelArgument: "--model",
       promptDelivery: "argument",
     },
@@ -297,6 +309,7 @@ export function builtInAgentProfiles(): readonly CommandAgentProfile[] {
       id: "opencode",
       command: "opencode",
       args: ["run"],
+      interactiveArgs: [],
       modelArgument: "--model",
       promptDelivery: "argument",
     },
@@ -341,6 +354,7 @@ function workerHandle(
       pid: execution.pid,
       tmux: execution.tmux,
       persistent: execution.tmux !== undefined,
+      interactive: resolved.promptDelivery === "interactive",
     },
   };
 }

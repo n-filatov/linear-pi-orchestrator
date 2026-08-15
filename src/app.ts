@@ -14,6 +14,7 @@ import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
 import { RepositoryDaemon } from "./daemon.js";
+import { checkRelayUpdate, updateRelay } from "./updater.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
@@ -27,6 +28,19 @@ type RuntimeComposition = {
 
 export function createRuntimeHandlers(): RelayCommandHandlers {
   return {
+    update: async (options) => {
+      const result = options.check
+        ? await checkRelayUpdate({ version: options.version })
+        : await updateRelay({ version: options.version });
+      if (options.check) {
+        return result.updateAvailable
+          ? `Task Relay ${result.version} is available. Run 'relay update${result.version === "latest" ? "" : ` ${result.version}`}'.`
+          : `Task Relay is up to date with ${result.version}.`;
+      }
+      return result.updateAvailable
+        ? `Task Relay update was not installed.`
+        : `Task Relay is now up to date with ${result.version}. Restart any running relay daemon or watch process.`;
+    },
     once: async (context, options) => {
       const runtime = await composeRuntime(context, options);
       try { writeTickSummary(context, await runtime.relay.tick()); }
@@ -67,6 +81,17 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       const daemon = new RepositoryDaemon(context.projectRoot);
       context.write(action === "start" ? await daemon.start() : action === "stop" ? await daemon.stop() : await daemon.status());
     },
+    attach: async (context, target) => {
+      const candidates = (await context.store.listRuns())
+        .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
+        .filter((run) => asRecord(run.worker?.metadata?.tmux).target)
+        .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+      if (candidates.length === 0) throw new Error(`No attachable tmux worker found for '${target}'.`);
+      const active = candidates.find((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
+      const run = active ?? candidates[0];
+      const executor = new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${context.config.project.name || path.basename(context.projectRoot)}` });
+      await executor.attach(run.worker!);
+    },
     cleanup: async (context, target) => {
       const candidates = (await context.store.listRuns()).filter((run) => run.id === target || run.worker?.id === target || run.item.id.toLowerCase() === target.toLowerCase());
       if (candidates.length === 0) throw new Error(`No run or worker found for '${target}'.`);
@@ -77,7 +102,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       const wasActive = ["claimed", "provisioning", "launching", "running"].includes(run.status);
       const runtime = await composeRuntime(context);
       try {
-        if (wasActive && run.worker) await runtime.launcher.stop(run.worker);
+        if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) await runtime.launcher.stop(run.worker);
         if (run.workspace) await runtime.workspace.cleanup(run.workspace, run);
         const stopped = wasActive ? await runtime.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt: new Date().toISOString() }) : undefined;
         const cleaned = await runtime.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, new Date().toISOString());
@@ -175,9 +200,13 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
       resolved = { id: reference.id ?? `${index + 1}-${reference.use}`, use: reference.use, config: reference.with, continueOnError: reference.continueOnError };
     }
     if (resolved.use === "launch") {
-      const harness = stringValue(asRecord(resolved.config).harness);
+      const launchConfig = asRecord(resolved.config);
+      const harness = stringValue(launchConfig.harness);
       if (!harness) throw new Error(`Launch action '${resolved.id}' requires 'with.harness'.`);
       if (!config.harnesses[harness]) throw new Error(`Launch action '${resolved.id}' references unknown harness '${harness}'.`);
+      if (launchConfig.mode === "interactive" && config.execution.adapter !== "tmux") {
+        throw new Error(`Launch action '${resolved.id}' uses interactive mode, which requires execution.adapter: tmux.`);
+      }
     }
     return resolved;
   });
@@ -202,6 +231,7 @@ export function agentProfiles(config: RelayConfigV2 | LegacyRelayConfig): Comman
     id,
     command: agent.command,
     args: agent.args,
+    interactiveArgs: agent.interactiveArgs,
     environment: agent.environment,
     models: Object.entries(config.modelProfiles)
       .filter(([profileId, profile]) => (agent.models.length === 0 || agent.models.includes(profileId)) && (!agent.provider || profile.provider === agent.provider))
