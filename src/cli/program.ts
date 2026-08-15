@@ -34,6 +34,7 @@ function harnessChoices(): { name: string; value: typeof BUILT_IN_HARNESSES[numb
 function harnessAvailabilityRows(): [string, string][] { return BUILT_IN_HARNESSES.map((harness) => [harness, executable(harness) ? "available" : "not found"]); }
 export function defaultConfig(options: Required<Pick<InitOptions, "source" | "harness" | "label" | "maxConcurrent" | "mode" | "prompt">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfigV2 {
   const actionId = "implement";
+  const cleanupActionId = "cleanup-completed-worker";
   return relayConfigV2Schema.parse({
     version: 2,
     project: { name: projectName },
@@ -59,15 +60,32 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
           prompt: options.prompt,
         },
       },
+      [cleanupActionId]: {
+        use: "cleanup",
+        with: { activeWorker: "stop" },
+      },
     },
-    triggers: [{
-      id: `${options.source}-${options.label.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "") || "tasks"}`,
-      source: options.source,
-      match: { labels: { all: [options.label], none: ["relay:running", "relay:done", "relay:blocked"] }, assignee: "me" },
-      actions: [actionId],
-      fire: { policy: "once-per-match" },
-      maxConcurrent: options.maxConcurrent,
-    }],
+    triggers: [
+      {
+        id: `${options.source}-${options.label.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "") || "tasks"}`,
+        source: options.source,
+        match: { labels: { all: [options.label], none: ["relay:running", "relay:done", "relay:blocked"] }, assignee: "me" },
+        actions: [actionId],
+        // A terminal issue can later be reopened. The running/terminal labels
+        // make this safe to evaluate on every poll, while the active-run guard
+        // prevents duplicate workers during Linear's update propagation.
+        fire: { policy: "every-poll" },
+        maxConcurrent: options.maxConcurrent,
+      },
+      {
+        id: `${options.source}-cleanup-terminal`,
+        source: options.source,
+        match: { statusTypes: ["completed", "canceled"] },
+        targets: { workers: { sourceItem: "current", runs: "all" } },
+        actions: [cleanupActionId],
+        fire: { policy: "once-per-item" },
+      },
+    ],
     workspace: { adapter: "wt", directory: ".task-relay/workspaces", baseBranch: branch, branchPrefix: "relay" },
     execution: { maxConcurrent: options.maxConcurrent, retries: 2, adapter: "tmux", tmuxSession: `task-relay-${projectName.replace(/[^a-zA-Z0-9_.-]+/g, "-")}` },
     logging: { level: "info", pretty: true },

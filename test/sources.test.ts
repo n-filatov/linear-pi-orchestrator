@@ -24,6 +24,7 @@ describe("Linear source identity and lifecycle reporting", () => {
               id: "uuid-123",
               identifier: "ENG-123",
               title: "Eligible",
+              updatedAt: "2026-08-15T12:00:00.000Z",
               labels: ["relay:implement", "team:platform"],
               status: { name: "In Progress", type: "started" },
             },
@@ -58,7 +59,7 @@ describe("Linear source identity and lifecycle reporting", () => {
     const items = await source.discover({ trigger });
 
     expect(items.map((item) => item.id)).toEqual(["ENG-123"]);
-    expect(items[0]?.metadata).toMatchObject({ linearStatus: "In Progress", linearStatusType: "started" });
+    expect(items[0]?.metadata).toMatchObject({ linearStatus: "In Progress", linearStatusType: "started", linearUpdatedAt: "2026-08-15T12:00:00.000Z" });
     expect(calls[0]).toEqual({
       name: "list_issues",
       args: { label: "relay:implement", state: "In Progress", limit: 50, includeArchived: false, orderBy: "updatedAt" },

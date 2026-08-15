@@ -33,6 +33,14 @@ curl -fsSL https://raw.githubusercontent.com/n-filatov/linear-pi-orchestrator/ma
 
 ## Start in a repository
 
+For local development, run this checkout without replacing the installed `relay` CLI:
+
+```sh
+npm run dev:cli -- status
+# or, after `npm link` from this repository:
+relay-dev status
+```
+
 ```bash
 relay init
 relay doctor

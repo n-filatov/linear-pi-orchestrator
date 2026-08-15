@@ -320,6 +320,10 @@ function toWorkItem(sourceId: string, issue: LinearIssue): WorkItem {
       linearAssignee: issue.assignee,
       linearStatus: issueStatus.name,
       linearStatusType: issueStatus.type,
+      // `on-change` trigger policies need Linear's server-side revision so a
+      // reopened issue receives a new action generation even when its visible
+      // fields return to their previous values.
+      linearUpdatedAt: readOptionalString(issue.updatedAt),
     },
   };
 }
