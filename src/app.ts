@@ -364,9 +364,10 @@ function stringRecord(value: unknown): Record<string, string> { return Object.fr
 function eventName(message: string): string { return message.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, ""); }
 async function writeTickSummary(context: RelayCommandContext, result: TickResult): Promise<void> {
   const activeRuns = await context.store.listActive({ id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot });
-  const suppressedSkips = result.items.filter((outcome) => outcome.status === "skipped" && outcome.reason?.endsWith("No matching workers."));
+  const isNoise = (outcome: TickResult["items"][number]) => outcome.status === "skipped" && (outcome.reason?.endsWith("No matching workers.") || outcome.reason === "Ticket is terminal.");
+  const suppressedSkips = result.items.filter(isNoise);
   const rows: TickTableRow[] = result.items
-    .filter((outcome) => !(outcome.status === "skipped" && outcome.reason?.endsWith("No matching workers.")))
+    .filter((outcome) => !isNoise(outcome))
     .map((outcome) => ({
       ticket: outcome.item.id,
       title: outcome.item.title,
