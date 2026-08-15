@@ -31,40 +31,31 @@ jobs:
         include:
           - os: ubuntu-latest
             bun-target: bun-linux-x64
-            artifact: linear-pi-linux-x64
+            artifact: task-relay-linux-x64
 
           - os: macos-latest
             bun-target: bun-darwin-arm64
-            artifact: linear-pi-macos-arm64
+            artifact: task-relay-macos-arm64
 
           - os: macos-latest
             bun-target: bun-darwin-x64
-            artifact: linear-pi-macos-x64
+            artifact: task-relay-macos-x64
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Install dependencies
-        # --frozen-lockfile fails if bun.lock is out of sync with package.json,
-        # catching lockfile drift (e.g. a dep added to package.json but not the
-        # lockfile) before it can break a later install path.
-        run: bun install --frozen-lockfile
-
-      - name: Write version info
-        run: |
-          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            RELEASE_TAG="${GITHUB_REF_NAME}"
-          else
-            RELEASE_TAG="latest"
-          fi
-          printf 'export const BUILD_DATE = "%s";\nexport const RELEASE_TAG = "%s";\n' \
-            "$BUILD_DATE" "$RELEASE_TAG" > src/core/version.ts
+        run: npm ci
 
       - name: Compile binary
         run: |
@@ -72,7 +63,7 @@ jobs:
             --compile \
             --target=${{ matrix.bun-target }} \
             --outfile=${{ matrix.artifact }} \
-            src/cli.ts
+            src/cli/main.ts
 
       - name: Smoke test
         if: matrix.bun-target == 'bun-linux-x64' || matrix.bun-target == 'bun-darwin-arm64'
@@ -119,25 +110,25 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          files: dist/linear-pi-*
+          files: dist/task-relay-*
           generate_release_notes: ${{ steps.meta.outputs.prerelease == 'false' }}
           body: |
             ## Install
 
             **macOS (Apple Silicon)**
             ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-macos-arm64 -o linear-pi
-            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-macos-arm64 -o relay
+            chmod +x relay && sudo mv relay /usr/local/bin/
             ```
 
             **macOS (Intel)**
             ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-macos-x64 -o linear-pi
-            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-macos-x64 -o relay
+            chmod +x relay && sudo mv relay /usr/local/bin/
             ```
 
             **Linux (x64)**
             ```bash
-            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/linear-pi-linux-x64 -o linear-pi
-            chmod +x linear-pi && sudo mv linear-pi /usr/local/bin/
+            curl -L https://github.com/n-filatov/linear-pi-orchestrator/releases/download/${{ steps.meta.outputs.tag }}/task-relay-linux-x64 -o relay
+            chmod +x relay && sudo mv relay /usr/local/bin/
             ```

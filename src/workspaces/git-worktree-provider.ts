@@ -1,0 +1,75 @@
+import path from "node:path";
+import { lstat } from "node:fs/promises";
+import { execa } from "execa";
+import type { RunRecord, Workspace } from "../domain/index.js";
+import type { WorktreeProvider, WorkspaceProviderOptions } from "./types.js";
+import { branchForRun, cleanupOwnership, localBranchExists, resolveBaseBranch, workspace } from "./worktree-utils.js";
+
+export type GitWorktreeProviderOptions = WorkspaceProviderOptions;
+
+/** Native Git alternative for installations that do not use the `wt` helper. */
+export class GitWorktreeProvider implements WorktreeProvider {
+  constructor(private readonly options: GitWorktreeProviderOptions = {}) {}
+
+  async provision(run: RunRecord, signal?: AbortSignal): Promise<Workspace> {
+    const repository = run.identity.repository.root;
+    const branch = branchForRun(run, this.options.branchTemplate);
+    const existing = await this.findPath(repository, branch, signal);
+    const worktreeRoot = this.worktreeRoot(repository);
+    if (existing) return workspace(run, existing, branch, "git-worktree", { createdWorkspace: false, createdBranch: false, worktreeRoot });
+
+    const destination = path.join(worktreeRoot, safeSegment(branch));
+    const exists = await localBranchExists(repository, branch);
+    const args = exists
+      ? ["worktree", "add", destination, branch]
+      : ["worktree", "add", "-b", branch, destination, await resolveBaseBranch(repository, triggerBase(run) ?? this.options.baseBranch)];
+    await execa("git", args, { cwd: repository, cancelSignal: signal });
+    return workspace(run, destination, branch, "git-worktree", { createdWorkspace: true, createdBranch: !exists, worktreeRoot });
+  }
+
+  async cleanup(space: Workspace, run: RunRecord): Promise<void> {
+    const repository = run.identity.repository.root;
+    const ownership = cleanupOwnership(space, run, "git-worktree", this.worktreeRoot(repository));
+    if (!ownership.createdWorkspace) return;
+    const removed = await execa("git", ["worktree", "remove", "--force", space.path], { cwd: repository, reject: false });
+    if (removed.exitCode !== 0 && await pathExists(space.path)) {
+      throw new Error(`Could not remove worktree ${space.path}: ${removed.stderr.trim() || `git exited with code ${removed.exitCode}`}`);
+    }
+    if (await pathExists(space.path)) throw new Error(`Git reported success, but worktree still exists at ${space.path}.`);
+    if (!ownership.createdBranch || !space.branch) return;
+    if (await localBranchExists(repository, space.branch)) await execa("git", ["branch", "-D", space.branch], { cwd: repository });
+  }
+
+  private worktreeRoot(repository: string): string {
+    return path.resolve(this.options.worktreeRoot ?? path.join(repository, ".task-relay", "workspaces"));
+  }
+
+  private async findPath(repository: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
+    const listed = await execa("git", ["worktree", "list", "--porcelain"], { cwd: repository, cancelSignal: signal });
+    const lines = listed.stdout.split("\n");
+    let currentPath: string | undefined;
+    for (const line of lines) {
+      if (line.startsWith("worktree ")) currentPath = line.slice("worktree ".length);
+      if (line === `branch refs/heads/${branch}`) return currentPath;
+    }
+    return undefined;
+  }
+}
+
+async function pathExists(value: string): Promise<boolean> {
+  try { await lstat(value); return true; }
+  catch (error) {
+    const code = error !== null && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function safeSegment(branch: string): string {
+  return branch.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 100) || "worktree";
+}
+
+function triggerBase(run: RunRecord): string | undefined {
+  const value = run.trigger.metadata?.baseBranch;
+  return typeof value === "string" ? value : undefined;
+}

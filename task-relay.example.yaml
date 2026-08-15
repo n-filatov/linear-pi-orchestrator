@@ -1,0 +1,78 @@
+# Copy to .task-relay.yaml in the repository you want Task Relay to automate.
+# This file is safe to commit: source authentication is intentionally external.
+version: 1
+project:
+  name: example-service
+
+sources:
+  linear:
+    type: linear
+    pollIntervalMs: 30000
+    mcp:
+      transport: stdio
+      command: npx
+      args: [-y, mcp-remote, https://mcp.linear.app/mcp]
+    reporting:
+      runningLabel: relay:running
+      blockedLabel: relay:blocked
+      doneLabel: relay:done
+      inProgressState: In Progress
+      commentOnLaunch: true
+      commentOnFailure: true
+
+agents:
+  codex:
+    provider: openai
+    command: codex
+    args: [exec]
+    models: [codex-default]
+    defaultModelProfile: codex-default
+    modelArgument: --model
+    promptDelivery: { mode: argument }
+  claude:
+    provider: anthropic
+    command: claude
+    args: [-p]
+    models: [claude-balanced]
+    defaultModelProfile: claude-balanced
+    modelArgument: --model
+    reasoningEffortArgument: --effort
+    promptDelivery: { mode: argument }
+
+modelProfiles:
+  codex-default:
+    provider: openai
+    # model omitted: use the default configured in Codex
+  claude-balanced:
+    provider: anthropic
+    model: sonnet
+    reasoningEffort: medium
+
+triggers:
+  - id: linear-implementation
+    source: linear
+    label: relay:implement
+    assignee: me
+    match: { excludeLabels: [relay:running, relay:done, relay:blocked] }
+    agent: codex
+    model: codex-default
+  - id: linear-review
+    source: linear
+    label: relay:review
+    assignee: me
+    match: { excludeLabels: [relay:running, relay:done, relay:blocked] }
+    agent: claude
+    model: claude-balanced
+
+workspace:
+  directory: .task-relay/workspaces
+  baseBranch: main
+  branchPrefix: relay
+execution:
+  maxConcurrent: 2
+  retries: 2
+  adapter: tmux
+  tmuxSession: task-relay
+logging:
+  level: info
+  pretty: true

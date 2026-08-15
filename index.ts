@@ -1,3 +1,15 @@
-// Backward-compat entry for existing Pi symlinks.
-// New entry point: src/extension.ts
-export { default } from "./src/extension.ts";
+export * from "./src/domain/index.js";
+export * from "./src/core/index.js";
+export * from "./src/sources/index.js";
+export * from "./src/agents/index.js";
+export * from "./src/actions/index.js";
+export * from "./src/plugins/index.js";
+export * from "./src/runtime/index.js";
+export * from "./src/workspaces/index.js";
+export * from "./src/config/schema.js";
+export * from "./src/config/load.js";
+export * from "./src/logging/events.js";
+export * from "./src/state/store.js";
+export * from "./src/cli/program.js";
+export * from "./src/app.js";
+export * from "./src/daemon.js";
