@@ -87,7 +87,7 @@ describe("TmuxExecutionAdapter", () => {
         "process.stdin.on(\"data\", (chunk) => {",
         "  value += chunk.toString();",
         "  if (!/[\\r\\n]$/.test(value)) return;",
-        "  const prompt = value.replace(/\\u001b\\[200~/g, \"\").replace(/\\u001b\\[201~/g, \"\").slice(0, -1);",
+        "  const prompt = value.replace(/\\u001b\\[200~/g, \"\").replace(/\\u001b\\[201~/g, \"\").slice(0, -1).replace(/\\r/g, \"\\n\");",
         "  fs.writeFileSync(process.argv[1], prompt); process.exit(0);",
         "});",
       ].join("\n");
