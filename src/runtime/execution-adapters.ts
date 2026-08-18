@@ -85,6 +85,8 @@ export type TmuxExecutionAdapterOptions = {
   stopTimeoutMs?: number;
   /** Delay before pasting into a newly started terminal UI. Defaults to 500ms. */
   interactivePromptDelayMs?: number;
+  /** Delay between pasting the prompt and submitting it with Enter. Defaults to 150ms. */
+  interactiveSubmitDelayMs?: number;
 };
 
 /**
@@ -229,6 +231,10 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
       await execa("tmux", ["delete-buffer", "-b", buffer], { reject: false });
       throw new Error(`Could not paste the interactive prompt into worker: ${pasted.stderr.trim() || `tmux exited with code ${pasted.exitCode}`}`);
     }
+    // The TUI needs a moment to commit the bracketed paste into its input state
+    // before it will treat a following Enter as "submit" rather than dropping it.
+    const submitDelayMs = this.options.interactiveSubmitDelayMs ?? 150;
+    if (submitDelayMs > 0) await delay(submitDelayMs);
     const submitted = await execa("tmux", ["send-keys", "-t", target, "Enter"], { reject: false });
     if (submitted.exitCode !== 0) {
       throw new Error(`Could not submit the interactive prompt to worker: ${submitted.stderr.trim() || `tmux exited with code ${submitted.exitCode}`}`);
