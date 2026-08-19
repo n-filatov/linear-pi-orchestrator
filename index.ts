@@ -1,15 +1,3 @@
-export * from "./src/domain/index.js";
-export * from "./src/core/index.js";
-export * from "./src/sources/index.js";
-export * from "./src/agents/index.js";
-export * from "./src/actions/index.js";
-export * from "./src/plugins/index.js";
-export * from "./src/runtime/index.js";
-export * from "./src/workspaces/index.js";
-export * from "./src/config/schema.js";
-export * from "./src/config/load.js";
-export * from "./src/logging/events.js";
-export * from "./src/state/store.js";
-export * from "./src/cli/program.js";
-export * from "./src/app.js";
-export * from "./src/daemon.js";
+// Compatibility entry point. The published barrel now lives at src/index.ts so
+// that the build can emit dist/index.js and dist/plugin.js side by side.
+export * from "./src/index.js";

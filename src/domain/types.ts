@@ -111,6 +111,78 @@ export interface WorkerHandle {
   metadata?: Record<string, unknown>;
 }
 
+/** Where a worker-scoped command opens: beside the agent, or in its own window. */
+export type WorkerOpenTarget = "pane" | "window";
+
+export interface WorkerChildSpec {
+  command: string;
+  args?: readonly string[];
+  /** Defaults to the worker's workspace directory. */
+  cwd?: string;
+  env?: Readonly<Record<string, string>>;
+  /** Window name, or pane title when the runtime supports one. */
+  name?: string;
+  open: WorkerOpenTarget;
+  /** Split direction for a pane. Ignored when opening a window. */
+  direction?: "horizontal" | "vertical";
+}
+
+/**
+ * A process Relay started beside an existing worker. Children are persisted on
+ * the worker handle so that stop and cleanup can account for every window and
+ * pane Relay opened, not only the one the agent runs in.
+ */
+export interface WorkerChildHandle {
+  id: string;
+  kind: WorkerOpenTarget;
+  /** Runtime-specific address, such as a tmux pane or window id. */
+  target: string;
+  name?: string;
+  command: string;
+  startedAt: string;
+}
+
+export interface WorkerInputSpec {
+  text: string;
+  /** Submit the text after pasting it. Defaults to true. */
+  submit?: boolean;
+  /** Address a child opened by `open` instead of the worker's own pane. */
+  child?: string;
+}
+
+export interface WorkerRuntimeCapabilities {
+  /** Can open additional panes or windows beside a running worker. */
+  children: boolean;
+  /** Can deliver text into a live worker session. */
+  input: boolean;
+  /** Can read back a worker's visible output. */
+  capture: boolean;
+}
+
+/**
+ * Control over an already-running worker. This is deliberately separate from
+ * launching one: an action may need to open a dev server beside an agent, send
+ * it a new instruction, or read what it printed, long after it started.
+ */
+export interface WorkerRuntime {
+  readonly capabilities: WorkerRuntimeCapabilities;
+  open(worker: WorkerHandle, spec: WorkerChildSpec): Promise<WorkerChildHandle>;
+  sendInput(worker: WorkerHandle, spec: WorkerInputSpec): Promise<void>;
+  capture(worker: WorkerHandle, options?: { child?: string; lines?: number }): Promise<string>;
+  exists(worker: WorkerHandle, child?: string): Promise<boolean>;
+  closeChild(worker: WorkerHandle, child: WorkerChildHandle): Promise<void>;
+}
+
+/** Children Relay opened beside a worker, read from its persisted metadata. */
+export function workerChildren(worker: WorkerHandle | undefined): readonly WorkerChildHandle[] {
+  const value = worker?.metadata?.children;
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is WorkerChildHandle =>
+    entry !== null && typeof entry === "object"
+    && typeof (entry as WorkerChildHandle).id === "string"
+    && typeof (entry as WorkerChildHandle).target === "string");
+}
+
 /** The terminal result observed for a worker after it has been launched. */
 export interface WorkerCompletion {
   status: "succeeded" | "failed";
@@ -194,6 +266,12 @@ export interface RunStore {
   finishActive(identity: RunIdentity, claimedAt: string, transition: RunTerminalTransition): Promise<RunRecord | undefined>;
   /** Atomically records workspace removal without changing the run's terminal result. */
   markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined>;
+  /**
+   * Atomically appends a child Relay opened beside a worker. This must not be a
+   * read-modify-write of the whole record: a worker can reach a terminal status
+   * while a pane is being opened for it, and that result must survive.
+   */
+  recordWorkerChild?(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined>;
   update(run: RunRecord): Promise<void>;
   listActive?(repository: RepositoryScope): Promise<readonly RunRecord[]>;
   /** Find workers created for a source item, regardless of the trigger that launched them. */
@@ -226,6 +304,8 @@ export interface AgentLaunchSpec {
 export interface AgentLauncher {
   resolve(profile: AgentProfile | undefined, item: WorkItem, trigger: TriggerDefinition): Promise<AgentResolution>;
   launch(spec: AgentLaunchSpec): Promise<WorkerHandle>;
+  /** Control over already-running workers. Undefined when the adapter cannot provide it. */
+  readonly runtime?: WorkerRuntime;
   /** Wait for a locally launched worker. Undefined means this launcher cannot observe exits. */
   wait?(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined>;
   /** Check a persisted worker after a relay process has restarted. */

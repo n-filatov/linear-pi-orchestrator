@@ -74,7 +74,9 @@ describe("GitWorktreeProvider cleanup ownership", () => {
     const space = await provider.provision(run());
 
     expect(space.metadata?.taskRelay).toEqual({ createdWorkspace: false, createdBranch: false, worktreeRoot: workspaceRoot });
-    await expect(provider.cleanup(space, run())).rejects.toThrow(/adopted workspace/);
+    // Cleaning an adopted workspace succeeds without touching it, so a second
+    // worker on the same item cannot break the item's cleanup pipeline.
+    await expect(provider.cleanup(space, run())).resolves.toBeUndefined();
     expect(mockExeca).toHaveBeenCalledTimes(1);
   });
 
@@ -159,8 +161,19 @@ describe("WtWorkspaceProvider cleanup ownership", () => {
     const provider = new WtWorkspaceProvider({ worktreeRoot: workspaceRoot });
     const space = await provider.provision(run());
 
-    await expect(provider.cleanup(space, run())).rejects.toThrow(/adopted workspace/);
+    await expect(provider.cleanup(space, run())).resolves.toBeUndefined();
     expect(mockExeca).toHaveBeenCalledTimes(1);
+  });
+
+  it("still refuses a workspace record written by another provider", async () => {
+    const provider = new WtWorkspaceProvider({ worktreeRoot: workspaceRoot });
+    const foreign: Workspace = {
+      path: `${workspaceRoot}/relay-ENG-123`,
+      branch,
+      metadata: { repository, provider: "git-worktree", taskRelay: { createdWorkspace: false, createdBranch: false, worktreeRoot: workspaceRoot } },
+    };
+
+    await expect(provider.cleanup(foreign, run())).rejects.toThrow(/not created by this Task Relay provider/);
   });
 
   it("refuses a wt result outside the configured Relay workspace root", async () => {

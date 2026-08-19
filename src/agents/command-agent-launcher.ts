@@ -10,8 +10,10 @@ import type {
   WorkItem,
   WorkerCompletion,
   WorkerHandle,
+  WorkerRuntime,
   Workspace,
 } from "../domain/index.js";
+import { workerChildren } from "../domain/index.js";
 import { renderEnvironment, renderTemplate, renderTemplates, templateValues } from "./templates.js";
 import type {
   AgentCliDefaults,
@@ -170,8 +172,20 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
     return detailed.worker;
   }
 
+  /** Control over already-running workers, when the execution adapter provides it. */
+  get runtime(): WorkerRuntime | undefined { return this.options.executor.runtime; }
+
   async stop(worker: WorkerHandle): Promise<void> {
     if (!this.options.executor.stop) throw new Error("The configured execution adapter cannot stop workers.");
+    // Panes inside the worker's own window die with it, but a child opened as
+    // its own window does not. Close every recorded child before the worker so
+    // nothing Relay started is left behind.
+    const runtime = this.options.executor.runtime;
+    if (runtime) {
+      for (const child of workerChildren(worker)) {
+        await runtime.closeChild(worker, child).catch(() => undefined);
+      }
+    }
     await this.options.executor.stop(worker);
   }
 

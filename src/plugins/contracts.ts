@@ -3,8 +3,10 @@ import type {
   RepositoryScope,
   SourceEvent,
   WorkItem,
+  WorkerChildSpec,
   WorkerCompletion,
   WorkerHandle,
+  WorkerInputSpec,
   RunRecord,
   Workspace,
 } from "../domain/index.js";
@@ -51,6 +53,40 @@ export interface WorkerTargetSelector {
   workerIds?: readonly string[];
 }
 
+/**
+ * How an action names the worker it wants to act on.
+ *
+ * `{ action }` is the common case inside a pipeline: it addresses the worker a
+ * named earlier action created, read from that action's output. The other two
+ * forms address workers that already exist, whether or not this pipeline made
+ * them.
+ */
+export type WorkerRef =
+  | { action: string }
+  | { workerId: string }
+  | { sourceItem: "current"; runs?: "latest" | "active" | "all" };
+
+export interface ResolvedWorker {
+  worker: WorkerHandle;
+  run: RunRecord;
+}
+
+/** Verbs an action may use against workers. Launch creates; the rest address one that exists. */
+export interface WorkerActions {
+  launch(request: LaunchWorkerActionRequest): Promise<ActionResult>;
+  cleanup(workerId: string): Promise<ActionResult>;
+  /** Workers matching a reference, newest first. Empty when none match. */
+  resolve(ref: WorkerRef): Promise<readonly ResolvedWorker[]>;
+  /** Open a pane or window beside a running worker, in its workspace. */
+  exec(ref: WorkerRef, spec: WorkerChildSpec): Promise<ActionResult>;
+  /** Deliver text into a running worker's live session. */
+  send(ref: WorkerRef, spec: WorkerInputSpec): Promise<ActionResult>;
+  /** Read back what a worker has printed. */
+  capture(ref: WorkerRef, options?: { child?: string; lines?: number }): Promise<ActionResult>;
+  /** Stop a worker and its children without removing its workspace. */
+  stop(ref: WorkerRef): Promise<ActionResult>;
+}
+
 export interface ActionContext {
   executionId: string;
   actionId: string;
@@ -64,10 +100,7 @@ export interface ActionContext {
   /** Present for actions which execute once per selected worker. */
   worker?: WorkerHandle;
   run?: RunRecord;
-  workers: {
-    launch(request: LaunchWorkerActionRequest): Promise<ActionResult>;
-    cleanup(workerId: string): Promise<ActionResult>;
-  };
+  workers: WorkerActions;
   signal?: AbortSignal;
 }
 

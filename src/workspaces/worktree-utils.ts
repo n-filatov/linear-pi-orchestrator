@@ -71,6 +71,11 @@ export function isWithinWorkspaceRoot(worktreePath: string, worktreeRoot: string
   return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
+/** True when Relay created neither the worktree nor the branch behind this record. */
+export function isAdoptedWorkspace(ownership: RelayWorkspaceOwnership): boolean {
+  return !ownership.createdWorkspace && !ownership.createdBranch;
+}
+
 /**
  * Validates persisted provenance before issuing a destructive command. Records from
  * older Relay versions deliberately fail this check and are treated as adopted.
@@ -91,9 +96,10 @@ export function cleanupOwnership(
   if (path.resolve(ownership.worktreeRoot) !== configuredRoot) {
     throw new Error("Refusing to remove a workspace whose recorded Relay root differs from the configured workspace root.");
   }
-  if (!ownership.createdWorkspace && !ownership.createdBranch) {
-    throw new Error("Refusing to remove an adopted workspace or branch.");
-  }
+  // Relay created nothing here: this run adopted a workspace an earlier run or a
+  // person already made. Leaving it alone is the correct outcome, and the caller
+  // reports success — an item with several workers must still clean all of them.
+  if (isAdoptedWorkspace(ownership)) return ownership;
   if (!isWithinWorkspaceRoot(space.path, configuredRoot)) {
     throw new Error(`Refusing to remove workspace outside the configured Relay workspace root: ${space.path}`);
   }

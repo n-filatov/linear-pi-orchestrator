@@ -4,6 +4,26 @@
   "private": true,
   "description": "Repository-scoped task relay CLI for routing source work items to isolated coding-agent workspaces.",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "relay": "./bin/relay.js",
     "relay-dev": "./bin/relay-dev.js",
@@ -11,6 +31,8 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-declarations.mjs",
+    "prepare": "npm run build",
     "test": "vitest run",
     "start": "tsx src/cli/main.ts",
     "dev:cli": "node bin/relay-dev.js"
@@ -21,6 +43,7 @@
     "vitest": "^3.1.2"
   },
   "dependencies": {
+    "@notwhale/relay-implement-linear": "file:../relay-implement-linear",
     "@inquirer/prompts": "^7.5.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "cli-table3": "^0.6.5",

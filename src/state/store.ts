@@ -3,7 +3,7 @@ import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import writeFileAtomic from "write-file-atomic";
 import { stateDirectory } from "../logging/events.js";
-import { createRunKey, isActiveRun, type RepositoryScope, type RunClaim, type RunIdentity, type RunRecord, type RunStore, type RunTerminalTransition } from "../domain/types.js";
+import { createRunKey, isActiveRun, workerChildren, type RepositoryScope, type RunClaim, type RunIdentity, type RunRecord, type RunStore, type RunTerminalTransition, type WorkerChildHandle } from "../domain/types.js";
 
 /** JSON-safe data passed between configurable actions. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -248,6 +248,19 @@ export class RepositoryStateStore implements RunStore {
       if (!run || run.claimedAt !== claimedAt) return undefined;
       run.workspaceCleanedAt = cleanedAt;
       run.updatedAt = cleanedAt;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return run;
+    } finally { await release(); }
+  }
+  async recordWorkerChild(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const run = state.runs[taskStateKey(identity)];
+      if (!run || run.claimedAt !== claimedAt || !run.worker) return undefined;
+      run.worker = { ...run.worker, metadata: { ...run.worker.metadata, children: [...workerChildren(run.worker), child] } };
+      run.updatedAt = recordedAt;
       await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
       return run;
     } finally { await release(); }

@@ -6,10 +6,10 @@ import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js
 import type { RelayActionReference, RelayConfigV2, RelayTriggerV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkSource } from "./domain/index.js";
+import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, type AgentModelProfile, type CommandAgentProfile } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
-import { RelayPluginRegistry, loadRelayPlugin, type SourcePlugin } from "./plugins/index.js";
+import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, loadRelayPlugin, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
@@ -154,6 +154,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
     agentLauncher: launcher,
     actionPlugins: plugins,
     actionExecutions: context.store,
+    validateLaunch: (request, where) => validateLaunchRequest(context.config, request, `Action '${where.actionId}' in trigger '${where.triggerId}'`),
     logger: relayLogger(context.logger, repository.id),
   });
   return { relay, sources, triggers, launcher, workspace, runStore: eventStore, plugins };
@@ -200,24 +201,38 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
       if (!reference.enabled) throw new Error(`Inline action '${reference.id ?? reference.use}' is disabled.`);
       resolved = { id: reference.id ?? `${index + 1}-${reference.use}`, use: reference.use, config: reference.with, continueOnError: reference.continueOnError };
     }
+    // Built-in launch config is known statically, so its errors surface at
+    // config-load time. Every other action goes through the same rules at
+    // dispatch time via validateLaunchRequest below.
     if (resolved.use === "launch") {
       const launchConfig = asRecord(resolved.config);
-      const harness = stringValue(launchConfig.harness);
-      if (!harness) throw new Error(`Launch action '${resolved.id}' requires 'with.harness'.`);
-      if (!config.harnesses[harness]) throw new Error(`Launch action '${resolved.id}' references unknown harness '${harness}'.`);
-      if (launchConfig.mode === "interactive" && config.execution.adapter !== "tmux") {
-        throw new Error(`Launch action '${resolved.id}' uses interactive mode, which requires execution.adapter: tmux.`);
-      }
+      validateLaunchRequest(config, { harness: stringValue(launchConfig.harness) ?? "", mode: launchConfig.mode as LaunchWorkerActionRequest["mode"] }, `Launch action '${resolved.id}'`);
     }
     return resolved;
   });
 }
 
+/**
+ * The rules that make a worker launch possible, applied to the request rather
+ * than to the name of the plugin that issued it. An external action that wraps
+ * `workers.launch` gets exactly the same errors as the built-in `launch`.
+ */
+export function validateLaunchRequest(config: RelayConfigV2, request: Pick<LaunchWorkerActionRequest, "harness" | "mode">, subject: string): void {
+  if (!request.harness) throw new Error(`${subject} requires 'with.harness'.`);
+  if (!config.harnesses[request.harness]) {
+    const known = Object.keys(config.harnesses);
+    throw new Error(`${subject} references unknown harness '${request.harness}'.${known.length ? ` Configured harnesses: ${known.join(", ")}.` : " No harnesses are configured."}`);
+  }
+  if (request.mode === "interactive" && config.execution.adapter !== "tmux") {
+    throw new Error(`${subject} uses interactive mode, which requires execution.adapter: tmux.`);
+  }
+}
+
 export function harnessProfiles(config: RelayConfigV2): CommandAgentProfile[] {
   return Object.entries(config.harnesses).map(([id, definition]) => {
     const overrides = asRecord(definition.with);
-    if (["codex", "claude", "pi", "opencode"].includes(definition.use)) {
-      const base = builtInHarnessProfile(definition.use as "codex" | "claude" | "pi" | "opencode");
+    if ((BUILT_IN_HARNESS_PROFILES as readonly string[]).includes(definition.use)) {
+      const base = builtInHarnessProfile(definition.use as typeof BUILT_IN_HARNESS_PROFILES[number]);
       return { ...base, ...overrides, id } as CommandAgentProfile;
     }
     if (definition.use === "command") return { ...overrides, id } as CommandAgentProfile;
@@ -250,7 +265,7 @@ async function pluginRegistry(config: RelayConfigV2, projectRoot: string): Promi
   const registry = new RelayPluginRegistry();
   for (const plugin of builtInActionPlugins()) registry.register(plugin);
   const externalUses = new Set<string>();
-  for (const source of Object.values(config.sources)) if (source.use !== "linear" && source.use !== "command") externalUses.add(source.use);
+  for (const source of Object.values(config.sources)) if (!BUILT_IN_SOURCES.has(source.use)) externalUses.add(source.use);
   for (const action of Object.values(config.actions)) if (!registry.action(action.use)) externalUses.add(action.use);
   for (const trigger of config.triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
   for (const use of externalUses) registry.registerAs(use, await loadRelayPlugin(use, projectRoot));
@@ -349,6 +364,7 @@ class EventingRunStore implements RunStore {
   async claim(claim: RunClaim): Promise<RunRecord | undefined> { const run = await this.store.claim(claim); if (run) this.write(run, "task.claimed"); return run; }
   async finishActive(identity: RunIdentity, claimedAt: string, transition: RunTerminalTransition): Promise<RunRecord | undefined> { const run = await this.store.finishActive(identity, claimedAt, transition); if (run) this.write(run, `run.${run.status}`); return run; }
   async markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined> { const run = await this.store.markWorkspaceCleaned(identity, claimedAt, cleanedAt); if (run) this.write(run, "run.workspace.cleaned"); return run; }
+  async recordWorkerChild(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined> { const run = await this.store.recordWorkerChild?.(identity, claimedAt, child, recordedAt); if (run) this.write(run, "run.worker.child.opened"); return run; }
   async update(run: RunRecord): Promise<void> { await this.store.update(run); this.write(run, `run.${run.status}`); }
   private write(run: RunRecord, event: string): void {
     const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, title: run.item.title, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };

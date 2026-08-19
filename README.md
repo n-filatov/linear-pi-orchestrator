@@ -170,6 +170,119 @@ logging:
 
 The Linear plugin owns `labels`, `statuses`, and other Linear fields. A GitHub or internal-queue plugin may define completely different match fields.
 
+## A different model for each kind of task
+
+`model` belongs to the action, not to Relay, so routing two kinds of work to two
+different models is ordinary configuration. Give each kind its own action and its
+own label-matched trigger:
+
+```yaml
+harnesses:
+  claude: { use: claude }
+  codex: { use: codex }
+
+actions:
+  decompose:
+    use: launch
+    with:
+      harness: claude
+      model: claude-opus-5      # the expensive model, for planning work
+      mode: interactive
+      prompt: |
+        Break {{item.id}} into implementable Linear issues.
+        Label each new issue `relay-implement`.
+
+  implement:
+    use: launch
+    with:
+      harness: claude
+      model: claude-sonnet-5    # the cheaper model, for mechanical work
+      mode: interactive
+      prompt: "Implement {{item.id}}: {{item.title}}"
+
+triggers:
+  - id: decompose-epic
+    source: linear
+    match: { labels: { all: [relay-decompose] } }
+    actions: [decompose]
+  - id: implement-issue
+    source: linear
+    match: { labels: { all: [relay-implement] } }
+    actions: [implement]
+```
+
+The decomposition worker writes new issues into Linear with the `relay-implement`
+label, and the next poll picks them up. Chaining work across tickets goes through
+the source rather than through Relay, so it survives a restart and stays visible
+in Linear.
+
+## Acting on a worker that is already running
+
+`launch` creates a worker. These actions address one that exists, in the same
+pipeline or from an earlier one. Both require `execution.adapter: tmux`.
+
+| Action | Effect |
+| --- | --- |
+| `worker-exec` | Opens a pane in the worker's window, or a separate window, running a command in the worker's workspace. |
+| `worker-send` | Pastes text into the worker's live session and submits it. |
+
+`worker` names the target: `{ action: <id> }` addresses the worker a named earlier
+action created, `{ workerId: <id> }` is explicit, and
+`{ sourceItem: current, runs: latest }` (the default) addresses the newest worker
+for the item that matched.
+
+```yaml
+actions:
+  implement:
+    use: launch
+    with: { harness: codex, mode: interactive, prompt: "Implement {{item.id}}" }
+
+  dev-server:
+    use: worker-exec
+    with:
+      worker: { action: implement }
+      open: pane                 # or `window`
+      name: dev
+      command: npm
+      args: [run, dev]
+
+  review:
+    use: launch
+    with:
+      harness: claude
+      model: claude-opus-5
+      mode: interactive
+      workspace: { fromAction: implement }   # same branch and worktree
+      prompt: "Review {{branch}} for {{item.id}}."
+
+  ask:
+    use: worker-send
+    with:
+      worker: { sourceItem: current, runs: latest }
+      text: "New guidance on {{item.id}}: {{item.title}}"
+
+triggers:
+  - id: implement-issue
+    source: linear
+    match: { labels: { all: [relay-implement] } }
+    actions: [implement, dev-server, review]
+
+  - id: ask-the-worker
+    source: linear
+    match: { labels: { all: [relay:ask] } }
+    actions: [ask]
+    fire: { policy: on-change }
+```
+
+Actions run in the order they are listed. An action that finds no matching worker
+is skipped, not failed, so a pipeline does not break when a worker has already
+finished. Panes and windows Relay opens are recorded on the worker, so `relay
+cleanup` and the `cleanup` action close them too.
+
+`workspace.fromAction` pins a launch to the branch of an earlier action's worker.
+Without it two launches for the same item only share a worktree when their branch
+templates happen to render the same name.
+
 `mode: interactive` starts the harness's terminal UI (`claude`, `codex`, `pi`, or `opencode`) in a detached tmux window, pastes the rendered prompt into that live session, and submits it. It requires `execution.adapter: tmux`; use `relay attach <task-or-run>` to enter the session. `mode: oneshot` retains the non-interactive behavior (`claude -p`, `codex exec`, and equivalent commands) and exits when the command finishes.
 
 The cleanup trigger does not need a worker ID in YAML. `targets.workers.sourceItem: current` resolves workers associated with the current source item; `runs` can be `latest`, `active`, or `all`. Cleanup only removes Relay-owned workspaces/branches and is idempotent once a worker has `workspaceCleanedAt`.
@@ -203,6 +316,19 @@ triggers:
 ```
 
 Only explicitly configured modules are loaded. Treat plugin modules as trusted code and keep secrets out of YAML.
+
+Plugin packages import the extension contracts from `task-relay/plugin`:
+
+```ts
+import type { ActionContext, ActionPlugin, ActionResult } from "task-relay/plugin";
+```
+
+That entry point exports only the plugin contracts and the domain types they use.
+It never pulls in Relay's CLI, dashboard, daemon, or state store, so a plugin's
+`tsc` does not have to resolve Relay's own runtime dependencies. Everything it
+exports is covered by Relay's semantic versioning: a breaking change to those
+types requires a major release. Do not import from `task-relay` itself or from
+`task-relay/src/...`.
 
 For a custom local coding CLI today, use the built-in `command` harness with its executable configuration. Relay's external `HarnessPlugin` contract is reserved for a future runtime adapter.
 

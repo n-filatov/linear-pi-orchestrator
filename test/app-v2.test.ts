@@ -88,6 +88,81 @@ describe("v2 app/config integration", () => {
     expect(await new RepositoryStateStore(projectRoot).listActionExecutions()).toHaveLength(1);
   });
 
+  it("composes a worker pipeline and reports a missing worker as skipped, not failed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-worker-app-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-worker-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    const sourceProgram = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'TASK-9',title:'Add a dev server'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "worker-app-test" },
+      sources: { queue: { use: "command", with: { discover: { command: process.execPath, args: ["-e", sourceProgram] } } } },
+      harnesses: { codex: { use: "codex" } },
+      actions: {
+        "dev-server": {
+          use: "worker-exec",
+          with: { worker: { action: "implement" }, open: "pane", name: "dev", command: "npm", args: ["run", "dev"] },
+        },
+        ask: { use: "worker-send", with: { text: "New guidance on {{item.id}}: {{item.title}}" } },
+        review: {
+          use: "launch",
+          with: { harness: "codex", mode: "interactive", workspace: { fromAction: "implement" }, prompt: "Review {{item.id}}" },
+        },
+      },
+      triggers: [{ id: "ask-worker", source: "queue", actions: ["ask"], fire: { policy: "every-poll" } }],
+      execution: { adapter: "tmux", tmuxSession: "task-relay-worker-app-test" },
+      logging: { level: "silent", pretty: false },
+    }));
+
+    const preview = await run(root, "trigger", "test", "ask-worker");
+    expect(preview.errors).toBe("");
+    expect(preview.output).toContain("Actions: ask (worker-send)");
+    expect(preview.output).toContain("TASK-9  Add a dev server");
+
+    // No worker exists for the item, so the action is a clean skip. Nothing
+    // reaches tmux, and the pipeline does not fail.
+    const tick = await run(root, "once", "--trigger", "ask-worker");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("0 action failures");
+    expect(tick.output).toContain("No matching worker is running.");
+  });
+
+  it("applies launch rules to an external action that wraps workers.launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-external-launch-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-external-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    // A plugin Relay cannot inspect statically: its `use` is not "launch", so
+    // only the request-level check can catch the unknown harness.
+    await writeFile(join(root, "wrap-launch.mjs"), [
+      "export default {",
+      "  kind: 'action',",
+      "  use: 'wrap-launch',",
+      "  configSchema: { parse: (value) => value ?? {} },",
+      "  async execute(context) {",
+      "    return context.workers.launch({ harness: 'not-configured', mode: 'oneshot', prompt: 'go' });",
+      "  },",
+      "};",
+    ].join("\n"));
+    const sourceProgram = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'TASK-7',title:'Wrapped launch'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "external-launch-test" },
+      sources: { queue: { use: "command", with: { discover: { command: process.execPath, args: ["-e", sourceProgram] } } } },
+      harnesses: { codex: { use: "codex" } },
+      actions: { implement: { use: "./wrap-launch.mjs", with: {} } },
+      triggers: [{ id: "ready", source: "queue", actions: ["implement"] }],
+      logging: { level: "silent", pretty: false },
+    }));
+
+    const tick = await run(root, "once", "--trigger", "ready");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("1 action failures");
+    expect(tick.output).toContain("unknown harness 'not-configured'");
+    expect(tick.output).toContain("Configured harnesses: codex.");
+  });
+
   it("normalizes v1 files and reloads the v2 document printed by init dry-run", async () => {
     const v1Root = await mkdtemp(join(tmpdir(), "task-relay-v1-app-"));
     await writeFile(join(v1Root, ".task-relay.yaml"), `version: 1\nsources:\n  queue:\n    type: command\n    discover: { command: ${process.execPath} }\nagents:\n  codex:\n    command: codex\ntriggers:\n  - id: ready\n    source: queue\n    label: ready\n    agent: codex\n`);

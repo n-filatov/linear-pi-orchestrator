@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { isPlugin } from "../plugins/loader.js";
+import { BUILT_IN_ACTIONS, BUILT_IN_HARNESSES, BUILT_IN_SOURCES } from "../plugins/built-ins.js";
 
 export interface RelayPluginManifest {
   name: string;
@@ -90,7 +91,7 @@ function pluginManifest(name: string, use: string, kind: "source" | "action" | "
 
 function sourcePluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { SourcePlugin, SourcePluginContext, WorkItem } from "task-relay";
+import type { SourcePlugin, SourcePluginContext, WorkItem } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your source configuration fields here
@@ -134,7 +135,7 @@ export default plugin;
 
 function actionPluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { ActionPlugin, ActionContext, ActionResult } from "task-relay";
+import type { ActionPlugin, ActionContext, ActionResult } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your action configuration fields here
@@ -163,7 +164,7 @@ export default plugin;
 
 function harnessPluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { HarnessPlugin, HarnessLaunchRequest, WorkerHandle } from "task-relay";
+import type { HarnessPlugin, HarnessLaunchRequest, WorkerHandle } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your harness configuration fields here
@@ -399,29 +400,25 @@ export function addPluginCommands(program: Command, print: (value: string) => vo
       const { config } = await loadRelayConfig(root);
 
       const referenced = new Map<string, { use: string; kind: string; locations: string[] }>();
+      const record = (use: string, kind: string, location: string) => {
+        const entry = referenced.get(use) || { use, kind, locations: [] };
+        entry.locations.push(location);
+        referenced.set(use, entry);
+      };
 
       for (const [id, source] of Object.entries(config.sources)) {
-        if (!["linear"].includes(source.use)) {
-          const key = source.use;
-          const entry = referenced.get(key) || { use: source.use, kind: "source", locations: [] };
-          entry.locations.push(`sources.${id}`);
-          referenced.set(key, entry);
-        }
+        if (!BUILT_IN_SOURCES.has(source.use)) record(source.use, "source", `sources.${id}`);
       }
       for (const [id, action] of Object.entries(config.actions)) {
-        if (!["launch", "cleanup"].includes(action.use)) {
-          const key = action.use;
-          const entry = referenced.get(key) || { use: action.use, kind: "action", locations: [] };
-          entry.locations.push(`actions.${id}`);
-          referenced.set(key, entry);
-        }
+        if (!BUILT_IN_ACTIONS.has(action.use)) record(action.use, "action", `actions.${id}`);
       }
       for (const [id, harness] of Object.entries(config.harnesses)) {
-        if (!["codex", "claude", "pi", "opencode"].includes(harness.use)) {
-          const key = harness.use;
-          const entry = referenced.get(key) || { use: harness.use, kind: "harness", locations: [] };
-          entry.locations.push(`harnesses.${id}`);
-          referenced.set(key, entry);
+        if (!BUILT_IN_HARNESSES.has(harness.use)) record(harness.use, "harness", `harnesses.${id}`);
+      }
+      for (const trigger of config.triggers) {
+        for (const [index, action] of trigger.actions.entries()) {
+          if (typeof action === "string" || BUILT_IN_ACTIONS.has(action.use)) continue;
+          record(action.use, "action", `triggers.${trigger.id}.actions.${index}`);
         }
       }
 
