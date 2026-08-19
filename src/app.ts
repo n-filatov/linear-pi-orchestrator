@@ -111,7 +111,41 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       } finally { await runtime.relay.stop(); }
       context.write(`${run.item.id}: recorded ${status}${Object.keys(outputs).length ? ` with ${Object.keys(outputs).length} output(s)` : ""}.`);
     },
+    workerControl: async (context, target, action) => {
+      const candidates = (await context.store.listRuns())
+        .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
+        .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+      const run = candidates.find((candidate) => ["claimed", "provisioning", "launching", "running"].includes(candidate.status)) ?? candidates[0];
+      if (!run?.worker) throw new Error(`No worker found for '${target}'.`);
+
+      // Controlling a live worker needs only its execution adapter, not a whole
+      // relay: composing one would connect every source for a single key press.
+      const executor = context.config.execution.adapter === "tmux"
+        ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${context.config.project.name || path.basename(context.projectRoot)}` })
+        : new DirectProcessAdapter();
+      const runtime = executor.runtime;
+      if (!runtime?.capabilities.input) throw new Error("Controlling a running worker requires execution.adapter: tmux.");
+
+      if (action.type === "send") {
+        await runtime.sendInput(run.worker, { text: action.text, submit: action.submit !== false });
+        return `Sent ${action.text.length} characters to ${run.worker.id}.`;
+      }
+      const child = await runtime.open(run.worker, {
+        command: action.command,
+        args: action.args ?? [],
+        open: action.open ?? "pane",
+        ...(action.name ? { name: action.name } : {}),
+      });
+      await context.store.recordWorkerChild(run.identity, run.claimedAt, child, new Date().toISOString());
+      return `Opened ${child.kind} ${child.target} running ${child.command}.`;
+    },
     workflowTest: async (context, id) => {
+      // Guarded here rather than in the CLI so every caller — including the
+      // dashboard — gets the same precise message.
+      if (!context.config.workflows[id]) {
+        const known = Object.keys(context.config.workflows);
+        throw new Error(`Unknown workflow '${id}'.${known.length ? ` Configured workflows: ${known.join(", ")}.` : " None are configured."}`);
+      }
       const runtime = await composeRuntime(context, { trigger: id });
       try {
         const workflow = runtime.workflows[0];
@@ -173,7 +207,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
 
 async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string } = {}): Promise<RuntimeComposition> {
   const repository: RepositoryScope = { id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot };
-  const plugins = await pluginRegistry(context.config, context.projectRoot);
+  const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger);
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
     .map((trigger) => domainTrigger(context.config, trigger, repository));
@@ -407,15 +441,31 @@ export function agentProfiles(config: RelayConfigV2 | LegacyRelayConfig): Comman
   }));
 }
 
-async function pluginRegistry(config: RelayConfigV2, projectRoot: string): Promise<RelayPluginRegistry> {
+/**
+ * Loads only the plugins the selected work can actually reach.
+ *
+ * Scoping matters for `trigger test` and `workflow test`: a dry run of one
+ * workflow must not fail because an unrelated action elsewhere in the file
+ * names a plugin that is not installed. Harnesses stay unscoped, because any
+ * action may launch any of them.
+ */
+async function pluginRegistry(config: RelayConfigV2, projectRoot: string, selected?: string): Promise<RelayPluginRegistry> {
   const registry = new RelayPluginRegistry();
   for (const plugin of builtInActionPlugins()) registry.register(plugin);
   const externalUses = new Set<string>();
-  for (const source of Object.values(config.sources)) if (!BUILT_IN_SOURCES.has(source.use)) externalUses.add(source.use);
+
+  const triggers = config.triggers.filter((trigger) => !selected || trigger.id === selected);
+  const workflows = Object.entries(config.workflows).filter(([id]) => !selected || id === selected);
+  const sourceIds = new Set([...triggers.map((trigger) => trigger.source), ...workflows.map(([, workflow]) => workflow.on.source)]);
+  const namedActions = new Set<string>();
+  for (const trigger of triggers) for (const action of trigger.actions) if (typeof action === "string") namedActions.add(action);
+  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs)) if (config.actions[job.use]) namedActions.add(job.use);
+
+  for (const [id, source] of Object.entries(config.sources)) if (sourceIds.has(id) && !BUILT_IN_SOURCES.has(source.use)) externalUses.add(source.use);
   for (const harness of Object.values(config.harnesses)) if (!isCommandHarness(harness)) externalUses.add(harness.use);
-  for (const action of Object.values(config.actions)) if (!registry.action(action.use)) externalUses.add(action.use);
-  for (const workflow of Object.values(config.workflows)) for (const job of Object.values(workflow.jobs)) if (!registry.action(job.use) && !config.actions[job.use]) externalUses.add(job.use);
-  for (const trigger of config.triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
+  for (const [id, action] of Object.entries(config.actions)) if (namedActions.has(id) && !registry.action(action.use)) externalUses.add(action.use);
+  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs)) if (!registry.action(job.use) && !config.actions[job.use]) externalUses.add(job.use);
+  for (const trigger of triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
   // Read the managed lockfile once, not once per plugin.
   const lock = externalUses.size > 0 ? await readPluginLock() : undefined;
   for (const use of externalUses) registry.registerAs(use, await loadRelayPlugin(use, projectRoot, lock));

@@ -21,6 +21,11 @@ export type RelayCommandHandlers = {
   attach?: (context: RelayCommandContext, target: string) => Promise<void>;
   signal?: (context: RelayCommandContext, target: string, outcome: "done" | "failed", options: { outputs: Record<string, string>; message?: string }) => Promise<void>;
   workflowTest?: (context: RelayCommandContext, id: string) => Promise<void>;
+  /** Ad-hoc control of one live worker, used by the dashboard. */
+  workerControl?: (context: RelayCommandContext, target: string, action:
+    | { type: "send"; text: string; submit?: boolean }
+    | { type: "exec"; command: string; args?: string[]; open?: "pane" | "window"; name?: string }
+  ) => Promise<string>;
   update?: (options: { check?: boolean; version?: string }) => Promise<string>;
 };
 export type RelayCliOptions = { handlers?: RelayCommandHandlers; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; cwd?: () => string };

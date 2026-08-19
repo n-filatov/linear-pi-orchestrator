@@ -418,7 +418,15 @@ dependency cannot stall a workflow for ever.
 relay workflow test feature    # matched items, each job, and what would start now
 relay workflow runs            # every run, with each job's state and why it is blocked
 relay workflow runs --json
+relay dashboard                # the same, in a browser, updating as it happens
 ```
+
+`relay dashboard` shows every workflow with its declared jobs, each run's job
+states, and the edge each waiting job is blocked on. A **Test** button runs the
+same dry run without changing anything. Its Plugins tab reports what this
+project references and whether it is installed, and its Workers tab can send a
+prompt into a live worker or open a pane beside it. A live event feed streams
+the structured log at the bottom of every tab.
 
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
