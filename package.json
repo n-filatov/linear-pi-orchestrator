@@ -46,7 +46,6 @@
     "@actions/expressions": "^0.3.61",
     "@inquirer/prompts": "^7.5.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
-    "@notwhale/relay-implement-linear": "file:../relay-implement-linear",
     "cli-table3": "^0.6.5",
     "commander": "^13.1.0",
     "cosmiconfig": "^9.0.0",
