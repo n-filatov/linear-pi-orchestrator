@@ -19,6 +19,13 @@ export type RelayCommandHandlers = {
   triggerTest?: (context: RelayCommandContext, trigger: RelayTriggerV2) => Promise<void>;
   cleanup?: (context: RelayCommandContext, target: string) => Promise<void>;
   attach?: (context: RelayCommandContext, target: string) => Promise<void>;
+  signal?: (context: RelayCommandContext, target: string, outcome: "done" | "failed", options: { outputs: Record<string, string>; message?: string }) => Promise<void>;
+  workflowTest?: (context: RelayCommandContext, id: string) => Promise<void>;
+  /** Ad-hoc control of one live worker, used by the dashboard. */
+  workerControl?: (context: RelayCommandContext, target: string, action:
+    | { type: "send"; text: string; submit?: boolean }
+    | { type: "exec"; command: string; args?: string[]; open?: "pane" | "window"; name?: string }
+  ) => Promise<string>;
   update?: (options: { check?: boolean; version?: string }) => Promise<string>;
 };
 export type RelayCliOptions = { handlers?: RelayCommandHandlers; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; cwd?: () => string };
@@ -93,6 +100,37 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
   });
 }
 
+/** Health of every plugin this configuration names, for `relay doctor`. */
+async function pluginHealth(config: RelayConfigV2 | undefined): Promise<[string, string][]> {
+  if (!config) return [];
+  const { BUILT_IN_ACTIONS, BUILT_IN_HARNESSES, BUILT_IN_SOURCES } = await import("../plugins/built-ins.js");
+  const { checkPlugin, readPluginLock } = await import("../plugins/store.js");
+  const uses = new Set<string>();
+  for (const source of Object.values(config.sources)) if (!BUILT_IN_SOURCES.has(source.use)) uses.add(source.use);
+  for (const action of Object.values(config.actions)) if (!BUILT_IN_ACTIONS.has(action.use)) uses.add(action.use);
+  for (const harness of Object.values(config.harnesses)) if (!BUILT_IN_HARNESSES.has(harness.use)) uses.add(harness.use);
+  for (const trigger of config.triggers) {
+    for (const action of trigger.actions) if (typeof action !== "string" && !BUILT_IN_ACTIONS.has(action.use)) uses.add(action.use);
+  }
+  for (const workflow of Object.values(config.workflows)) {
+    for (const job of Object.values(workflow.jobs ?? {})) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) uses.add(job.use);
+  }
+  if (uses.size === 0) return [];
+
+  const lock = await readPluginLock();
+  const rows: [string, string][] = [];
+  for (const use of uses) {
+    // A local module path is resolved against the project, not the plugin store.
+    if (use.startsWith(".") || use.startsWith("/")) { rows.push([use, "local module"]); continue; }
+    const health = await checkPlugin(use, lock);
+    rows.push([use, health.state === "ok" ? `installed ${health.plugin.version}`
+      : health.state === "not-installed" ? "not installed — run 'relay plugin install'"
+      : health.state === "missing-file" ? "missing on disk — reinstall"
+      : "changed since install — reinstall"]);
+  }
+  return rows;
+}
+
 async function resolveContext(cwd: () => string, write: (value: string) => void): Promise<RelayCommandContext> {
   const loaded = await loadRelayConfig(cwd());
   return { projectRoot: loaded.projectRoot, config: loaded.config, store: new RepositoryStateStore(loaded.projectRoot), logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty), write };
@@ -140,13 +178,19 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       await writeFile(target, document); print(`Created ${target}`);
     });
 
-  program.command("doctor").description("Check repository configuration and required local executables.").action(async () => {
+  program.command("doctor").description("Check repository configuration, plugins, and required local executables.").action(async () => {
     const root = await findProjectRoot(cwd()); let configuration = "missing";
-    try { await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
-    print(statusTable([["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)]]));
+    let loaded: Awaited<ReturnType<typeof loadRelayConfig>> | undefined;
+    try { loaded = await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
+    const { pluginDirectory } = await import("../plugins/store.js");
+    const rows: [string, string | number][] = [["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)], ["Plugin directory", pluginDirectory()]];
+    // A configured plugin that is missing or altered must be reported before a
+    // worker is launched, not when the first tick tries to import it.
+    for (const [use, health] of await pluginHealth(loaded?.config)) rows.push([`Plugin ${use}`, health]);
+    print(statusTable(rows));
   });
 
-  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });
+  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Workflows", Object.values(context.config.workflows).filter((workflow) => workflow.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });
 
   program.command("runs").description("List persisted runs.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); if (flags.json) print(JSON.stringify(runs, null, 2)); else print(eventsTable(runs.map((run) => ({ project: context.config.project.name || context.projectRoot, timestamp: run.claimedAt, level: run.status === "failed" ? "error" : "info", task: run.item.id, trigger: run.trigger.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event: run.status, error: run.error })))); });
 
@@ -168,6 +212,78 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   program.command("update [version]").description("Check for or install a Task Relay CLI update.").option("--check", "check without installing").action(async (version: string | undefined, flags: { check?: boolean }) => { if (!options.handlers?.update) noHandler("update"); print(await options.handlers.update({ check: flags.check, version: version ?? "latest" })); });
   program.command("attach <task-or-run>").description("Attach to an interactive tmux worker.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.attach) noHandler("attach"); await options.handlers.attach(context, target); });
   program.command("cleanup <task-or-run>").description("Stop a worker and remove its isolated workspace.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.cleanup) noHandler("cleanup"); await options.handlers.cleanup(context, target); });
+  program.command("signal <task-or-worker> <outcome>")
+    .description("Report a worker's own result so a workflow job can finish. Outcome is 'done' or 'failed'.")
+    .option("--output <key=value>", "record an output for later jobs (repeatable)", (value: string, previous: string[]) => [...previous, value], [])
+    .option("--message <text>", "human-readable note stored with the result")
+    .action(async (target: string, outcome: string, flags: { output: string[]; message?: string }) => {
+      if (outcome !== "done" && outcome !== "failed") throw new Error(`Outcome must be 'done' or 'failed', not '${outcome}'.`);
+      const outputs: Record<string, string> = {};
+      for (const entry of flags.output) {
+        const separator = entry.indexOf("=");
+        if (separator <= 0) throw new Error(`--output must be key=value, not '${entry}'.`);
+        outputs[entry.slice(0, separator)] = entry.slice(separator + 1);
+      }
+      const context = await resolveContext(cwd, print);
+      if (!options.handlers?.signal) noHandler("signal");
+      await options.handlers.signal(context, target, outcome, { outputs, message: flags.message });
+    });
+  const config = program.command("config").description("Inspect and describe this repository's configuration.");
+  config.command("schema")
+    .description(`Emit a JSON Schema for ${CONFIG_FILE}, for editor completion and validation.`)
+    .option("--write [path]", `write the schema to a file (default .task-relay.schema.json) and print the ${CONFIG_FILE} header to add`)
+    .action(async (flags: { write?: string | boolean }) => {
+      const { relayJsonSchema, schemaDirective } = await import("../config/json-schema.js");
+      const schema = relayJsonSchema();
+      if (!flags.write) { print(JSON.stringify(schema, null, 2)); return; }
+      const root = await findProjectRoot(cwd());
+      const relative = typeof flags.write === "string" ? flags.write : ".task-relay.schema.json";
+      await writeFile(resolve(root, relative), `${JSON.stringify(schema, null, 2)}\n`);
+      print(`Wrote ${resolve(root, relative)}`);
+      print(`Add this as the first line of ${CONFIG_FILE} for completion in your editor:`);
+      print(`  ${schemaDirective(`./${relative}`)}`);
+    });
+
+  const workflow = program.command("workflow").description("Inspect workflow runs and their job graphs.");
+  workflow.command("test <id>").description("Preview a workflow's items, jobs, and what would start now.").action(async (id: string) => {
+    const context = await resolveContext(cwd, print);
+    if (!context.config.workflows[id]) throw new Error(`Unknown workflow '${id}'.`);
+    if (!options.handlers?.workflowTest) noHandler("workflow test");
+    await options.handlers.workflowTest(context, id);
+  });
+  workflow.command("retry <id> <task>")
+    .description("Clear settled jobs so a workflow run advances again on the next poll.")
+    .option("--job <name>", "retry only this job (repeatable)", (value: string, previous: string[]) => [...previous, value], [])
+    .option("--occurrence <name>", "target a specific run; defaults to the most recent")
+    .action(async (id: string, task: string, flags: { job: string[]; occurrence?: string }) => {
+      const context = await resolveContext(cwd, print);
+      const repository = { id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot };
+      const runs = (await context.store.listWorkflowRuns(repository))
+        .filter((run) => run.identity.workflowId === id && run.identity.itemId.toLowerCase() === task.toLowerCase())
+        .filter((run) => !flags.occurrence || run.identity.occurrence === flags.occurrence)
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+      if (runs.length === 0) throw new Error(`No run of workflow '${id}' found for '${task}'.`);
+      const target = runs[0];
+      const updated = await context.store.retryWorkflowJobs(target.identity, flags.job, new Date().toISOString());
+      if (!updated) throw new Error(`Run ${target.identity.occurrence} of '${id}' could not be retried.`);
+      const reset = Object.entries(updated.jobs).filter(([, job]) => job.status === "pending").map(([name]) => name);
+      print(`Retrying ${id} for ${target.identity.itemId} (${target.identity.occurrence}).`);
+      print(reset.length ? `  pending: ${reset.join(", ")}` : "  nothing was settled; the run was reopened.");
+      print(`Run 'relay once --trigger ${id}' or wait for the next poll.`);
+    });
+
+  workflow.command("runs").description("Show persisted workflow runs and each job's state.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => {
+    const context = await resolveContext(cwd, print);
+    const runs = await context.store.listWorkflowRuns({ id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot });
+    if (flags.json) { print(JSON.stringify(runs, null, 2)); return; }
+    if (runs.length === 0) { print("No workflow runs recorded."); return; }
+    for (const run of runs) {
+      print(`${run.identity.workflowId}  ${run.item.id}  ${run.status}  (${run.identity.occurrence})`);
+      for (const [jobId, job] of Object.entries(run.jobs)) {
+        print(`    ${jobId.padEnd(20)} ${job.status.padEnd(10)} ${job.message || job.error || ""}`);
+      }
+    }
+  });
   const daemon = program.command("daemon").description("Control the registered background runtime.");
   for (const action of ["start", "stop", "status"] as const) daemon.command(action).action(async () => { const context = await resolveContext(cwd, print); if (!options.handlers?.daemon) noHandler(`daemon ${action}`); await options.handlers.daemon(context, action); });
 

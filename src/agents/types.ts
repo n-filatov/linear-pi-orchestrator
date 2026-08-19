@@ -1,4 +1,4 @@
-import type { AgentLaunchSpec, AgentProfile, TriggerDefinition, WorkItem, WorkerCompletion, WorkerHandle, Workspace } from "../domain/index.js";
+import type { AgentLaunchSpec, AgentProfile, TriggerDefinition, WorkItem, WorkerCompletion, WorkerHandle, WorkerRuntime, Workspace } from "../domain/index.js";
 
 /** The supported ways an agent can receive the rendered task prompt. */
 export type PromptDeliveryMode = "stdin" | "argument" | "file" | "interactive";
@@ -113,6 +113,8 @@ export interface AgentExecutionAdapter {
   reconcile?(worker: WorkerHandle): Promise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle): Promise<void>;
   attach?(worker: WorkerHandle): Promise<void>;
+  /** Control over workers this adapter already started. */
+  readonly runtime?: WorkerRuntime;
 }
 
 export type TemplateValues = {

@@ -5,7 +5,15 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { execa } from "execa";
 import type { AgentExecution, AgentExecutionAdapter, AgentExecutionResult } from "../agents/types.js";
-import type { WorkerCompletion, WorkerHandle } from "../domain/index.js";
+import type {
+  WorkerChildHandle,
+  WorkerChildSpec,
+  WorkerCompletion,
+  WorkerHandle,
+  WorkerInputSpec,
+  WorkerRuntime,
+  WorkerRuntimeCapabilities,
+} from "../domain/index.js";
 
 export type DirectProcessAdapterOptions = {
   extendEnv?: boolean;
@@ -15,9 +23,40 @@ export type DirectProcessAdapterOptions = {
 };
 
 /** Starts an agent directly and returns as soon as the child has a PID. */
-export class DirectProcessAdapter implements AgentExecutionAdapter {
+export class DirectProcessAdapter implements AgentExecutionAdapter, WorkerRuntime {
   private readonly children = new Map<number, ReturnType<typeof execa>>();
   constructor(private readonly options: DirectProcessAdapterOptions = {}) {}
+
+  /**
+   * A detached process has no terminal Relay owns, so none of the live-worker
+   * verbs can be honoured. The capabilities are reported truthfully instead of
+   * failing late, and every verb explains the fix rather than the symptom.
+   */
+  readonly capabilities: WorkerRuntimeCapabilities = { children: false, input: false, capture: false };
+
+  get runtime(): WorkerRuntime { return this; }
+
+  async open(_worker: WorkerHandle, spec: WorkerChildSpec): Promise<WorkerChildHandle> {
+    throw new Error(`Opening a ${spec.open} beside a worker requires execution.adapter: tmux.`);
+  }
+
+  async sendInput(): Promise<void> {
+    throw new Error("Sending input to a running worker requires execution.adapter: tmux.");
+  }
+
+  async capture(): Promise<string> {
+    throw new Error("Reading a worker's output requires execution.adapter: tmux.");
+  }
+
+  async exists(worker: WorkerHandle): Promise<boolean> {
+    const pid = numberMetadata(worker, "pid");
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+
+  async closeChild(): Promise<void> {
+    throw new Error("The direct-process adapter never opens worker children.");
+  }
 
   async execute(execution: AgentExecution): Promise<AgentExecutionResult> {
     if (execution.interactiveInput !== undefined) {
@@ -93,8 +132,13 @@ export type TmuxExecutionAdapterOptions = {
  * tmux is the sole shell boundary. The actual agent command remains argv until
  * it is safely quoted for tmux's `sh -lc` payload.
  */
-export class TmuxExecutionAdapter implements AgentExecutionAdapter {
+export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntime {
   constructor(private readonly options: TmuxExecutionAdapterOptions) {}
+
+  /** tmux can do everything Relay asks of a live worker. */
+  readonly capabilities: WorkerRuntimeCapabilities = { children: true, input: true, capture: true };
+
+  get runtime(): WorkerRuntime { return this; }
 
   async execute(execution: AgentExecution): Promise<AgentExecutionResult> {
     await this.ensureSession();
@@ -197,6 +241,104 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     await execa("tmux", ["attach-session", "-t", attachTarget], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   }
 
+  // ── WorkerRuntime ─────────────────────────────────────────────────────────
+
+  async open(worker: WorkerHandle, spec: WorkerChildSpec): Promise<WorkerChildHandle> {
+    const target = this.requireTarget(worker);
+    const cwd = spec.cwd ?? stringMetadata(worker, "workspace");
+    if (!cwd) throw new Error(`Worker ${worker.id} has no workspace directory to open a ${spec.open} in.`);
+    if (!await this.aliveTarget(target)) throw new Error(`Worker ${worker.id} is no longer running, so Relay cannot open a ${spec.open} beside it.`);
+
+    const payload = tmuxShellPayload(spec.command, spec.args ?? [], spec.env ?? {});
+    const name = sanitizeWindowName(spec.name ?? spec.command);
+    const created = spec.open === "pane"
+      ? await execa("tmux", [
+        "split-window", "-d", "-P",
+        "-F", "#{pane_id}",
+        spec.direction === "horizontal" ? "-h" : "-v",
+        "-t", target,
+        "-c", cwd,
+        this.options.shell ?? "sh", "-lc", payload,
+      ], { reject: false })
+      : await execa("tmux", [
+        "new-window", "-d", "-P",
+        "-F", "#{window_id}",
+        "-t", this.sessionOf(worker),
+        "-n", name,
+        "-c", cwd,
+        this.options.shell ?? "sh", "-lc", payload,
+      ], { reject: false });
+
+    if (created.exitCode !== 0) {
+      throw new Error(`Could not open a ${spec.open} for worker ${worker.id}: ${created.stderr.trim() || `tmux exited with code ${created.exitCode}`}`);
+    }
+    const childTarget = created.stdout.trim();
+    if (!childTarget) throw new Error(`tmux opened a ${spec.open} for worker ${worker.id} but did not report its id.`);
+
+    // Keep the output readable after the command finishes. A worker-scoped pane
+    // exists so a person can see it; letting tmux reap it defeats the purpose.
+    await execa("tmux", ["set-option", "-t", childTarget, spec.open === "pane" ? "-p" : "-w", "remain-on-exit", "on"], { reject: false });
+    if (spec.open === "pane" && spec.name) {
+      await execa("tmux", ["select-pane", "-t", childTarget, "-T", spec.name], { reject: false });
+    }
+
+    return {
+      id: `${worker.id}:${name}`,
+      kind: spec.open,
+      target: childTarget,
+      name: spec.name ?? name,
+      command: [spec.command, ...(spec.args ?? [])].join(" "),
+      startedAt: new Date().toISOString(),
+    };
+  }
+
+  async sendInput(worker: WorkerHandle, spec: WorkerInputSpec): Promise<void> {
+    const target = spec.child ?? this.requireTarget(worker);
+    if (!await this.aliveTarget(target)) throw new Error(`Worker ${worker.id} is no longer running, so Relay cannot send input to it.`);
+    await this.pasteInto(target, spec.text, spec.submit !== false);
+  }
+
+  async capture(worker: WorkerHandle, options: { child?: string; lines?: number } = {}): Promise<string> {
+    const target = options.child ?? this.requireTarget(worker);
+    const args = ["capture-pane", "-p", "-t", target];
+    if (options.lines && options.lines > 0) args.push("-S", `-${options.lines}`);
+    const captured = await execa("tmux", args, { reject: false });
+    if (captured.exitCode !== 0) {
+      throw new Error(`Could not read output from worker ${worker.id}: ${captured.stderr.trim() || `tmux exited with code ${captured.exitCode}`}`);
+    }
+    return captured.stdout;
+  }
+
+  async exists(worker: WorkerHandle, child?: string): Promise<boolean> {
+    const tmux = tmuxMetadata(worker);
+    const target = child ?? tmux.target;
+    return target ? await this.aliveTarget(target) : false;
+  }
+
+  async closeChild(_worker: WorkerHandle, child: WorkerChildHandle): Promise<void> {
+    const command = child.kind === "pane" ? "kill-pane" : "kill-window";
+    const removed = await execa("tmux", [command, "-t", child.target], { reject: false });
+    if (removed.exitCode !== 0 && await this.aliveTarget(child.target)) {
+      throw new Error(`Could not close ${child.kind} ${child.target}: ${removed.stderr.trim() || `tmux exited with code ${removed.exitCode}`}`);
+    }
+  }
+
+  private requireTarget(worker: WorkerHandle): string {
+    const tmux = tmuxMetadata(worker);
+    if (!tmux.target) throw new Error(`Worker ${worker.id} has no tmux target. Only workers launched by the tmux adapter can be controlled.`);
+    return tmux.target;
+  }
+
+  private sessionOf(worker: WorkerHandle): string {
+    return tmuxMetadata(worker).session ?? this.options.session;
+  }
+
+  /** True for a window id, pane id, or `session:index` that tmux still knows. */
+  private async aliveTarget(target: string): Promise<boolean> {
+    const shown = await execa("tmux", ["display-message", "-p", "-t", target, "#{pane_id}"], { reject: false });
+    return shown.exitCode === 0 && shown.stdout.trim().length > 0;
+  }
+
   private async ensureSession(): Promise<void> {
     const existing = await execa("tmux", ["has-session", "-t", this.options.session], { reject: false });
     if (existing.exitCode === 0) return;
@@ -220,24 +362,34 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
     if (!await this.windowExists(this.options.session, target)) {
       throw new Error("Interactive worker exited before Relay could deliver its prompt.");
     }
+    await this.pasteInto(target, input, true);
+  }
 
+  /**
+   * Bracketed paste followed by an optional Enter. This is the only way to put
+   * text into a terminal UI that owns the tty, and it is shared by the launch
+   * prompt and by later `worker-send` instructions.
+   */
+  private async pasteInto(target: string, input: string, submit: boolean): Promise<void> {
     const buffer = `task-relay-prompt-${randomUUID()}`;
     const loaded = await execa("tmux", ["load-buffer", "-b", buffer, "-"], { input, reject: false });
     if (loaded.exitCode !== 0) {
-      throw new Error(`Could not load the interactive prompt into tmux: ${loaded.stderr.trim() || `tmux exited with code ${loaded.exitCode}`}`);
+      throw new Error(`Could not load the prompt into tmux: ${loaded.stderr.trim() || `tmux exited with code ${loaded.exitCode}`}`);
     }
     const pasted = await execa("tmux", ["paste-buffer", "-p", "-d", "-b", buffer, "-t", target], { reject: false });
     if (pasted.exitCode !== 0) {
       await execa("tmux", ["delete-buffer", "-b", buffer], { reject: false });
-      throw new Error(`Could not paste the interactive prompt into worker: ${pasted.stderr.trim() || `tmux exited with code ${pasted.exitCode}`}`);
+      throw new Error(`Could not paste the prompt into worker: ${pasted.stderr.trim() || `tmux exited with code ${pasted.exitCode}`}`);
     }
+    if (!submit) return;
     // The TUI needs a moment to commit the bracketed paste into its input state
     // before it will treat a following Enter as "submit" rather than dropping it.
+    // This now covers `worker-send` as well, which pastes into the same TUI.
     const submitDelayMs = this.options.interactiveSubmitDelayMs ?? 150;
     if (submitDelayMs > 0) await delay(submitDelayMs);
     const submitted = await execa("tmux", ["send-keys", "-t", target, "Enter"], { reject: false });
     if (submitted.exitCode !== 0) {
-      throw new Error(`Could not submit the interactive prompt to worker: ${submitted.stderr.trim() || `tmux exited with code ${submitted.exitCode}`}`);
+      throw new Error(`Could not submit the prompt to worker: ${submitted.stderr.trim() || `tmux exited with code ${submitted.exitCode}`}`);
     }
   }
 
@@ -269,6 +421,18 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter {
   }
 }
 
+/** argv plus environment, quoted into a single `sh -lc` payload. No interpolation. */
+function tmuxShellPayload(command: string, args: readonly string[], env: Readonly<Record<string, string | undefined>>): string {
+  const assignments = Object.entries(env)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .map(([key, value]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name: ${key}`);
+      return `${key}=${shellQuote(value)}`;
+    });
+  const argv = [shellQuote(command), ...args.map(shellQuote)].join(" ");
+  return `${assignments.join(" ")}${assignments.length ? " " : ""}${argv}`;
+}
+
 function tmuxShellCommand(execution: AgentExecution, exitKey: string): string {
   const env = Object.entries(execution.env)
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -298,6 +462,11 @@ function sanitizeWindowName(value: string): string {
 function numberMetadata(worker: WorkerHandle, key: string): number | undefined {
   const value = worker.metadata?.[key];
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function stringMetadata(worker: WorkerHandle, key: string): string | undefined {
+  const value = worker.metadata?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function recordMetadata(worker: WorkerHandle, key: string): Record<string, unknown> {

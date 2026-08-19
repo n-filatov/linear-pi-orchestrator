@@ -4,6 +4,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { isPlugin } from "../plugins/loader.js";
+import { BUILT_IN_ACTIONS, BUILT_IN_HARNESSES, BUILT_IN_SOURCES } from "../plugins/built-ins.js";
+import { CONFIG_FILE } from "../config/load.js";
 
 export interface RelayPluginManifest {
   name: string;
@@ -90,7 +92,7 @@ function pluginManifest(name: string, use: string, kind: "source" | "action" | "
 
 function sourcePluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { SourcePlugin, SourcePluginContext, WorkItem } from "task-relay";
+import type { SourcePlugin, SourcePluginContext, WorkItem } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your source configuration fields here
@@ -134,7 +136,7 @@ export default plugin;
 
 function actionPluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { ActionPlugin, ActionContext, ActionResult } from "task-relay";
+import type { ActionPlugin, ActionContext, ActionResult } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your action configuration fields here
@@ -163,7 +165,7 @@ export default plugin;
 
 function harnessPluginTemplate(use: string): string {
   return `import { z } from "zod";
-import type { HarnessPlugin, HarnessLaunchRequest, WorkerHandle } from "task-relay";
+import type { HarnessPlugin, HarnessLaunchRequest, WorkerHandle } from "task-relay/plugin";
 
 const configSchema = z.object({
   // Add your harness configuration fields here
@@ -391,47 +393,130 @@ export function addPluginCommands(program: Command, print: (value: string) => vo
       print(`\nPlugin ${manifest.name}@${manifest.version} is ready.`);
     });
 
+  plugin.command("install <reference>")
+    .description("Install a plugin package into Relay's managed plugin directory.")
+    .option("--dir <dir>", "override the managed plugin directory")
+    .action(async (reference: string, flags: { dir?: string }) => {
+      const { installPlugin, pluginDirectory } = await import("../plugins/store.js");
+      const { loadPluginFromEntry } = await import("../plugins/loader.js");
+      const directory = flags.dir ? path.resolve(flags.dir) : pluginDirectory();
+      const result = await installPlugin({
+        reference,
+        directory,
+        validate: async (entry) => {
+          const loaded = await loadPluginFromEntry(entry);
+          return { kind: loaded.kind, use: loaded.use };
+        },
+      });
+      print(`Installed ${result.plugin.name}@${result.plugin.version}${result.replaced ? ` (replacing ${result.replaced})` : ""}`);
+      print(`  kind: ${result.plugin.kind}  use: ${result.plugin.use}`);
+      print(`  entry: ${result.plugin.entry}`);
+      print(`  ${result.plugin.integrity}`);
+      print(`\nReference it in ${CONFIG_FILE} as:`);
+      print(`  ${result.plugin.kind === "source" ? "sources" : result.plugin.kind === "action" ? "actions" : "harnesses"}:`);
+      print(`    my-${result.plugin.kind}:`);
+      print(`      uses: "${result.plugin.name}"`);
+    });
+
+  plugin.command("remove <name>")
+    .description("Remove an installed plugin. Refuses while this project still references it.")
+    .option("--dir <dir>", "override the managed plugin directory")
+    .option("--force", "remove even if the current project references it")
+    .action(async (name: string, flags: { dir?: string; force?: boolean }) => {
+      const { findInstalledPlugin, pluginDirectory, readPluginLock, removePlugin } = await import("../plugins/store.js");
+      const directory = flags.dir ? path.resolve(flags.dir) : pluginDirectory();
+      if (!flags.force) {
+        const referenced = await referencedPlugins().catch(() => new Map<string, string[]>());
+        const installed = findInstalledPlugin(await readPluginLock(directory), name);
+        const locations = referenced.get(name) ?? (installed ? referenced.get(installed.use) : undefined);
+        if (locations?.length) {
+          throw new Error(`${name} is still referenced by ${locations.join(", ")} in this project. Remove those entries first, or pass --force.`);
+        }
+      }
+      const removed = await removePlugin(name, directory);
+      print(`Removed ${removed.name}@${removed.version}`);
+    });
+
+  plugin.command("pack [path]")
+    .description("Produce a checksummed tarball of a plugin directory.")
+    .option("--out <dir>", "destination directory", ".")
+    .action(async (pluginPath: string | undefined, flags: { out?: string }) => {
+      const { packPlugin } = await import("../plugins/store.js");
+      const packed = await packPlugin(pluginPath || ".", path.resolve(flags.out || "."));
+      print(`Packed ${packed.tarball}`);
+      print(`  ${packed.integrity}`);
+      print(`\nInstall it with:\n  relay plugin install ${packed.tarball}`);
+    });
+
   plugin.command("list")
-    .description("List plugins referenced in the current project's configuration.")
-    .action(async () => {
-      const { loadRelayConfig, findProjectRoot } = await import("../config/load.js");
-      const root = await findProjectRoot(process.cwd());
-      const { config } = await loadRelayConfig(root);
+    .description("List installed plugins and the plugins this project's configuration references.")
+    .option("--dir <dir>", "override the managed plugin directory")
+    .action(async (flags: { dir?: string }) => {
+      const { checkPlugin, pluginDirectory, pluginLockPath, readPluginLock } = await import("../plugins/store.js");
+      const directory = flags.dir ? path.resolve(flags.dir) : pluginDirectory();
+      const lock = await readPluginLock(directory);
 
-      const referenced = new Map<string, { use: string; kind: string; locations: string[] }>();
-
-      for (const [id, source] of Object.entries(config.sources)) {
-        if (!["linear"].includes(source.use)) {
-          const key = source.use;
-          const entry = referenced.get(key) || { use: source.use, kind: "source", locations: [] };
-          entry.locations.push(`sources.${id}`);
-          referenced.set(key, entry);
-        }
-      }
-      for (const [id, action] of Object.entries(config.actions)) {
-        if (!["launch", "cleanup"].includes(action.use)) {
-          const key = action.use;
-          const entry = referenced.get(key) || { use: action.use, kind: "action", locations: [] };
-          entry.locations.push(`actions.${id}`);
-          referenced.set(key, entry);
-        }
-      }
-      for (const [id, harness] of Object.entries(config.harnesses)) {
-        if (!["codex", "claude", "pi", "opencode"].includes(harness.use)) {
-          const key = harness.use;
-          const entry = referenced.get(key) || { use: harness.use, kind: "harness", locations: [] };
-          entry.locations.push(`harnesses.${id}`);
-          referenced.set(key, entry);
-        }
+      print(`Installed (${pluginLockPath(directory)}):`);
+      const installed = Object.values(lock.plugins);
+      if (installed.length === 0) print("  none — install one with 'relay plugin install <package>'");
+      for (const entry of installed) {
+        print(`  ${entry.name}@${entry.version}  (${entry.kind})  use: ${entry.use}`);
       }
 
-      if (referenced.size === 0) {
-        print("No external plugins referenced in this project's configuration.");
-        return;
-      }
+      const referenced = await referencedPlugins().catch((error: unknown) => {
+        print(`\nReferenced: could not read this project's configuration (${error instanceof Error ? error.message.split("\n")[0] : String(error)})`);
+        return undefined;
+      });
+      if (!referenced) return;
 
-      for (const [use, info] of referenced) {
-        print(`${use}  (${info.kind})  — used by: ${info.locations.join(", ")}`);
+      print(`\nReferenced by this project:`);
+      if (referenced.size === 0) { print("  none"); return; }
+      for (const [use, locations] of referenced) {
+        const health = await checkPlugin(use, lock);
+        const state = health.state === "ok" ? `installed ${health.plugin.version}`
+          : health.state === "not-installed" ? "NOT INSTALLED — run 'relay plugin install'"
+          : health.state === "missing-file" ? "INSTALLED BUT MISSING ON DISK — reinstall"
+          : "CHANGED SINCE INSTALL — reinstall to trust it";
+        print(`  ${use}  [${state}]`);
+        print(`      used by: ${locations.join(", ")}`);
       }
     });
+}
+
+/**
+ * Every plugin name this project's configuration names, and where. Built-ins are
+ * excluded because they are not loadable modules. Kept in one place so `list`
+ * and `remove` cannot disagree about whether a plugin is still in use.
+ */
+async function referencedPlugins(): Promise<Map<string, string[]>> {
+  const { loadRelayConfig, findProjectRoot } = await import("../config/load.js");
+  const { config } = await loadRelayConfig(await findProjectRoot(process.cwd()));
+  const referenced = new Map<string, string[]>();
+  const record = (use: string, location: string) => {
+    referenced.set(use, [...(referenced.get(use) ?? []), location]);
+  };
+
+  for (const [id, source] of Object.entries(config.sources)) {
+    if (!BUILT_IN_SOURCES.has(source.use)) record(source.use, `sources.${id}`);
+  }
+  for (const [id, action] of Object.entries(config.actions)) {
+    if (!BUILT_IN_ACTIONS.has(action.use)) record(action.use, `actions.${id}`);
+  }
+  for (const [id, harness] of Object.entries(config.harnesses)) {
+    if (!BUILT_IN_HARNESSES.has(harness.use)) record(harness.use, `harnesses.${id}`);
+  }
+  for (const trigger of config.triggers) {
+    for (const [index, action] of trigger.actions.entries()) {
+      if (typeof action === "string" || BUILT_IN_ACTIONS.has(action.use)) continue;
+      record(action.use, `triggers.${trigger.id}.actions.${index}`);
+    }
+  }
+  for (const [name, workflow] of Object.entries(config.workflows)) {
+    for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+      // A job may name a reusable action instead of a plugin.
+      if (BUILT_IN_ACTIONS.has(job.use) || config.actions[job.use]) continue;
+      record(job.use, `workflows.${name}.jobs.${jobName}`);
+    }
+  }
+  return referenced;
 }

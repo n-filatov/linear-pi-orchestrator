@@ -170,11 +170,18 @@ export {
   triggerActionV2Schema,
   triggerTargetsV2Schema,
   triggerV2Schema,
+  withUsesAlias,
   workerTargetSelectorSchema,
+  workflowJobSchema,
+  workflowNeedSchema,
+  workflowSchema,
 } from "./v2.js";
 export type {
   RelayActionReference,
   RelayConfigV2,
   RelayTriggerV2,
+  RelayWorkflowJobV2,
+  RelayWorkflowNeedV2,
+  RelayWorkflowV2,
   WorkerTargetSelectorConfig,
 } from "./v2.js";

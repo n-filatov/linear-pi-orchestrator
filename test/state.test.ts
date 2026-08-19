@@ -109,6 +109,47 @@ describe("RepositoryStateStore", () => {
     }
   });
 
+  it("appends worker children without erasing a terminal result or an earlier child", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-children-"));
+    const originalStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateHome;
+    try {
+      const repository: RepositoryScope = { id: "children", root: join(stateHome, "repo") };
+      const trigger: TriggerDefinition = { id: "ready", sourceId: "queue", repository, enabled: true, maxConcurrent: 1 };
+      const identity = { repository, sourceId: "queue", itemId: "TASK-C", triggerId: trigger.id };
+      const store = new RepositoryStateStore(repository.root);
+      const claimed = await store.claim({
+        id: "unused",
+        identity,
+        item: { sourceId: "queue", id: "TASK-C", title: "C" },
+        trigger,
+        agent: { agentId: "codex" },
+        claimedAt: "claimed",
+        maxConcurrent: 1,
+      });
+      claimed!.worker = { id: "worker-c", startedAt: "claimed", metadata: { tmux: { session: "s", target: "@1" } } };
+      await store.update(claimed!);
+
+      const child = (name: string) => ({ id: `worker-c:${name}`, kind: "pane" as const, target: `%${name}`, name, command: name, startedAt: "now" });
+      await store.recordWorkerChild(identity, "claimed", child("dev"), "opened-1");
+      // The worker exits between the two panes; the second append must not
+      // resurrect it, and must not drop the first child.
+      await store.finishActive(identity, "claimed", { status: "succeeded", completedAt: "finished" });
+      const second = await store.recordWorkerChild(identity, "claimed", child("lint"), "opened-2");
+
+      expect(second).toMatchObject({ status: "succeeded", completedAt: "finished", updatedAt: "opened-2" });
+      expect(second?.worker?.metadata?.children).toEqual([child("dev"), child("lint")]);
+      expect(second?.worker?.metadata?.tmux).toEqual({ session: "s", target: "@1" });
+
+      // A stale generation is refused outright.
+      await expect(store.recordWorkerChild(identity, "a-different-claim", child("late"), "opened-3")).resolves.toBeUndefined();
+    } finally {
+      if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = originalStateHome;
+      await rm(stateHome, { recursive: true, force: true });
+    }
+  });
+
   it("persists idempotent action executions with structured results", async () => {
     const stateHome = await mkdtemp(join(tmpdir(), "task-relay-actions-"));
     const originalStateHome = process.env.XDG_STATE_HOME;

@@ -18,6 +18,11 @@ import {
   type RunTerminalTransition,
   type TriggerDefinition,
   type WorkItem,
+  workerChildren,
+  type WorkerChildHandle,
+  type WorkerChildSpec,
+  type WorkerInputSpec,
+  type WorkerRuntime,
   type WorkSource,
   type WorkspaceProvider,
 } from "../src/domain/index.js";
@@ -67,6 +72,18 @@ class MemoryRunStore implements RunStore {
   }
 
   async update(run: RunRecord): Promise<void> { this.runs.set(run.id, structuredClone(run)); }
+
+  async recordWorkerChild(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined> {
+    const run = this.runs.get(createRunKey(identity));
+    if (!run || run.claimedAt !== claimedAt || !run.worker) return undefined;
+    const updated: RunRecord = {
+      ...run,
+      worker: { ...run.worker, metadata: { ...run.worker.metadata, children: [...workerChildren(run.worker), child] } },
+      updatedAt: recordedAt,
+    };
+    this.runs.set(updated.id, updated);
+    return updated;
+  }
 
   async listActive(scope: RepositoryScope): Promise<readonly RunRecord[]> {
     return [...this.runs.values()].filter((run) => sameRepository(run.identity.repository, scope) && isActiveRun(run.status));
@@ -402,3 +419,175 @@ describe("generic action execution", () => {
 function sameRepository(left: RepositoryScope, right: RepositoryScope): boolean {
   return left.id === right.id && left.root === right.root;
 }
+
+describe("worker-scoped actions", () => {
+  const item: WorkItem = { sourceId: "linear", id: "ENG-900", title: "Add a dev server" };
+
+  function seededRun(store: MemoryRunStore, options: { workerId: string; branch?: string; claimedAt?: string; triggerId?: string }): RunRecord {
+    const identity = { repository, sourceId: "linear", itemId: item.id, triggerId: options.triggerId ?? "implementation" };
+    const claimedAt = options.claimedAt ?? "earlier";
+    const run: RunRecord = {
+      id: createRunKey(identity), identity, item,
+      trigger: { id: identity.triggerId, sourceId: "linear", repository, enabled: true },
+      agent: { agentId: "codex" }, status: "running", claimedAt, updatedAt: claimedAt,
+      workspace: { path: "/workspace/ENG-900", branch: options.branch ?? "relay/ENG-900" },
+      worker: { id: options.workerId, startedAt: claimedAt, metadata: { workspace: "/workspace/ENG-900", tmux: { session: "s", target: "@1" } } },
+    };
+    store.runs.set(run.id, run);
+    return run;
+  }
+
+  function recordingRuntime() {
+    const opened: { worker: string; spec: WorkerChildSpec }[] = [];
+    const sent: { worker: string; spec: WorkerInputSpec }[] = [];
+    const runtime: WorkerRuntime = {
+      capabilities: { children: true, input: true, capture: true },
+      async open(worker, spec) {
+        opened.push({ worker: worker.id, spec });
+        return { id: `${worker.id}:child`, kind: spec.open, target: "%7", name: spec.name, command: spec.command, startedAt: "now" };
+      },
+      async sendInput(worker, spec) { sent.push({ worker: worker.id, spec }); },
+      async capture() { return "captured output"; },
+      async exists() { return true; },
+      async closeChild() {},
+    };
+    return { runtime, opened, sent };
+  }
+
+  function launcherWith(runtime?: WorkerRuntime): AgentLauncher {
+    return { resolve: async () => ({ agentId: "codex" }), launch: async () => ({ id: "unused", startedAt: "now" }), stop: async () => {}, runtime };
+  }
+
+  it("opens a pane beside the worker a previous action created and records the child", async () => {
+    const store = new MemoryRunStore();
+    const run = seededRun(store, { workerId: "worker-implement" });
+    const { runtime, opened } = recordingRuntime();
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    // Stands in for a launch action: it reports the worker it created.
+    registry.registerAction({
+      kind: "action", use: "stub-launch", configSchema: z.object({}),
+      async execute() { return { status: "succeeded", output: { workerId: "worker-implement", runId: run.id } }; },
+    });
+
+    const activeRelay = relay({
+      trigger: {
+        id: "feature", sourceId: "linear", repository, enabled: true,
+        actions: [
+          { id: "implement", use: "stub-launch", config: {} },
+          { id: "dev-server", use: "worker-exec", config: { worker: { action: "implement" }, open: "pane", name: "dev", command: "npm", args: ["run", "dev"] } },
+        ],
+      },
+      items: [item], runStore: store, registry, actionLedger: new MemoryActionLedger(), agent: launcherWith(runtime),
+    });
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(0);
+    expect(result.actionsExecuted).toBe(2);
+    expect(opened).toEqual([{
+      worker: "worker-implement",
+      spec: { command: "npm", args: ["run", "dev"], cwd: undefined, env: {}, name: "dev", open: "pane", direction: "vertical" },
+    }]);
+    expect(store.runs.get(run.id)?.worker?.metadata?.children).toEqual([
+      { id: "worker-implement:child", kind: "pane", target: "%7", name: "dev", command: "npm", startedAt: "now" },
+    ]);
+  });
+
+  it("sends rendered text to the most recent worker for the item", async () => {
+    const store = new MemoryRunStore();
+    seededRun(store, { workerId: "worker-old", claimedAt: "2026-08-01", triggerId: "old" });
+    seededRun(store, { workerId: "worker-new", claimedAt: "2026-08-15", triggerId: "new" });
+    const { runtime, sent } = recordingRuntime();
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+
+    const activeRelay = relay({
+      trigger: {
+        id: "ask", sourceId: "linear", repository, enabled: true,
+        actions: [{ id: "ask", use: "worker-send", config: { text: "New guidance on {{item.id}}: {{item.title}}" } }],
+      },
+      items: [item], runStore: store, registry, actionLedger: new MemoryActionLedger(), agent: launcherWith(runtime),
+    });
+
+    await activeRelay.tick();
+    expect(sent).toEqual([{ worker: "worker-new", spec: { text: "New guidance on ENG-900: Add a dev server", submit: true, child: undefined } }]);
+  });
+
+  it("skips instead of failing when no worker matches the reference", async () => {
+    const store = new MemoryRunStore();
+    const { runtime } = recordingRuntime();
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    const ledger = new MemoryActionLedger();
+
+    const activeRelay = relay({
+      trigger: {
+        id: "ask", sourceId: "linear", repository, enabled: true,
+        actions: [{ id: "ask", use: "worker-send", config: { text: "anyone there?" } }],
+      },
+      items: [item], runStore: store, registry, actionLedger: ledger, agent: launcherWith(runtime),
+    });
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect([...ledger.records.values()][0]).toMatchObject({ status: "skipped" });
+  });
+
+  it("explains that live worker control needs the tmux adapter", async () => {
+    const store = new MemoryRunStore();
+    seededRun(store, { workerId: "worker-implement" });
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    const ledger = new MemoryActionLedger();
+
+    const activeRelay = relay({
+      trigger: {
+        id: "feature", sourceId: "linear", repository, enabled: true,
+        actions: [{ id: "dev-server", use: "worker-exec", config: { command: "npm", args: ["run", "dev"] } }],
+      },
+      items: [item], runStore: store, registry, actionLedger: ledger, agent: launcherWith(undefined),
+    });
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(1);
+    expect([...ledger.records.values()][0]?.error).toMatch(/execution\.adapter: tmux/);
+  });
+
+  it("pins a launch to the branch of the worker an earlier action created", async () => {
+    const store = new MemoryRunStore();
+    const run = seededRun(store, { workerId: "worker-implement", branch: "relay/ENG-900-add-a-dev-server" });
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    registry.registerAction({
+      kind: "action", use: "stub-launch", configSchema: z.object({}),
+      async execute() { return { status: "succeeded", output: { workerId: "worker-implement", runId: run.id } }; },
+    });
+    const provisioned: (string | undefined)[] = [];
+
+    const activeRelay = relay({
+      trigger: {
+        id: "feature", sourceId: "linear", repository, enabled: true,
+        metadata: { branchTemplate: "review/{{key}}" },
+        actions: [
+          { id: "implement", use: "stub-launch", config: {} },
+          { id: "review", use: "launch", config: { harness: "claude", workspace: { fromAction: "implement" } } },
+        ],
+      },
+      items: [item], runStore: store, registry, actionLedger: new MemoryActionLedger(),
+      agent: launcherWith(undefined),
+      workspace: {
+        provision: async (provisioning) => {
+          provisioned.push(provisioning.trigger.metadata?.branchTemplate as string | undefined);
+          return { path: "/workspace/ENG-900", branch: "relay/ENG-900-add-a-dev-server" };
+        },
+      },
+    });
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(0);
+    // The trigger's own template is overridden by the earlier worker's branch,
+    // so the review agent lands in the same worktree instead of a new one.
+    expect(provisioned).toEqual(["relay/ENG-900-add-a-dev-server"]);
+  });
+});

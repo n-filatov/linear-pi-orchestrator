@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   createRunKey,
+  createWorkflowRunKey,
   isTerminalWorkItem,
   type AgentLauncher,
   type RelayLogger,
@@ -11,18 +12,38 @@ import {
   type SourceEvent,
   type TriggerDefinition,
   type WorkItem,
+  type WorkerChildHandle,
+  type WorkerChildSpec,
+  type WorkerInputSpec,
+  type WorkerRuntime,
+  type WorkflowDefinition,
+  type WorkflowJobDefinition,
+  type WorkflowJobStatus,
+  type WorkflowRunRecord,
+  type WorkflowRunStore,
   type WorkSource,
   type WorkspaceProvider,
   isActiveRun,
+  isTerminalJobStatus,
+  workerChildren,
 } from "../domain/index.js";
-import type { ActionContext, ActionResult, LaunchWorkerActionRequest, RelayPluginRegistry } from "../plugins/index.js";
+import { decideJob, jobInstances, jobTimedOut, runOutcome, timedOut, type JobDecision } from "../workflows/reconciler.js";
+import Handlebars from "handlebars";
+import type { ActionContext, ActionResult, LaunchWorkerActionRequest, RelayPluginRegistry, ResolvedWorker, WorkerRef } from "../plugins/index.js";
 
 export interface TriggerProvider {
   list(): Promise<readonly TriggerDefinition[]>;
 }
 
+export interface WorkflowProvider {
+  list(): Promise<readonly WorkflowDefinition[]>;
+}
+
 export interface TaskRelayDependencies {
   triggers: TriggerProvider;
+  /** Workflows are evaluated after triggers, against their own durable runs. */
+  workflows?: WorkflowProvider;
+  workflowRuns?: WorkflowRunStore;
   sources: Iterable<WorkSource>;
   runStore: RunStore;
   workspaceProvider: WorkspaceProvider;
@@ -30,6 +51,12 @@ export interface TaskRelayDependencies {
   logger: RelayLogger;
   actionPlugins?: RelayPluginRegistry;
   actionExecutions?: ActionInvocationStore;
+  /**
+   * Applied to every worker launch, whichever action requested it. The
+   * composition root owns the rules because they depend on configuration the
+   * engine deliberately does not read.
+   */
+  validateLaunch?(request: LaunchWorkerActionRequest, context: { triggerId: string; actionId: string }): void;
   now?: () => Date;
 }
 
@@ -143,7 +170,311 @@ export class TaskRelay {
       result.triggersVisited += 1;
       await this.runTrigger(trigger, result);
     }
+    for (const workflow of await this.dependencies.workflows?.list() ?? []) {
+      if (this.stopController.signal.aborted) break;
+      if (!workflow.enabled) continue;
+      result.triggersVisited += 1;
+      await this.runWorkflow(workflow, result);
+    }
     return result;
+  }
+
+  // ── Workflows ─────────────────────────────────────────────────────────────
+
+  private async runWorkflow(workflow: WorkflowDefinition, result: TickResult): Promise<void> {
+    const source = this.sources.get(workflow.sourceId);
+    if (!source) {
+      this.dependencies.logger.error("Configured workflow has no matching work source", { workflowId: workflow.id, sourceId: workflow.sourceId });
+      return;
+    }
+    const runs = this.dependencies.workflowRuns;
+    if (!runs) throw new Error(`Workflow '${workflow.id}' needs a workflow run store, but none is configured.`);
+
+    let items: readonly WorkItem[];
+    try {
+      items = await source.discover({ trigger: workflowAsTrigger(workflow), signal: this.stopController.signal });
+    } catch (error) {
+      this.dependencies.logger.error("Work source discovery failed", { workflowId: workflow.id, sourceId: source.id, error: messageFor(error) });
+      return;
+    }
+    result.itemsDiscovered += items.length;
+
+    // A concurrency group is checked and then claimed by opening a run. Those
+    // two steps are not atomic, so items must be reconciled one at a time when
+    // a group is configured, or two could both pass the check.
+    const queue = new PQueue({ concurrency: workflow.concurrency ? 1 : normaliseConcurrency(workflow.maxConcurrent) });
+    for (const item of items) {
+      void queue.add(async () => this.reconcileWorkflow(workflow, source, item, runs, result)).catch((error: unknown) => {
+        this.dependencies.logger.error("Workflow reconciliation failed unexpectedly", {
+          workflowId: workflow.id, itemId: item.id, title: item.title, error: messageFor(error),
+        });
+      });
+    }
+    await queue.onIdle();
+  }
+
+  private async reconcileWorkflow(
+    workflow: WorkflowDefinition,
+    source: WorkSource,
+    item: WorkItem,
+    runs: WorkflowRunStore,
+    result: TickResult,
+  ): Promise<void> {
+    const occurrence = await this.workflowOccurrence(workflow, item, runs);
+    const identity = { repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id, occurrence };
+    const startedAt = this.now().toISOString();
+
+    // Concurrency is decided before the run is opened, so a group that is
+    // already busy never produces a second live run to reconcile.
+    const group = workflow.concurrency ? renderGroup(workflow.concurrency.group, item) : undefined;
+    if (group) {
+      const key = createWorkflowRunKey(identity);
+      const live = (await runs.findRunningInGroup(workflow.repository, group)).filter((other) => other.id !== key);
+      if (live.length > 0) {
+        if (!workflow.concurrency!.cancelInProgress) {
+          result.skipped += 1;
+          this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped",
+            `Concurrency group '${group}' is held by ${live.map((other) => other.item.id).join(", ")}.`);
+          return;
+        }
+        for (const other of live) await this.cancelWorkflowRun(workflow, other, runs, result);
+      }
+    }
+
+    let run = await runs.openWorkflowRun({
+      identity,
+      item,
+      startedAt,
+      ...(workflow.timeoutMs ? { timeoutAt: new Date(this.now().getTime() + workflow.timeoutMs).toISOString() } : {}),
+      ...(group ? { concurrencyGroup: group } : {}),
+    });
+    if (run.status !== "running") {
+      // Say so rather than returning silently: an item that keeps matching but
+      // never advances is otherwise indistinguishable from a broken workflow.
+      result.skipped += 1;
+      this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped", `Workflow run ${occurrence} already ${run.status}.`);
+      return;
+    }
+
+    // A worker launched on an earlier tick may have finished since. Job state is
+    // derived from the run record, never assumed from the last decision.
+    run = await this.refreshWorkflowJobs(workflow, run, runs) ?? run;
+
+    if (timedOut(run, this.now())) {
+      await this.expireWorkflow(workflow, run, runs, result, item);
+      return;
+    }
+
+    const instances = jobInstances(workflow.jobs);
+    const known = new Set(instances.keys());
+    const outputs: Record<string, ActionResult> = actionOutputsOf(run);
+    for (const job of workflow.jobs) {
+      if (this.stopController.signal.aborted) break;
+      // A job with its own deadline fails alone, leaving the run to continue.
+      if (jobTimedOut(job, run.jobs[job.id], this.now())) {
+        run = await runs.updateWorkflowJob(identity, job.id, { status: "failed", error: "Job timed out.", at: this.now().toISOString() }) ?? run;
+        result.actionsFailed += 1;
+        this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "failed", `${job.id}: timed out.`);
+        continue;
+      }
+      let decision: JobDecision;
+      try {
+        decision = decideJob({ job, states: run.jobs, item, known, instances });
+      } catch (error) {
+        // A bad `if:` must not silently hold a workflow open for ever.
+        decision = { action: "settle", status: "omitted", reason: messageFor(error) };
+      }
+      if (decision.action === "hold") continue;
+      if (decision.action === "settle") {
+        run = await runs.updateWorkflowJob(identity, job.id, { status: decision.status, message: decision.reason, at: this.now().toISOString() }) ?? run;
+        result.skipped += 1;
+        this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped", `${job.id}: ${decision.reason}`);
+        continue;
+      }
+      run = await this.executeWorkflowJob(workflow, source, item, job, identity, runs, outputs, result) ?? run;
+    }
+
+    const outcome = runOutcome(workflow.jobs, run.jobs);
+    if (outcome.done) await runs.finishWorkflowRun(identity, outcome.status, this.now().toISOString());
+  }
+
+  /** Maps each job's launched run onto a job status, so `needs` sees the truth. */
+  private async refreshWorkflowJobs(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+  ): Promise<WorkflowRunRecord | undefined> {
+    let current: WorkflowRunRecord | undefined = run;
+    for (const job of workflow.jobs) {
+      const state = run.jobs[job.id];
+      if (!state?.runId || state.status !== "started") continue;
+      const record = (await this.dependencies.runStore.findWorkerTargets?.({
+        repository: workflow.repository,
+        sourceId: run.identity.sourceId,
+        itemId: run.identity.itemId,
+        selection: "all",
+        includeCleaned: true,
+      }) ?? []).find((candidate) => candidate.id === state.runId);
+      if (!record || isActiveRun(record.status)) continue;
+      const status: WorkflowJobStatus = record.status === "succeeded" || record.status === "stopped" ? "succeeded" : "failed";
+      current = await runs.updateWorkflowJob(run.identity, job.id, {
+        status,
+        outputs: signalOutputs(record),
+        ...(record.error ? { error: record.error } : {}),
+        at: this.now().toISOString(),
+      }) ?? current;
+      if (current) run = current;
+    }
+    return current;
+  }
+
+  private async executeWorkflowJob(
+    workflow: WorkflowDefinition,
+    source: WorkSource,
+    item: WorkItem,
+    job: WorkflowJobDefinition,
+    identity: WorkflowRunRecord["identity"],
+    runs: WorkflowRunStore,
+    outputs: Record<string, ActionResult>,
+    result: TickResult,
+  ): Promise<WorkflowRunRecord | undefined> {
+    const registry = this.dependencies.actionPlugins;
+    if (!registry) throw new Error(`Workflow ${workflow.id} declares jobs, but no action registry is configured.`);
+    const plugin = registry.action(job.use);
+    if (!plugin) throw new Error(`Unknown action plugin '${job.use}' in workflow ${workflow.id}.`);
+    const config = registry.parseActionConfig(job.use, job.config ?? {});
+    const trigger = workflowAsTrigger(workflow, job.id);
+    const executionId = JSON.stringify([identity.repository.id, identity.repository.root, workflow.id, identity.itemId, identity.occurrence, job.id]);
+
+    this.dependencies.logger.info("Workflow job started", { workflowId: workflow.id, jobId: job.id, actionType: job.use, itemId: item.id, title: item.title });
+    try {
+      const context: ActionContext = {
+        executionId,
+        actionId: job.id,
+        triggerId: workflow.id,
+        repository: workflow.repository,
+        sourceId: source.id,
+        item,
+        outputs,
+        targets: workflow.targets?.workers,
+        workers: {
+          launch: (request) => this.launchFromAction(source, trigger, item, job.id, request, result, outputs),
+          cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
+          resolve: (ref) => this.resolveWorkers(trigger, item, outputs, ref),
+          exec: (ref, spec) => this.execInWorker(trigger, item, outputs, ref, spec),
+          send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
+          capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
+          stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
+        },
+        signal: this.stopController.signal,
+      };
+      const actionResult = await plugin.execute(context, config);
+      outputs[job.id] = actionResult;
+      result.actionsExecuted += 1;
+
+      // A plugin that reports `skipped` has nothing to do *yet* — no worker has
+      // appeared, for instance — so the job stays pending and is retried on a
+      // later tick. Only `if:` and an unsatisfiable dependency settle a job as
+      // skipped or omitted.
+      if (actionResult.status === "skipped") {
+        result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", `${job.id}: ${actionResult.message ?? "Nothing to do yet."}`);
+        return runs.updateWorkflowJob(identity, job.id, { status: "pending", message: actionResult.message, at: this.now().toISOString(), attempted: true });
+      }
+
+      const runId = stringOutput(actionResult, "runId");
+      const workerId = stringOutput(actionResult, "workerId");
+      // A job that launched a live worker is `started`, not `succeeded`: the
+      // agent is still running, and a later job may depend on either fact.
+      const status: WorkflowJobStatus = runId ? "started" : "succeeded";
+      if (job.use !== "launch") this.recordItemOutcome(result, trigger, item, "action", `${job.id}: ${status}.`, workerId);
+      return runs.updateWorkflowJob(identity, job.id, {
+        status,
+        runId,
+        workerId,
+        outputs: jsonOutputs(actionResult),
+        at: this.now().toISOString(),
+        attempted: true,
+      });
+    } catch (error) {
+      result.actionsFailed += 1;
+      this.dependencies.logger.error("Workflow job failed", { workflowId: workflow.id, jobId: job.id, itemId: item.id, title: item.title, error: messageFor(error) });
+      this.recordItemOutcome(result, trigger, item, "failed", `${job.id}: ${messageFor(error)}`);
+      return runs.updateWorkflowJob(identity, job.id, { status: "failed", error: messageFor(error), at: this.now().toISOString(), attempted: true });
+    }
+  }
+
+  /**
+   * Stops an older run so a newer one in the same concurrency group can start.
+   * Its live workers are stopped first: leaving them running would defeat the
+   * point of cancelling, and orphan windows nothing will ever close.
+   */
+  private async cancelWorkflowRun(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+    result: TickResult,
+  ): Promise<void> {
+    const at = this.now().toISOString();
+    for (const job of workflow.jobs) {
+      const state = run.jobs[job.id];
+      if (!state || isTerminalJobStatus(state.status)) continue;
+      if (state.status === "started" && state.workerId) {
+        await this.stopWorker(workflowAsTrigger(workflow), run.item, {}, { workerId: state.workerId }).catch((error: unknown) => {
+          this.dependencies.logger.warn("Could not stop a worker while cancelling a superseded run", {
+            workflowId: workflow.id, itemId: run.identity.itemId, workerId: state.workerId, error: messageFor(error),
+          });
+        });
+      }
+      await runs.updateWorkflowJob(run.identity, job.id, { status: "omitted", message: "Superseded by a newer run in the same concurrency group.", at });
+    }
+    await runs.finishWorkflowRun(run.identity, "failed", at);
+    result.skipped += 1;
+    this.recordItemOutcome(result, workflowAsTrigger(workflow), run.item, "skipped", `Cancelled: superseded in concurrency group '${run.concurrencyGroup}'.`);
+    this.dependencies.logger.info("Workflow run cancelled by a newer run", {
+      workflowId: workflow.id, itemId: run.identity.itemId, group: run.concurrencyGroup,
+    });
+  }
+
+  private async expireWorkflow(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+    result: TickResult,
+    item: WorkItem,
+  ): Promise<void> {
+    const at = this.now().toISOString();
+    for (const job of workflow.jobs) {
+      const status = run.jobs[job.id]?.status ?? "pending";
+      if (isTerminalJobStatus(status)) continue;
+      await runs.updateWorkflowJob(run.identity, job.id, { status: "omitted", message: "Workflow run timed out.", at });
+    }
+    await runs.finishWorkflowRun(run.identity, "failed", at);
+    result.skipped += 1;
+    this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "failed", "Workflow run timed out.");
+    this.dependencies.logger.warn("Workflow run timed out", { workflowId: workflow.id, itemId: run.identity.itemId, startedAt: run.startedAt });
+  }
+
+  /**
+   * Which occurrence of a workflow this item belongs to. `once-per-item` never
+   * reruns; `on-change` opens a new occurrence when the item changes; and
+   * `every-poll` opens a new one only after the previous occurrence finished, so
+   * a reopened ticket runs again without a poll ever duplicating live work.
+   */
+  private async workflowOccurrence(
+    workflow: WorkflowDefinition,
+    item: WorkItem,
+    runs: WorkflowRunStore,
+  ): Promise<string> {
+    const base = { repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id };
+    const policy = workflow.firePolicy ?? "once-per-match";
+    if (policy === "on-change") return `change-${actionFingerprint({ selector: workflow.selector } as TriggerDefinition, item)}`;
+    if (policy !== "every-poll") return "item";
+    const latest = await runs.latestWorkflowRun(base);
+    if (!latest) return "run-1";
+    if (latest.status === "running") return latest.identity.occurrence;
+    const previous = Number(/^run-(\d+)$/.exec(latest.identity.occurrence)?.[1] ?? "0");
+    return `run-${previous + 1}`;
   }
 
   private async runTrigger(trigger: TriggerDefinition, result: TickResult): Promise<void> {
@@ -383,8 +714,13 @@ export class TaskRelay {
             worker: run?.worker,
             run,
             workers: {
-              launch: (request) => this.launchFromAction(source, trigger, item, action.id, request, result),
+              launch: (request) => this.launchFromAction(source, trigger, item, action.id, request, result, outputs),
               cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
+              resolve: (ref) => this.resolveWorkers(trigger, item, outputs, ref),
+              exec: (ref, spec) => this.execInWorker(trigger, item, outputs, ref, spec),
+              send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
+              capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
+              stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
             },
             signal: this.stopController.signal,
           };
@@ -413,14 +749,26 @@ export class TaskRelay {
     }
   }
 
-  private async launchFromAction(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, actionId: string, request: LaunchWorkerActionRequest, result: TickResult): Promise<ActionResult> {
+  private async launchFromAction(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, actionId: string, request: LaunchWorkerActionRequest, result: TickResult, outputs: Readonly<Record<string, ActionResult>> = {}): Promise<ActionResult> {
+    this.dependencies.validateLaunch?.(request, { triggerId: trigger.id, actionId });
+    const workspace = { ...request.workspace };
+    // `fromAction` pins this worker to the branch an earlier action's worker is
+    // already on. Without it the two only share a worktree by coincidence,
+    // because both branch templates happen to render the same name.
+    const fromAction = typeof workspace.fromAction === "string" ? workspace.fromAction : undefined;
+    if (fromAction) {
+      delete workspace.fromAction;
+      const branch = await this.branchOfAction(trigger, item, outputs, fromAction);
+      if (!branch) return { status: "skipped", message: `Action '${fromAction}' has no workspace to reuse.` };
+      workspace.branchTemplate = branch;
+    }
     const derived: TriggerDefinition = {
       ...trigger,
       id: `${trigger.id}:${actionId}`,
       actions: undefined,
       agent: { id: request.harness, model: request.model, promptTemplate: request.prompt, metadata: { modelProfile: request.modelProfile } },
       promptDelivery: request.mode === "interactive" ? "interactive" : undefined,
-      metadata: { ...trigger.metadata, ...request.workspace },
+      metadata: { ...trigger.metadata, ...workspace },
     };
     const outcome = await this.dispatchItem(source, derived, item);
     result.runsClaimed += outcome.claimed ? 1 : 0;
@@ -449,14 +797,153 @@ export class TaskRelay {
     return { status: "succeeded", output: { workerId, runId: run.id, workspace: run.workspace?.path } };
   }
 
-  private async workerTargets(trigger: TriggerDefinition, item: WorkItem, explicitWorkerIds?: readonly string[]): Promise<readonly RunRecord[]> {
+  // ── Worker-scoped verbs available to every action ────────────────────────
+
+  /**
+   * Turns a reference into concrete workers. A reference to an earlier action
+   * reads that action's recorded output, so a pipeline never has to know worker
+   * ids, and a stale or skipped step resolves to nothing rather than guessing.
+   */
+  private async resolveWorkers(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+  ): Promise<readonly ResolvedWorker[]> {
+    let workerIds: readonly string[] | undefined;
+    let selection: "latest" | "active" | "all" = "all";
+
+    if ("action" in ref) {
+      const produced = outputs[ref.action];
+      if (!produced) throw new Error(`Action '${ref.action}' has not run before this one in trigger '${trigger.id}'.`);
+      const workerId = produced.output?.workerId;
+      if (typeof workerId !== "string") return [];
+      workerIds = [workerId];
+    } else if ("workerId" in ref) {
+      workerIds = [ref.workerId];
+    } else {
+      selection = ref.runs ?? "latest";
+    }
+
+    const runs = await this.workerTargets(trigger, item, workerIds, selection);
+    return runs
+      .filter((run): run is RunRecord & { worker: NonNullable<RunRecord["worker"]> } => Boolean(run.worker))
+      .map((run) => ({ worker: run.worker, run }));
+  }
+
+  /** The branch an earlier action's worker is on, if it created one. */
+  private async branchOfAction(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    actionId: string,
+  ): Promise<string | undefined> {
+    const produced = outputs[actionId];
+    if (!produced) throw new Error(`Action '${actionId}' has not run before this one in trigger '${trigger.id}'.`);
+    const runId = produced.output?.runId;
+    if (typeof runId !== "string") return undefined;
+    const runs = await this.workerTargets(trigger, item, undefined, "all");
+    return runs.find((run) => run.id === runId)?.workspace?.branch;
+  }
+
+  private requireRuntime(verb: string): WorkerRuntime {
+    const runtime = this.dependencies.agentLauncher.runtime;
+    if (!runtime) throw new Error(`The configured execution adapter cannot ${verb}. Set execution.adapter: tmux.`);
+    return runtime;
+  }
+
+  private async execInWorker(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+    spec: WorkerChildSpec,
+  ): Promise<ActionResult> {
+    const runtime = this.requireRuntime(`open a ${spec.open} beside a worker`);
+    const targets = await this.resolveWorkers(trigger, item, outputs, ref);
+    if (targets.length === 0) return { status: "skipped", message: "No matching worker is running." };
+
+    const opened: WorkerChildHandle[] = [];
+    for (const { worker, run } of targets) {
+      const child = await runtime.open(worker, spec);
+      opened.push(child);
+      // Record immediately: a child that is not recorded is a window nothing
+      // will ever close. The append is generation-checked and lock-scoped, so a
+      // worker that finished while its pane opened keeps its terminal status.
+      const recorded = await this.dependencies.runStore.recordWorkerChild?.(run.identity, run.claimedAt, child, this.now().toISOString());
+      if (recorded === undefined && !this.dependencies.runStore.recordWorkerChild) {
+        run.worker = { ...worker, metadata: { ...worker.metadata, children: [...workerChildren(worker), child] } };
+        run.updatedAt = this.now().toISOString();
+        await this.dependencies.runStore.update(run);
+      } else if (!recorded) {
+        this.dependencies.logger.warn("Opened a worker child, but the run changed before it could be recorded", {
+          triggerId: trigger.id, itemId: item.id, workerId: worker.id, child: child.target,
+        });
+      }
+    }
+    return { status: "succeeded", output: { children: opened, target: spec.open } };
+  }
+
+  private async sendToWorker(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+    spec: WorkerInputSpec,
+  ): Promise<ActionResult> {
+    const runtime = this.requireRuntime("send input to a worker");
+    const targets = await this.resolveWorkers(trigger, item, outputs, ref);
+    if (targets.length === 0) return { status: "skipped", message: "No matching worker is running." };
+    for (const { worker } of targets) await runtime.sendInput(worker, spec);
+    return { status: "succeeded", output: { workerIds: targets.map((target) => target.worker.id), submitted: spec.submit !== false } };
+  }
+
+  private async captureWorker(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+    options?: { child?: string; lines?: number },
+  ): Promise<ActionResult> {
+    const runtime = this.requireRuntime("read a worker's output");
+    const targets = await this.resolveWorkers(trigger, item, outputs, ref);
+    if (targets.length === 0) return { status: "skipped", message: "No matching worker is running." };
+    const captured: Record<string, string> = {};
+    for (const { worker } of targets) captured[worker.id] = await runtime.capture(worker, options);
+    return { status: "succeeded", output: { captured } };
+  }
+
+  private async stopWorker(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+  ): Promise<ActionResult> {
+    const targets = await this.resolveWorkers(trigger, item, outputs, ref);
+    if (targets.length === 0) return { status: "skipped", message: "No matching worker is running." };
+    const stopped: string[] = [];
+    for (const { worker, run } of targets) {
+      if (!isActiveRun(run.status)) continue;
+      const completedAt = this.now().toISOString();
+      // Record the terminal transition before killing the window, so a
+      // concurrent wait() observer loses the race and reports nothing.
+      await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt });
+      await this.dependencies.agentLauncher.stop?.(worker, run);
+      stopped.push(worker.id);
+    }
+    return stopped.length === 0
+      ? { status: "skipped", message: "No matching worker was still active." }
+      : { status: "succeeded", output: { workerIds: stopped } };
+  }
+
+  private async workerTargets(trigger: TriggerDefinition, item: WorkItem, explicitWorkerIds?: readonly string[], selection?: "latest" | "active" | "all"): Promise<readonly RunRecord[]> {
     if (!this.dependencies.runStore.findWorkerTargets) throw new Error("The configured run store cannot resolve worker action targets.");
     const selector = trigger.targets?.workers;
     return this.dependencies.runStore.findWorkerTargets({
       repository: trigger.repository,
       sourceId: item.sourceId,
       itemId: item.id,
-      selection: selector?.runs ?? "all",
+      selection: selection ?? selector?.runs ?? "all",
       workerIds: explicitWorkerIds ?? selector?.workerIds,
     });
   }
@@ -635,4 +1122,65 @@ function runGeneration(run: Pick<RunRecord, "id" | "claimedAt">): string {
 
 function isPersistentWorker(run: RunRecord): boolean {
   return run.worker?.metadata?.persistent === true;
+}
+
+
+/**
+ * Workflows reuse the trigger-shaped plumbing for discovery, worker resolution,
+ * and launching. The derived trigger is never persisted as configuration; it
+ * exists so one engine serves both models.
+ */
+function workflowAsTrigger(workflow: WorkflowDefinition, jobId?: string): TriggerDefinition {
+  return {
+    id: jobId ? `${workflow.id}:${jobId}` : workflow.id,
+    sourceId: workflow.sourceId,
+    repository: workflow.repository,
+    enabled: workflow.enabled,
+    selector: workflow.selector,
+    maxConcurrent: workflow.maxConcurrent,
+    targets: workflow.targets,
+    firePolicy: workflow.firePolicy,
+    metadata: workflow.metadata,
+  };
+}
+
+/** A concurrency group is per item unless its template says otherwise. */
+function renderGroup(template: string, item: WorkItem): string {
+  return Handlebars.compile(template, { noEscape: true })({ item, id: item.id, title: item.title });
+}
+
+/** Earlier job results, shaped as action outputs so `{ action: <id> }` refs work. */
+function actionOutputsOf(run: WorkflowRunRecord): Record<string, ActionResult> {
+  const outputs: Record<string, ActionResult> = {};
+  for (const [id, state] of Object.entries(run.jobs)) {
+    if (state.status === "pending") continue;
+    outputs[id] = {
+      status: state.status === "skipped" || state.status === "omitted" ? "skipped" : "succeeded",
+      output: {
+        ...state.outputs,
+        ...(state.runId ? { runId: state.runId } : {}),
+        ...(state.workerId ? { workerId: state.workerId } : {}),
+      },
+      ...(state.message ? { message: state.message } : {}),
+    };
+  }
+  return outputs;
+}
+
+function stringOutput(result: ActionResult, key: string): string | undefined {
+  const value = result.output?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Only JSON-safe scalars and containers reach the expression context. */
+function jsonOutputs(result: ActionResult): Record<string, unknown> | undefined {
+  if (!result.output) return undefined;
+  const entries = Object.entries(result.output).filter(([, value]) => typeof value !== "function" && typeof value !== "symbol");
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** Outputs an agent reported for itself through `relay signal`. */
+function signalOutputs(run: RunRecord): Record<string, unknown> | undefined {
+  const value = run.worker?.metadata?.outputs;
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }

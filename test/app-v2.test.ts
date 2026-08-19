@@ -2,6 +2,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { execa } from "execa";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { createRuntimeHandlers } from "../src/app.js";
@@ -86,6 +87,138 @@ describe("v2 app/config integration", () => {
     const repeated = await run(root, "once", "--trigger", "ready");
     expect(repeated.output).toContain("0 actions");
     expect(await new RepositoryStateStore(projectRoot).listActionExecutions()).toHaveLength(1);
+  });
+
+  it("composes a worker pipeline and reports a missing worker as skipped, not failed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-worker-app-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-worker-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    const sourceProgram = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'TASK-9',title:'Add a dev server'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "worker-app-test" },
+      sources: { queue: { use: "command", with: { discover: { command: process.execPath, args: ["-e", sourceProgram] } } } },
+      harnesses: { codex: { use: "codex" } },
+      actions: {
+        "dev-server": {
+          use: "worker-exec",
+          with: { worker: { action: "implement" }, open: "pane", name: "dev", command: "npm", args: ["run", "dev"] },
+        },
+        ask: { use: "worker-send", with: { text: "New guidance on {{item.id}}: {{item.title}}" } },
+        review: {
+          use: "launch",
+          with: { harness: "codex", mode: "interactive", workspace: { fromAction: "implement" }, prompt: "Review {{item.id}}" },
+        },
+      },
+      triggers: [{ id: "ask-worker", source: "queue", actions: ["ask"], fire: { policy: "every-poll" } }],
+      execution: { adapter: "tmux", tmuxSession: "task-relay-worker-app-test" },
+      logging: { level: "silent", pretty: false },
+    }));
+
+    const preview = await run(root, "trigger", "test", "ask-worker");
+    expect(preview.errors).toBe("");
+    expect(preview.output).toContain("Actions: ask (worker-send)");
+    expect(preview.output).toContain("TASK-9  Add a dev server");
+
+    // No worker exists for the item, so the action is a clean skip. Nothing
+    // reaches tmux, and the pipeline does not fail.
+    const tick = await run(root, "once", "--trigger", "ask-worker");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("0 action failures");
+    expect(tick.output).toContain("No matching worker is running.");
+  });
+
+  it("applies launch rules to an external action that wraps workers.launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-external-launch-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-external-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    // A plugin Relay cannot inspect statically: its `use` is not "launch", so
+    // only the request-level check can catch the unknown harness.
+    await writeFile(join(root, "wrap-launch.mjs"), [
+      "export default {",
+      "  kind: 'action',",
+      "  use: 'wrap-launch',",
+      "  configSchema: { parse: (value) => value ?? {} },",
+      "  async execute(context) {",
+      "    return context.workers.launch({ harness: 'not-configured', mode: 'oneshot', prompt: 'go' });",
+      "  },",
+      "};",
+    ].join("\n"));
+    const sourceProgram = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'TASK-7',title:'Wrapped launch'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "external-launch-test" },
+      sources: { queue: { use: "command", with: { discover: { command: process.execPath, args: ["-e", sourceProgram] } } } },
+      harnesses: { codex: { use: "codex" } },
+      actions: { implement: { use: "./wrap-launch.mjs", with: {} } },
+      triggers: [{ id: "ready", source: "queue", actions: ["implement"] }],
+      logging: { level: "silent", pretty: false },
+    }));
+
+    const tick = await run(root, "once", "--trigger", "ready");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("1 action failures");
+    expect(tick.output).toContain("unknown harness 'not-configured'");
+    expect(tick.output).toContain("Configured harnesses: codex.");
+  });
+
+  it("launches a worker through an external harness plugin", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-harness-plugin-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-harness-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    const marker = join(root, "harness-launched.json");
+
+    // A harness plugin owns its own process. Relay hands it a rendered prompt
+    // and a workspace, and records the WorkerHandle it returns.
+    await writeFile(join(root, "harness.mjs"), [
+      "import { writeFileSync } from 'node:fs';",
+      "export default {",
+      "  kind: 'harness',",
+      "  use: 'fixture-harness',",
+      "  configSchema: { parse: (value) => value ?? {} },",
+      "  async launch(request) {",
+      `    writeFileSync(${JSON.stringify(marker)}, JSON.stringify({`,
+      "      workerId: request.workerId, prompt: request.prompt, model: request.model,",
+      "      workspace: request.workspace.path, config: request.config,",
+      "    }));",
+      "    return { id: request.workerId, startedAt: '2026-08-19T00:00:00.000Z' };",
+      "  },",
+      "  async wait() { return { status: 'succeeded' }; },",
+      "  async stop() {},",
+      "};",
+    ].join("\n"));
+
+    const discover = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'ENG-8',title:'Harness plugin task'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "harness-plugin-test" },
+      sources: { queue: { uses: "command", with: { discover: { command: process.execPath, args: ["-e", discover] } } } },
+      harnesses: { custom: { uses: "./harness.mjs", with: { flavour: "configured" } } },
+      actions: { implement: { uses: "launch", with: { harness: "custom", model: "some-model", prompt: "Do {{key}} in {{workspace}}" } } },
+      triggers: [{ id: "ready", source: "queue", actions: ["implement"] }],
+      // A harness plugin starts its own process, so no tmux adapter is needed.
+      execution: { adapter: "process" },
+      workspace: { adapter: "git-worktree", directory: ".task-relay/workspaces", baseBranch: "main" },
+      logging: { level: "silent", pretty: false },
+    }));
+
+    // A worker needs a real workspace, so the fixture needs a real repository.
+    for (const args of [["init", "-b", "main"], ["config", "user.email", "relay@example.invalid"], ["config", "user.name", "Relay Test"], ["commit", "--allow-empty", "-m", "init"]]) {
+      await execa("git", ["-C", root, ...args]);
+    }
+
+    const tick = await run(root, "once", "--trigger", "ready");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("1 workers launched");
+
+    const launched = JSON.parse(await readFile(marker, "utf8")) as Record<string, unknown>;
+    expect(launched.workerId).toBe("ENG-8:custom");
+    expect(launched.model).toBe("some-model");
+    expect(launched.config).toEqual({ flavour: "configured" });
+    expect(launched.prompt).toContain("Do ENG-8 in ");
   });
 
   it("normalizes v1 files and reloads the v2 document printed by init dry-run", async () => {

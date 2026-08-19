@@ -113,3 +113,86 @@ describe("TmuxExecutionAdapter", () => {
     }
   });
 });
+
+describe("TmuxExecutionAdapter worker runtime", () => {
+  it("opens, reads, and closes a pane beside a running worker", async (context) => {
+    const session = `task-relay-pane-${randomUUID()}`;
+    const directory = await mkdtemp(join(tmpdir(), "task-relay-pane-"));
+    const adapter = new TmuxExecutionAdapter({ session });
+    try {
+      const probe = await execa("tmux", ["has-session", "-t", session], { reject: false });
+      if (probe.stderr.includes("Operation not permitted")) return context.skip();
+
+      const execution = await adapter.execute({
+        command: "sh",
+        args: ["-c", "sleep 5"],
+        cwd: directory,
+        env: {},
+        workerName: "ENG-500",
+      });
+      const worker: WorkerHandle = {
+        id: "pane-worker",
+        startedAt: "now",
+        metadata: { tmux: execution.tmux, workspace: directory },
+      };
+      expect(adapter.capabilities).toEqual({ children: true, input: true, capture: true });
+
+      const child = await adapter.open(worker, { command: "sh", args: ["-c", "echo relay-pane-marker; sleep 5"], open: "pane", name: "dev" });
+      expect(child.kind).toBe("pane");
+      expect(child.target).toMatch(/^%\d+$/);
+      expect(await adapter.exists(worker, child.target)).toBe(true);
+
+      // The pane runs its own shell, so allow it a moment to print.
+      let output = "";
+      for (let attempt = 0; attempt < 40 && !output.includes("relay-pane-marker"); attempt += 1) {
+        await delay(25);
+        output = await adapter.capture(worker, { child: child.target });
+      }
+      expect(output).toContain("relay-pane-marker");
+
+      // The pane belongs to the worker's own window, so the worker survives it.
+      await adapter.closeChild(worker, child);
+      expect(await adapter.exists(worker, child.target)).toBe(false);
+      expect(await adapter.exists(worker)).toBe(true);
+    } finally {
+      await execa("tmux", ["kill-session", "-t", session], { reject: false });
+    }
+  });
+
+  it("opens a separate window and refuses to control a worker it never started", async (context) => {
+    const session = `task-relay-window-${randomUUID()}`;
+    const directory = await mkdtemp(join(tmpdir(), "task-relay-window-"));
+    const adapter = new TmuxExecutionAdapter({ session });
+    try {
+      const probe = await execa("tmux", ["has-session", "-t", session], { reject: false });
+      if (probe.stderr.includes("Operation not permitted")) return context.skip();
+
+      const execution = await adapter.execute({ command: "sh", args: ["-c", "sleep 5"], cwd: directory, env: {}, workerName: "ENG-501" });
+      const worker: WorkerHandle = { id: "window-worker", startedAt: "now", metadata: { tmux: execution.tmux, workspace: directory } };
+
+      const child = await adapter.open(worker, { command: "sh", args: ["-c", "sleep 5"], open: "window", name: "review" });
+      expect(child.kind).toBe("window");
+      expect(child.target).toMatch(/^@\d+$/);
+      expect(child.target).not.toBe(execution.tmux?.target);
+      await adapter.closeChild(worker, child);
+      expect(await adapter.exists(worker, child.target)).toBe(false);
+
+      const foreign: WorkerHandle = { id: "not-a-tmux-worker", startedAt: "now", metadata: { pid: 1 } };
+      await expect(adapter.open(foreign, { command: "sh", open: "pane" })).rejects.toThrow(/no tmux target/);
+    } finally {
+      await execa("tmux", ["kill-session", "-t", session], { reject: false });
+    }
+  });
+});
+
+describe("DirectProcessAdapter worker runtime", () => {
+  it("reports no live-worker capabilities and names the fix", async () => {
+    const adapter = new DirectProcessAdapter();
+    const worker: WorkerHandle = { id: "direct", startedAt: "now", metadata: { pid: process.pid } };
+    expect(adapter.capabilities).toEqual({ children: false, input: false, capture: false });
+    expect(await adapter.exists(worker)).toBe(true);
+    await expect(adapter.open(worker, { command: "npm", open: "pane" })).rejects.toThrow(/execution\.adapter: tmux/);
+    await expect(adapter.sendInput()).rejects.toThrow(/execution\.adapter: tmux/);
+    await expect(adapter.capture()).rejects.toThrow(/execution\.adapter: tmux/);
+  });
+});
