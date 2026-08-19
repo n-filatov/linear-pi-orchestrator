@@ -114,6 +114,24 @@ export interface WorkflowJobDefinition {
   /** GitHub Actions expression. Defaults to `success()` when omitted. */
   if?: string;
   continueOnError?: boolean;
+  /**
+   * The name this job was declared under. A matrix job expands into several
+   * instances that share one group, so `needs: implement` can mean "every
+   * instance of implement" without the author naming them.
+   */
+  group?: string;
+  /** Matrix values bound to this instance, exposed to `${{ matrix.* }}`. */
+  matrix?: Record<string, unknown>;
+  /** Milliseconds after which this job alone is failed. */
+  timeoutMs?: number;
+}
+
+/** At most one run per group is live at a time. */
+export interface WorkflowConcurrency {
+  /** Rendered per item, so a group may be workflow-wide or per-ticket. */
+  group: string;
+  /** Stop the older run rather than skipping the new one. */
+  cancelInProgress: boolean;
 }
 
 /** A named, ordered set of jobs evaluated for every item its source matches. */
@@ -130,6 +148,7 @@ export interface WorkflowDefinition {
   metadata?: Record<string, unknown>;
   /** Milliseconds after which a run with unsatisfiable jobs is failed. */
   timeoutMs?: number;
+  concurrency?: WorkflowConcurrency;
   /** Declaration order. `needs` refines it; it does not replace it. */
   jobs: readonly WorkflowJobDefinition[];
 }
@@ -167,6 +186,8 @@ export interface WorkflowRunRecord {
   completedAt?: string;
   /** Absolute deadline. A run that passes it is failed rather than left pending. */
   timeoutAt?: string;
+  /** Rendered concurrency group, so live runs can be compared without the config. */
+  concurrencyGroup?: string;
 }
 
 /** A narrow, generation-safe patch applied to one job inside one run. */
@@ -184,7 +205,11 @@ export interface WorkflowJobTransition {
 
 export interface WorkflowRunStore {
   /** Returns the open run for this identity, creating it when none exists. */
-  openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string }): Promise<WorkflowRunRecord>;
+  openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string; concurrencyGroup?: string }): Promise<WorkflowRunRecord>;
+  /** Live runs sharing a concurrency group, so a new one can yield or cancel. */
+  findRunningInGroup(repository: RepositoryScope, group: string): Promise<readonly WorkflowRunRecord[]>;
+  /** Clears terminal job states so a run can be advanced again. */
+  retryWorkflowJobs(identity: WorkflowRunIdentity, jobIds: readonly string[] | undefined, at: string): Promise<WorkflowRunRecord | undefined>;
   findWorkflowRun(identity: WorkflowRunIdentity): Promise<WorkflowRunRecord | undefined>;
   /** Highest occurrence recorded for a workflow and item, used to open a rerun. */
   latestWorkflowRun(identity: Omit<WorkflowRunIdentity, "occurrence">): Promise<WorkflowRunRecord | undefined>;

@@ -316,7 +316,7 @@ export class RepositoryStateStore implements RunStore, WorkflowRunStore {
 
   // ── Workflow runs ─────────────────────────────────────────────────────────
 
-  async openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string }): Promise<WorkflowRunRecord> {
+  async openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string; concurrencyGroup?: string }): Promise<WorkflowRunRecord> {
     this.ensure();
     const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
     try {
@@ -333,6 +333,7 @@ export class RepositoryStateStore implements RunStore, WorkflowRunStore {
         startedAt: input.startedAt,
         updatedAt: input.startedAt,
         ...(input.timeoutAt ? { timeoutAt: input.timeoutAt } : {}),
+        ...(input.concurrencyGroup ? { concurrencyGroup: input.concurrencyGroup } : {}),
       };
       state.workflows[id] = created;
       await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
@@ -391,6 +392,36 @@ export class RepositoryStateStore implements RunStore, WorkflowRunStore {
       run.status = status;
       run.completedAt = completedAt;
       run.updatedAt = completedAt;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return run;
+    } finally { await release(); }
+  }
+
+  async findRunningInGroup(repository: RepositoryScope, group: string): Promise<readonly WorkflowRunRecord[]> {
+    return Object.values((await this.snapshot()).workflows)
+      .filter((run) => run.status === "running" && run.concurrencyGroup === group && sameRepository(run.identity.repository, repository))
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  }
+
+  async retryWorkflowJobs(identity: WorkflowRunIdentity, jobIds: readonly string[] | undefined, at: string): Promise<WorkflowRunRecord | undefined> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const run = state.workflows[createWorkflowRunKey(identity)];
+      if (!run) return undefined;
+      const wanted = jobIds && jobIds.length > 0 ? new Set(jobIds) : undefined;
+      for (const [jobId, job] of Object.entries(run.jobs)) {
+        // Only settled jobs are reset. A live worker keeps its state, so a retry
+        // never orphans one or double-launches beside it.
+        if (wanted && !wanted.has(jobId)) continue;
+        if (!isTerminalJobStatus(job.status)) continue;
+        run.jobs[jobId] = { ...job, status: "pending", error: undefined, message: undefined, completedAt: undefined };
+      }
+      // Reopening the run is the point: a finished run does not advance.
+      run.status = "running";
+      run.completedAt = undefined;
+      run.updatedAt = at;
       await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
       return run;
     } finally { await release(); }

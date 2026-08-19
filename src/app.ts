@@ -3,13 +3,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import pRetry from "p-retry";
 import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js";
-import type { RelayActionReference, RelayConfigV2, RelayTriggerV2, RelayWorkflowV2 } from "./config/index.js";
+import type { RelayActionReference, RelayConfigV2, RelayTriggerV2, RelayWorkflowJobV2, RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
 import type { AgentLauncher, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, type AgentModelProfile, type CommandAgentProfile, type ConfiguredHarnessPlugin } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
-import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
+import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findInstalledPlugin, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
+import { loadReusableWorkflow } from "./config/reusable.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
@@ -211,9 +212,19 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
     .map((trigger) => domainTrigger(context.config, trigger, repository));
-  const workflows = Object.entries(context.config.workflows)
-    .filter(([id]) => !filters.trigger || id === filters.trigger)
-    .map(([id, workflow]) => domainWorkflow(context.config, id, workflow, repository));
+  const lock = await readPluginLock();
+  const packageDirectory = (name: string) => {
+    const installed = findInstalledPlugin(lock, name);
+    return installed ? path.dirname(installed.entry).replace(/\/dist$/, "") : undefined;
+  };
+  const workflows: WorkflowDefinition[] = [];
+  for (const [id, workflow] of Object.entries(context.config.workflows)) {
+    if (filters.trigger && id !== filters.trigger) continue;
+    const reusable = workflow.use
+      ? await loadReusableWorkflow({ specifier: workflow.use, projectRoot: context.projectRoot, with: workflow.with, lookup: packageDirectory, subject: `Workflow '${id}'` })
+      : undefined;
+    workflows.push(domainWorkflow(context.config, id, workflow, repository, reusable?.jobs));
+  }
   if (filters.trigger && triggers.length === 0 && workflows.length === 0) throw new Error(`Unknown trigger or workflow '${filters.trigger}'.`);
   for (const trigger of triggers) {
     for (const action of trigger.actions ?? []) plugins.parseActionConfig(action.use, action.config ?? {});
@@ -293,29 +304,41 @@ function domainTrigger(config: RelayConfigV2, trigger: RelayTriggerV2, repositor
  * `use` may name a reusable `actions:` entry or a plugin directly, so the same
  * action can be shared by several workflows without being copied.
  */
-export function domainWorkflow(config: RelayConfigV2, id: string, workflow: RelayWorkflowV2, repository: RepositoryScope): WorkflowDefinition {
+export function domainWorkflow(config: RelayConfigV2, id: string, workflow: RelayWorkflowV2, repository: RepositoryScope, declared?: Record<string, RelayWorkflowJobV2>): WorkflowDefinition {
   const source = config.sources[workflow.on.source];
   if (source?.use === "linear" && !isLinearTriggerSelector(workflow.on.match)) {
     throw new Error(`Workflow '${id}' has an invalid Linear match configuration.`);
   }
-  const jobs = Object.entries(workflow.jobs)
+  const declaredJobs = declared ?? workflow.jobs;
+  if (!declaredJobs) throw new Error(`Workflow '${id}' declares no jobs.`);
+
+  const jobs = Object.entries(declaredJobs)
     .filter(([, job]) => job.enabled)
-    .map(([jobId, job]): WorkflowJobDefinition => {
+    .flatMap(([jobId, job]): WorkflowJobDefinition[] => {
       const reused = config.actions[job.use];
       const use = reused?.use ?? job.use;
-      const merged = reused ? { ...asRecord(reused.with), ...asRecord(job.with) } : job.with;
-      if (use === "launch") {
-        const launchConfig = asRecord(merged);
-        validateLaunchRequest(config, { harness: stringValue(launchConfig.harness) ?? "", mode: launchConfig.mode as LaunchWorkerActionRequest["mode"] }, `Job '${jobId}' in workflow '${id}'`);
-      }
-      return {
-        id: jobId,
-        use,
-        config: merged,
-        needs: parseNeeds(job.needs),
-        ...(job.if ? { if: job.if } : {}),
-        continueOnError: job.continueOnError,
-      };
+      const base = reused ? { ...asRecord(reused.with), ...asRecord(job.with) } : job.with;
+      // A matrix job becomes one instance per combination, all sharing the
+      // declared name as their group so `needs: <name>` still addresses them all.
+      return matrixCombinations(job.strategy?.matrix).map((values): WorkflowJobDefinition => {
+        const instanceId = values ? `${jobId} (${describeMatrix(values)})` : jobId;
+        const resolved = values ? bindMatrix(base, values) : base;
+        if (use === "launch") {
+          const launchConfig = asRecord(resolved);
+          validateLaunchRequest(config, { harness: stringValue(launchConfig.harness) ?? "", mode: launchConfig.mode as LaunchWorkerActionRequest["mode"] }, `Job '${instanceId}' in workflow '${id}'`);
+        }
+        return {
+          id: instanceId,
+          group: jobId,
+          use,
+          config: resolved,
+          needs: parseNeeds(job.needs),
+          ...(job.if ? { if: job.if } : {}),
+          ...(values ? { matrix: values } : {}),
+          ...(job.timeoutMinutes ? { timeoutMs: job.timeoutMinutes * 60_000 } : {}),
+          continueOnError: job.continueOnError,
+        };
+      });
     });
   if (jobs.length === 0) throw new Error(`Workflow '${id}' has no enabled jobs.`);
   return {
@@ -328,6 +351,7 @@ export function domainWorkflow(config: RelayConfigV2, id: string, workflow: Rela
     maxConcurrent: workflow.maxConcurrent || config.execution.maxConcurrent,
     targets: workflow.targets,
     timeoutMs: workflow.timeoutMinutes * 60_000,
+    ...(workflow.concurrency ? { concurrency: { group: workflow.concurrency.group, cancelInProgress: workflow.concurrency.cancelInProgress } } : {}),
     metadata: {
       baseBranch: config.workspace.baseBranch,
       branchTemplate: config.workspace.branchTemplate || `${config.workspace.branchPrefix}/{{key}}-{{slug}}`,
@@ -336,8 +360,40 @@ export function domainWorkflow(config: RelayConfigV2, id: string, workflow: Rela
   };
 }
 
+/** The cartesian product of a matrix, or a single undefined for a plain job. */
+function matrixCombinations(matrix: Record<string, readonly (string | number | boolean)[]> | undefined): (Record<string, unknown> | undefined)[] {
+  if (!matrix) return [undefined];
+  const names = Object.keys(matrix);
+  if (names.length === 0) return [undefined];
+  let combinations: Record<string, unknown>[] = [{}];
+  for (const name of names) {
+    combinations = combinations.flatMap((partial) => matrix[name].map((value) => ({ ...partial, [name]: value })));
+  }
+  return combinations;
+}
+
+function describeMatrix(values: Record<string, unknown>): string {
+  return Object.entries(values).map(([key, value]) => `${key}=${String(value)}`).join(", ");
+}
+
+/** Substitutes `${{ matrix.name }}` through a job's configuration. */
+function bindMatrix(value: unknown, values: Record<string, unknown>): unknown {
+  if (typeof value === "string") {
+    return value.replace(/\$\{\{\s*matrix\.([A-Za-z0-9_.:-]+)\s*\}\}/g, (whole, name: string) => {
+      const bound = values[name];
+      if (bound === undefined) throw new Error(`Matrix has no value named '${name}'.`);
+      return String(bound);
+    });
+  }
+  if (Array.isArray(value)) return value.map((entry) => bindMatrix(entry, values));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, bindMatrix(entry, values)]));
+  }
+  return value;
+}
+
 /** Accepts `implement`, `implement.Started`, and the explicit object form. */
-function parseNeeds(needs: RelayWorkflowV2["jobs"][string]["needs"]): WorkflowNeed[] {
+function parseNeeds(needs: RelayWorkflowJobV2["needs"]): WorkflowNeed[] {
   const list = needs === undefined ? [] : Array.isArray(needs) ? needs : [needs];
   return list.map((need) => {
     if (typeof need !== "string") return need.status ? { job: need.job, status: need.status } : { job: need.job };
@@ -459,12 +515,12 @@ async function pluginRegistry(config: RelayConfigV2, projectRoot: string, select
   const sourceIds = new Set([...triggers.map((trigger) => trigger.source), ...workflows.map(([, workflow]) => workflow.on.source)]);
   const namedActions = new Set<string>();
   for (const trigger of triggers) for (const action of trigger.actions) if (typeof action === "string") namedActions.add(action);
-  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs)) if (config.actions[job.use]) namedActions.add(job.use);
+  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs ?? {})) if (config.actions[job.use]) namedActions.add(job.use);
 
   for (const [id, source] of Object.entries(config.sources)) if (sourceIds.has(id) && !BUILT_IN_SOURCES.has(source.use)) externalUses.add(source.use);
   for (const harness of Object.values(config.harnesses)) if (!isCommandHarness(harness)) externalUses.add(harness.use);
   for (const [id, action] of Object.entries(config.actions)) if (namedActions.has(id) && !registry.action(action.use)) externalUses.add(action.use);
-  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs)) if (!registry.action(job.use) && !config.actions[job.use]) externalUses.add(job.use);
+  for (const [, workflow] of workflows) for (const job of Object.values(workflow.jobs ?? {})) if (!registry.action(job.use) && !config.actions[job.use]) externalUses.add(job.use);
   for (const trigger of triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
   // Read the managed lockfile once, not once per plugin.
   const lock = externalUses.size > 0 ? await readPluginLock() : undefined;

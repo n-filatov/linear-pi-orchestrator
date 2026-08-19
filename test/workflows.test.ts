@@ -8,8 +8,10 @@ import { createRuntimeHandlers } from "../src/app.js";
 import { createRelayProgram } from "../src/cli/program.js";
 import { loadRelayConfig } from "../src/config/load.js";
 import { normalizeRelayConfig } from "../src/config/v2.js";
+import { loadReusableWorkflow } from "../src/config/reusable.js";
+import { domainWorkflow } from "../src/app.js";
 import { RepositoryStateStore } from "../src/state/store.js";
-import { decideJob, runOutcome } from "../src/workflows/reconciler.js";
+import { decideJob, jobInstances, jobTimedOut, runOutcome } from "../src/workflows/reconciler.js";
 import { RelayExpressionError, evaluateCondition } from "../src/workflows/expressions.js";
 import type { WorkflowJobDefinition, WorkflowJobState, WorkItem } from "../src/domain/index.js";
 
@@ -143,7 +145,7 @@ describe("workflow configuration", () => {
     });
     expect(config.sources.queue.use).toBe("command");
     expect((config.sources.queue.with as Record<string, unknown>).uses).toBe("left alone");
-    expect(config.workflows.feature.jobs.one.use).toBe("command");
+    expect(config.workflows.feature.jobs!.one.use).toBe("command");
   });
 
   it("rejects a dependency cycle, a self-dependency, and an unknown job", () => {
@@ -178,7 +180,148 @@ describe("workflow configuration", () => {
         },
       },
     });
-    expect(config.workflows.feature.jobs.dev.needs).toBe("implement.Started");
+    expect(config.workflows.feature.jobs!.dev.needs).toBe("implement.Started");
+  });
+});
+
+describe("matrix jobs", () => {
+  it("expands one declaration into an instance per combination, sharing a group", () => {
+    const config = normalizeRelayConfig({
+      version: 2,
+      sources: { queue: { use: "command", with: { discover: { command: "/bin/echo" } } } },
+      harnesses: { codex: { use: "codex" }, claude: { use: "claude" } },
+      workflows: {
+        race: {
+          on: { source: "queue" },
+          jobs: {
+            implement: {
+              use: "launch",
+              strategy: { matrix: { harness: ["codex", "claude"] } },
+              with: { harness: "${{ matrix.harness }}", mode: "oneshot", prompt: "go" },
+            },
+            review: { use: "command", with: { command: "/bin/echo" }, needs: "implement" },
+          },
+        },
+      },
+      execution: { adapter: "tmux" },
+    });
+    const workflow = domainWorkflow(config, "race", config.workflows.race, { id: "r", root: "/repo" });
+
+    const implement = workflow.jobs.filter((job) => job.group === "implement");
+    expect(implement.map((job) => job.id)).toEqual(["implement (harness=codex)", "implement (harness=claude)"]);
+    // The matrix value is bound into the job's own configuration.
+    expect((implement[0].config as Record<string, unknown>).harness).toBe("codex");
+    expect((implement[1].config as Record<string, unknown>).harness).toBe("claude");
+    expect(implement[0].matrix).toEqual({ harness: "codex" });
+
+    // `needs: implement` addresses the group, so the reviewer waits for both.
+    const instances = jobInstances(workflow.jobs);
+    expect(instances.get("implement")).toHaveLength(2);
+    const review = workflow.jobs.find((job) => job.id === "review")!;
+    const decide = (states: Record<string, WorkflowJobState>) =>
+      decideJob({ job: review, states, item, known: new Set(instances.keys()), instances });
+
+    expect(decide({ "implement (harness=codex)": state("succeeded") })).toMatchObject({ action: "hold" });
+    expect(decide({
+      "implement (harness=codex)": state("succeeded"),
+      "implement (harness=claude)": state("succeeded"),
+    })).toEqual({ action: "run" });
+    // One failed instance makes the whole group unsatisfiable.
+    expect(decide({
+      "implement (harness=codex)": state("succeeded"),
+      "implement (harness=claude)": state("failed"),
+    })).toMatchObject({ action: "settle", status: "omitted" });
+  });
+
+  it("fails a job that outlives its own timeout without touching the rest", () => {
+    const job: WorkflowJobDefinition = { id: "implement", use: "launch", timeoutMs: 60_000 };
+    const started = (at: string): WorkflowJobState => ({ status: "started", attempts: 1, startedAt: at });
+    expect(jobTimedOut(job, started("2026-08-19T10:00:00.000Z"), new Date("2026-08-19T10:00:30.000Z"))).toBe(false);
+    expect(jobTimedOut(job, started("2026-08-19T10:00:00.000Z"), new Date("2026-08-19T10:01:30.000Z"))).toBe(true);
+    // A job without its own deadline relies on the run's.
+    expect(jobTimedOut({ id: "x", use: "launch" }, started("2026-08-19T09:00:00.000Z"), new Date("2026-08-19T12:00:00.000Z"))).toBe(false);
+    // A settled job is never re-failed.
+    expect(jobTimedOut(job, { status: "succeeded", attempts: 1, startedAt: "2026-08-19T10:00:00.000Z" }, new Date("2026-08-19T23:00:00.000Z"))).toBe(false);
+  });
+});
+
+describe("reusable workflow files", () => {
+  async function withFile(contents: string): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-reusable-"));
+    await writeFile(join(root, "review.yaml"), contents);
+    return root;
+  }
+
+  const reviewFile = [
+    "inputs:",
+    "  harness: { required: true }",
+    "  model: { default: claude-opus-5 }",
+    "  focus: { default: correctness }",
+    "jobs:",
+    "  review:",
+    "    uses: launch",
+    "    with:",
+    "      harness: ${{ inputs.harness }}",
+    "      model: ${{ inputs.model }}",
+    "      mode: oneshot",
+    "      prompt: \"Review {{item.id}} for ${{ inputs.focus }}.\"",
+  ].join("\n");
+
+  it("binds inputs into the jobs and leaves later-stage expressions alone", async () => {
+    const root = await withFile([reviewFile, "    if: ${{ always() }}", "    needs: []"].join("\n"));
+    const loaded = await loadReusableWorkflow({
+      specifier: "./review.yaml", projectRoot: root, with: { harness: "claude", focus: "missing tests" }, subject: "Workflow 'x'",
+    });
+    const job = loaded.jobs.review;
+    const config = job.with as Record<string, string>;
+    expect(config.harness).toBe("claude");
+    expect(config.model).toBe("claude-opus-5");
+    expect(config.prompt).toBe("Review {{item.id}} for missing tests.");
+    // Handlebars and later-stage expressions survive this pass untouched.
+    expect(job.if).toBe("${{ always() }}");
+  });
+
+  it("rejects a missing required input and an input the file never declared", async () => {
+    const root = await withFile(reviewFile);
+    await expect(loadReusableWorkflow({ specifier: "./review.yaml", projectRoot: root, subject: "Workflow 'x'" }))
+      .rejects.toThrow(/requires input 'harness'/);
+    await expect(loadReusableWorkflow({ specifier: "./review.yaml", projectRoot: root, with: { harness: "claude", nope: "1" }, subject: "Workflow 'x'" }))
+      .rejects.toThrow(/declares no input named 'nope'/);
+  });
+
+  it("explains how to get a package-qualified workflow that is not installed", async () => {
+    const root = await withFile(reviewFile);
+    await expect(loadReusableWorkflow({ specifier: "@company/relay-workflows/review.yaml", projectRoot: root, subject: "Workflow 'x'" }))
+      .rejects.toThrow(/relay plugin install @company\/relay-workflows/);
+    await expect(loadReusableWorkflow({ specifier: "not-a-path", projectRoot: root, subject: "Workflow 'x'" }))
+      .rejects.toThrow(/is not a workflow file/);
+  });
+
+  it("resolves a workflow shipped inside an installed package", async () => {
+    const root = await withFile(reviewFile);
+    const loaded = await loadReusableWorkflow({
+      specifier: "@company/relay-workflows/review.yaml",
+      projectRoot: "/nowhere",
+      with: { harness: "codex" },
+      lookup: (name) => name === "@company/relay-workflows" ? root : undefined,
+      subject: "Workflow 'x'",
+    });
+    expect((loaded.jobs.review.with as Record<string, string>).harness).toBe("codex");
+  });
+
+  it("refuses a workflow that both uses a file and declares jobs", () => {
+    const base = {
+      version: 2,
+      sources: { queue: { use: "command", with: { discover: { command: "/bin/echo" } } } },
+    };
+    expect(() => normalizeRelayConfig({
+      ...base,
+      workflows: { x: { on: { source: "queue" }, uses: "./review.yaml", jobs: { a: { use: "command" } } } },
+    })).toThrow(/cannot also declare jobs/);
+    expect(() => normalizeRelayConfig({
+      ...base,
+      workflows: { x: { on: { source: "queue" } } },
+    })).toThrow(/declare 'jobs', or 'uses' a reusable workflow file/);
   });
 });
 
@@ -306,6 +449,85 @@ describe("workflow runs end to end", () => {
     expect(workflowRun.jobs.one).toMatchObject({ status: "succeeded", outputs: { reviewed: "yes" } });
     expect(workflowRun.jobs.two).toMatchObject({ status: "succeeded", outputs: { stdout: "reviewing" } });
     expect(workflowRun.status).toBe("succeeded");
+  });
+
+  it("holds a concurrency group, then cancels the older run when told to", async () => {
+    async function grouped(cancelInProgress: boolean) {
+      const root = await mkdtemp(join(tmpdir(), "task-relay-group-"));
+      process.env.XDG_STATE_HOME = await mkdtemp(join(tmpdir(), "task-relay-group-state-"));
+      const discover = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'ENG-1',title:'Add a dev server'}]}))";
+      await writeFile(join(root, ".task-relay.yaml"), stringify({
+        version: 2,
+        project: { name: "group-test" },
+        sources: { queue: { use: "command", with: { discover: { command: process.execPath, args: ["-e", discover] } } } },
+        workflows: {
+          feature: {
+            // One group for the whole workflow, so any live run holds it.
+            concurrency: { group: "feature", cancelInProgress },
+            on: { source: "queue" },
+            jobs: { one: { use: "command", with: { command: process.execPath, args: ["-e", "0"] } } },
+          },
+        },
+        logging: { level: "silent", pretty: false },
+      }));
+      const projectRoot = (await loadRelayConfig(root)).projectRoot;
+      const repository = { id: "group-test", root: projectRoot };
+      const store = new RepositoryStateStore(projectRoot);
+      // An older run for a different item is already live and holding the group.
+      const identity = { repository, workflowId: "feature", sourceId: "queue", itemId: "ENG-9", occurrence: "item" };
+      await store.openWorkflowRun({
+        identity,
+        item: { sourceId: "queue", id: "ENG-9", title: "older" },
+        startedAt: "2026-08-19T09:00:00.000Z",
+        concurrencyGroup: "feature",
+      });
+      await store.updateWorkflowJob(identity, "one", { status: "started", at: "2026-08-19T09:00:01.000Z" });
+      return { root, store, repository };
+    }
+
+    const held = await grouped(false);
+    const heldTick = await run(held.root, "once", "--trigger", "feature");
+    expect(heldTick.errors).toBe("");
+    expect(heldTick.output).toContain("Concurrency group 'feature' is held by ENG-9");
+    // The newer item yielded, so no second run was opened.
+    expect(await held.store.listWorkflowRuns(held.repository)).toHaveLength(1);
+
+    const cancelling = await grouped(true);
+    const cancelTick = await run(cancelling.root, "once", "--trigger", "feature");
+    expect(cancelTick.errors).toBe("");
+    expect(cancelTick.output).toContain("superseded in concurrency group");
+    const runs = await cancelling.store.listWorkflowRuns(cancelling.repository);
+    expect(runs).toHaveLength(2);
+    const older = runs.find((entry) => entry.identity.itemId === "ENG-9")!;
+    expect(older.status).toBe("failed");
+    expect(older.jobs.one).toMatchObject({ status: "omitted", message: "Superseded by a newer run in the same concurrency group." });
+    expect(runs.find((entry) => entry.identity.itemId === "ENG-1")!.status).toBe("succeeded");
+  });
+
+  it("reopens a finished run so a retried job can advance again", async () => {
+    const root = await project({ one: fail, two: { ...echo("after"), needs: "one" } });
+    const projectRoot = (await loadRelayConfig(root)).projectRoot;
+    const store = new RepositoryStateStore(projectRoot);
+    const repository = { id: "workflow-test", root: projectRoot };
+
+    await run(root, "once", "--trigger", "feature");
+    let [workflowRun] = await store.listWorkflowRuns(repository);
+    expect(workflowRun.status).toBe("failed");
+    expect(workflowRun.jobs.one.status).toBe("failed");
+    expect(workflowRun.jobs.two.status).toBe("omitted");
+
+    const retried = await run(root, "workflow", "retry", "feature", "ENG-1");
+    expect(retried.errors).toBe("");
+    expect(retried.output).toContain("Retrying feature for ENG-1");
+    [workflowRun] = await store.listWorkflowRuns(repository);
+    expect(workflowRun.status).toBe("running");
+    expect(workflowRun.jobs.one.status).toBe("pending");
+
+    // The job still fails, but the retry genuinely re-ran it.
+    await run(root, "once", "--trigger", "feature");
+    [workflowRun] = await store.listWorkflowRuns(repository);
+    expect(workflowRun.jobs.one.attempts).toBe(2);
+    expect(workflowRun.status).toBe("failed");
   });
 
   it("omits a job after its dependency fails, and always() still runs", async () => {

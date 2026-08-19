@@ -19,11 +19,30 @@ export interface JobDecisionInput {
   job: WorkflowJobDefinition;
   states: Readonly<Record<string, WorkflowJobState>>;
   item: WorkItem;
-  /** Names of every job in the workflow, used to reject a dependency typo. */
+  /** Declared names in the workflow, used to reject a dependency typo. */
   known: ReadonlySet<string>;
+  /** Instance ids for each declared name; a matrix job has several. */
+  instances?: ReadonlyMap<string, readonly string[]>;
 }
 
 const pending: WorkflowJobState = { status: "pending", attempts: 0 };
+
+/** Every state a declared name covers: one job, or all of a matrix's instances. */
+function instancesOf(
+  name: string,
+  states: Readonly<Record<string, WorkflowJobState>>,
+  instances: ReadonlyMap<string, readonly string[]> | undefined,
+): (WorkflowJobState | undefined)[] {
+  const ids = instances?.get(name);
+  if (!ids || ids.length === 0) return [states[name]];
+  return ids.map((id) => states[id]);
+}
+
+/** The whole group is met only when every instance is; impossible if any is. */
+function aggregate(results: readonly ("met" | "waiting" | "impossible")[]): "met" | "waiting" | "impossible" {
+  if (results.some((result) => result === "impossible")) return "impossible";
+  return results.every((result) => result === "met") ? "met" : "waiting";
+}
 
 /**
  * Decides one job's fate from persisted state alone.
@@ -42,7 +61,10 @@ export function decideJob(input: JobDecisionInput): JobDecision {
     if (!input.known.has(need.job)) {
       return { action: "settle", status: "omitted", reason: `needs unknown job '${need.job}'` };
     }
-    const satisfaction = needSatisfaction(need, input.states[need.job]);
+    // A matrix job expands into several instances sharing one group name, so a
+    // need on that name must be met by every instance, not just one.
+    const instances = instancesOf(need.job, input.states, input.instances);
+    const satisfaction = aggregate(instances.map((state) => needSatisfaction(need, state)));
     const label = `${need.job}.${need.status ?? "Succeeded"}`;
     if (satisfaction === "impossible") {
       // Only `if:` can rescue a job whose dependency can no longer be met, and
@@ -55,8 +77,8 @@ export function decideJob(input: JobDecisionInput): JobDecision {
   if (blocked.length > 0) return { action: "hold", reason: `blocked on ${blocked.join(", ")}` };
 
   if (input.job.if) {
-    const status = expressionStatus(input.job, input.states);
-    if (!evaluateCondition(input.job.if, expressionContexts(input.item, input.job, input.states), status)) {
+    const status = expressionStatus(input.job, input.states, input.instances);
+    if (!evaluateCondition(input.job.if, expressionContexts(input.item, input.job, input.states, input.instances), status)) {
       return { action: "settle", status: "skipped", reason: `if evaluated false` };
     }
     return { action: "run" };
@@ -74,11 +96,23 @@ export function expressionContexts(
   item: WorkItem,
   job: WorkflowJobDefinition,
   states: Readonly<Record<string, WorkflowJobState>>,
+  instances?: ReadonlyMap<string, readonly string[]>,
 ): Record<string, unknown> {
   const needs: Record<string, unknown> = {};
   for (const need of job.needs ?? []) {
-    const state = states[need.job] ?? pending;
-    needs[need.job] = { result: resultOf(state.status), status: state.status, outputs: state.outputs ?? {} };
+    const covered = instancesOf(need.job, states, instances).map((state) => state ?? pending);
+    // A matrix group reads as one dependency: its outputs are merged, and its
+    // result is the worst of its instances.
+    const merged: Record<string, unknown> = {};
+    for (const state of covered) Object.assign(merged, state.outputs ?? {});
+    const worst = covered.some((state) => state.status === "failed" || state.status === "omitted") ? "failure"
+      : covered.every((state) => state.status === "succeeded" || state.status === "started") ? "success"
+      : covered.every((state) => isTerminalJobStatus(state.status)) ? "skipped" : "";
+    needs[need.job] = {
+      result: covered.length === 1 ? resultOf(covered[0].status) : worst,
+      status: covered.length === 1 ? covered[0].status : worst,
+      outputs: merged,
+    };
   }
   const jobs: Record<string, unknown> = {};
   for (const [id, state] of Object.entries(states)) {
@@ -88,6 +122,7 @@ export function expressionContexts(
     item: { id: item.id, title: item.title, url: item.url ?? "", state: item.state ?? "unknown", metadata: item.metadata ?? {} },
     needs,
     jobs,
+    matrix: job.matrix ?? {},
   };
 }
 
@@ -107,10 +142,29 @@ export function resultOf(status: WorkflowJobStatus): string {
 export function expressionStatus(
   job: WorkflowJobDefinition,
   states: Readonly<Record<string, WorkflowJobState>>,
+  instances?: ReadonlyMap<string, readonly string[]>,
 ): ExpressionStatus {
-  const dependencies = (job.needs ?? []).map((need) => states[need.job]?.status ?? "pending");
+  const dependencies = (job.needs ?? []).flatMap((need) =>
+    instancesOf(need.job, states, instances).map((state) => state?.status ?? "pending"));
   const failure = dependencies.some((status) => status === "failed" || status === "omitted");
   return { success: !failure, failure, cancelled: false };
+}
+
+/** Declared name to instance ids, for a workflow whose jobs may be a matrix. */
+export function jobInstances(jobs: readonly WorkflowJobDefinition[]): Map<string, string[]> {
+  const instances = new Map<string, string[]>();
+  for (const job of jobs) {
+    const name = job.group ?? job.id;
+    instances.set(name, [...(instances.get(name) ?? []), job.id]);
+  }
+  return instances;
+}
+
+/** A job that has run longer than its own deadline, if it declared one. */
+export function jobTimedOut(job: WorkflowJobDefinition, state: WorkflowJobState | undefined, now: Date): boolean {
+  if (!job.timeoutMs || !state?.startedAt) return false;
+  if (isTerminalJobStatus(state.status)) return false;
+  return now.getTime() - new Date(state.startedAt).getTime() >= job.timeoutMs;
 }
 
 /**

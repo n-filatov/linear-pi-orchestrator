@@ -186,7 +186,7 @@ export class DashboardServer {
       source: workflow.on.source,
       fire: workflow.on.fire.policy,
       timeoutMinutes: workflow.timeoutMinutes,
-      jobs: Object.entries(workflow.jobs).map(([jobId, job]) => ({
+      jobs: Object.entries(workflow.jobs ?? {}).map(([jobId, job]) => ({
         id: jobId,
         use: job.use,
         needs: job.needs === undefined ? [] : Array.isArray(job.needs) ? job.needs : [job.needs],
@@ -227,7 +227,7 @@ export class DashboardServer {
       }
     }
     for (const [name, workflow] of Object.entries(config.workflows)) {
-      for (const [jobId, job] of Object.entries(workflow.jobs)) {
+      for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
         if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) record(job.use, `workflows.${name}.jobs.${jobId}`);
       }
     }

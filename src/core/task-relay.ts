@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   createRunKey,
+  createWorkflowRunKey,
   isTerminalWorkItem,
   type AgentLauncher,
   type RelayLogger,
@@ -26,7 +27,8 @@ import {
   isTerminalJobStatus,
   workerChildren,
 } from "../domain/index.js";
-import { decideJob, runOutcome, timedOut, type JobDecision } from "../workflows/reconciler.js";
+import { decideJob, jobInstances, jobTimedOut, runOutcome, timedOut, type JobDecision } from "../workflows/reconciler.js";
+import Handlebars from "handlebars";
 import type { ActionContext, ActionResult, LaunchWorkerActionRequest, RelayPluginRegistry, ResolvedWorker, WorkerRef } from "../plugins/index.js";
 
 export interface TriggerProvider {
@@ -197,7 +199,10 @@ export class TaskRelay {
     }
     result.itemsDiscovered += items.length;
 
-    const queue = new PQueue({ concurrency: normaliseConcurrency(workflow.maxConcurrent) });
+    // A concurrency group is checked and then claimed by opening a run. Those
+    // two steps are not atomic, so items must be reconciled one at a time when
+    // a group is configured, or two could both pass the check.
+    const queue = new PQueue({ concurrency: workflow.concurrency ? 1 : normaliseConcurrency(workflow.maxConcurrent) });
     for (const item of items) {
       void queue.add(async () => this.reconcileWorkflow(workflow, source, item, runs, result)).catch((error: unknown) => {
         this.dependencies.logger.error("Workflow reconciliation failed unexpectedly", {
@@ -218,11 +223,30 @@ export class TaskRelay {
     const occurrence = await this.workflowOccurrence(workflow, item, runs);
     const identity = { repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id, occurrence };
     const startedAt = this.now().toISOString();
+
+    // Concurrency is decided before the run is opened, so a group that is
+    // already busy never produces a second live run to reconcile.
+    const group = workflow.concurrency ? renderGroup(workflow.concurrency.group, item) : undefined;
+    if (group) {
+      const key = createWorkflowRunKey(identity);
+      const live = (await runs.findRunningInGroup(workflow.repository, group)).filter((other) => other.id !== key);
+      if (live.length > 0) {
+        if (!workflow.concurrency!.cancelInProgress) {
+          result.skipped += 1;
+          this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped",
+            `Concurrency group '${group}' is held by ${live.map((other) => other.item.id).join(", ")}.`);
+          return;
+        }
+        for (const other of live) await this.cancelWorkflowRun(workflow, other, runs, result);
+      }
+    }
+
     let run = await runs.openWorkflowRun({
       identity,
       item,
       startedAt,
       ...(workflow.timeoutMs ? { timeoutAt: new Date(this.now().getTime() + workflow.timeoutMs).toISOString() } : {}),
+      ...(group ? { concurrencyGroup: group } : {}),
     });
     if (run.status !== "running") {
       // Say so rather than returning silently: an item that keeps matching but
@@ -241,13 +265,21 @@ export class TaskRelay {
       return;
     }
 
-    const known = new Set(workflow.jobs.map((job) => job.id));
+    const instances = jobInstances(workflow.jobs);
+    const known = new Set(instances.keys());
     const outputs: Record<string, ActionResult> = actionOutputsOf(run);
     for (const job of workflow.jobs) {
       if (this.stopController.signal.aborted) break;
+      // A job with its own deadline fails alone, leaving the run to continue.
+      if (jobTimedOut(job, run.jobs[job.id], this.now())) {
+        run = await runs.updateWorkflowJob(identity, job.id, { status: "failed", error: "Job timed out.", at: this.now().toISOString() }) ?? run;
+        result.actionsFailed += 1;
+        this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "failed", `${job.id}: timed out.`);
+        continue;
+      }
       let decision: JobDecision;
       try {
-        decision = decideJob({ job, states: run.jobs, item, known });
+        decision = decideJob({ job, states: run.jobs, item, known, instances });
       } catch (error) {
         // A bad `if:` must not silently hold a workflow open for ever.
         decision = { action: "settle", status: "omitted", reason: messageFor(error) };
@@ -370,6 +402,38 @@ export class TaskRelay {
       this.recordItemOutcome(result, trigger, item, "failed", `${job.id}: ${messageFor(error)}`);
       return runs.updateWorkflowJob(identity, job.id, { status: "failed", error: messageFor(error), at: this.now().toISOString(), attempted: true });
     }
+  }
+
+  /**
+   * Stops an older run so a newer one in the same concurrency group can start.
+   * Its live workers are stopped first: leaving them running would defeat the
+   * point of cancelling, and orphan windows nothing will ever close.
+   */
+  private async cancelWorkflowRun(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+    result: TickResult,
+  ): Promise<void> {
+    const at = this.now().toISOString();
+    for (const job of workflow.jobs) {
+      const state = run.jobs[job.id];
+      if (!state || isTerminalJobStatus(state.status)) continue;
+      if (state.status === "started" && state.workerId) {
+        await this.stopWorker(workflowAsTrigger(workflow), run.item, {}, { workerId: state.workerId }).catch((error: unknown) => {
+          this.dependencies.logger.warn("Could not stop a worker while cancelling a superseded run", {
+            workflowId: workflow.id, itemId: run.identity.itemId, workerId: state.workerId, error: messageFor(error),
+          });
+        });
+      }
+      await runs.updateWorkflowJob(run.identity, job.id, { status: "omitted", message: "Superseded by a newer run in the same concurrency group.", at });
+    }
+    await runs.finishWorkflowRun(run.identity, "failed", at);
+    result.skipped += 1;
+    this.recordItemOutcome(result, workflowAsTrigger(workflow), run.item, "skipped", `Cancelled: superseded in concurrency group '${run.concurrencyGroup}'.`);
+    this.dependencies.logger.info("Workflow run cancelled by a newer run", {
+      workflowId: workflow.id, itemId: run.identity.itemId, group: run.concurrencyGroup,
+    });
   }
 
   private async expireWorkflow(
@@ -1078,6 +1142,11 @@ function workflowAsTrigger(workflow: WorkflowDefinition, jobId?: string): Trigge
     firePolicy: workflow.firePolicy,
     metadata: workflow.metadata,
   };
+}
+
+/** A concurrency group is per item unless its template says otherwise. */
+function renderGroup(template: string, item: WorkItem): string {
+  return Handlebars.compile(template, { noEscape: true })({ item, id: item.id, title: item.title });
 }
 
 /** Earlier job results, shaped as action outputs so `{ action: <id> }` refs work. */

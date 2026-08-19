@@ -113,7 +113,7 @@ async function pluginHealth(config: RelayConfigV2 | undefined): Promise<[string,
     for (const action of trigger.actions) if (typeof action !== "string" && !BUILT_IN_ACTIONS.has(action.use)) uses.add(action.use);
   }
   for (const workflow of Object.values(config.workflows)) {
-    for (const job of Object.values(workflow.jobs)) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) uses.add(job.use);
+    for (const job of Object.values(workflow.jobs ?? {})) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) uses.add(job.use);
   }
   if (uses.size === 0) return [];
 
@@ -251,6 +251,27 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
     if (!options.handlers?.workflowTest) noHandler("workflow test");
     await options.handlers.workflowTest(context, id);
   });
+  workflow.command("retry <id> <task>")
+    .description("Clear settled jobs so a workflow run advances again on the next poll.")
+    .option("--job <name>", "retry only this job (repeatable)", (value: string, previous: string[]) => [...previous, value], [])
+    .option("--occurrence <name>", "target a specific run; defaults to the most recent")
+    .action(async (id: string, task: string, flags: { job: string[]; occurrence?: string }) => {
+      const context = await resolveContext(cwd, print);
+      const repository = { id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot };
+      const runs = (await context.store.listWorkflowRuns(repository))
+        .filter((run) => run.identity.workflowId === id && run.identity.itemId.toLowerCase() === task.toLowerCase())
+        .filter((run) => !flags.occurrence || run.identity.occurrence === flags.occurrence)
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+      if (runs.length === 0) throw new Error(`No run of workflow '${id}' found for '${task}'.`);
+      const target = runs[0];
+      const updated = await context.store.retryWorkflowJobs(target.identity, flags.job, new Date().toISOString());
+      if (!updated) throw new Error(`Run ${target.identity.occurrence} of '${id}' could not be retried.`);
+      const reset = Object.entries(updated.jobs).filter(([, job]) => job.status === "pending").map(([name]) => name);
+      print(`Retrying ${id} for ${target.identity.itemId} (${target.identity.occurrence}).`);
+      print(reset.length ? `  pending: ${reset.join(", ")}` : "  nothing was settled; the run was reopened.");
+      print(`Run 'relay once --trigger ${id}' or wait for the next poll.`);
+    });
+
   workflow.command("runs").description("Show persisted workflow runs and each job's state.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => {
     const context = await resolveContext(cwd, print);
     const runs = await context.store.listWorkflowRuns({ id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot });

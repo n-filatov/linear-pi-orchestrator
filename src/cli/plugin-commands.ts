@@ -512,7 +512,7 @@ async function referencedPlugins(): Promise<Map<string, string[]>> {
     }
   }
   for (const [name, workflow] of Object.entries(config.workflows)) {
-    for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
       // A job may name a reusable action instead of a plugin.
       if (BUILT_IN_ACTIONS.has(job.use) || config.actions[job.use]) continue;
       record(job.use, `workflows.${name}.jobs.${jobName}`);

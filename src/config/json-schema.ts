@@ -89,7 +89,7 @@ export async function pluginConfigSchemas(config: RelayConfigV2, projectRoot: st
   for (const harness of Object.values(config.harnesses)) if (!BUILT_IN_HARNESSES.has(harness.use)) external.add(harness.use);
   for (const action of Object.values(config.actions)) if (!BUILT_IN_ACTIONS.has(action.use)) external.add(action.use);
   for (const workflow of Object.values(config.workflows)) {
-    for (const job of Object.values(workflow.jobs)) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) external.add(job.use);
+    for (const job of Object.values(workflow.jobs ?? {})) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) external.add(job.use);
   }
 
   const lock = external.size > 0 ? await readPluginLock() : undefined;

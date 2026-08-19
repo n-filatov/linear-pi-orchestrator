@@ -70,6 +70,12 @@ export const workflowNeedSchema = z.union([
   }).strict(),
 ]);
 
+/** One job becomes one instance per combination, all sharing its name as a group. */
+export const workflowStrategySchema = z.object({
+  matrix: z.record(identifier, z.array(z.union([z.string(), z.number(), z.boolean()])).min(1)),
+  maxParallel: z.number().int().min(1).max(32).optional(),
+}).strict();
+
 export const workflowJobSchema = z.object({
   use: pluginUse,
   with: z.unknown().optional(),
@@ -78,6 +84,31 @@ export const workflowJobSchema = z.object({
   if: z.string().min(1).optional(),
   continueOnError: z.boolean().default(false),
   enabled: z.boolean().default(true),
+  strategy: workflowStrategySchema.optional(),
+  /** Fails this job alone, leaving the rest of the run to continue. */
+  timeoutMinutes: z.number().int().min(1).max(10_080).optional(),
+}).strict();
+
+export const workflowConcurrencySchema = z.object({
+  /** Handlebars, rendered per item: `feature-{{item.id}}` is one group per ticket. */
+  group: z.string().min(1),
+  /** Stop the older run instead of skipping the new one. */
+  cancelInProgress: z.boolean().default(false),
+}).strict();
+
+/** Inputs a reusable workflow file declares, filled by the `with` that uses it. */
+export const workflowInputSchema = z.object({
+  description: z.string().optional(),
+  required: z.boolean().default(false),
+  default: z.union([z.string(), z.number(), z.boolean()]).optional(),
+}).strict();
+
+/** The shape of a standalone, reusable workflow file. */
+export const reusableWorkflowFileSchema = z.object({
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+  inputs: z.record(identifier, workflowInputSchema).default({}),
+  jobs: z.record(identifier, workflowJobSchema),
 }).strict();
 
 export const workflowSchema = z.object({
@@ -92,21 +123,42 @@ export const workflowSchema = z.object({
   targets: triggerTargetsV2Schema,
   /** A run whose jobs can no longer advance is failed rather than left pending. */
   timeoutMinutes: z.number().int().min(1).max(10_080).default(1_440),
-  jobs: z.record(identifier, workflowJobSchema),
+  concurrency: workflowConcurrencySchema.optional(),
+  /** A reusable workflow file supplying the jobs, instead of declaring them here. */
+  use: pluginUse.optional(),
+  /** Inputs passed to that file. */
+  with: z.record(identifier, z.union([z.string(), z.number(), z.boolean()])).optional(),
+  jobs: z.record(identifier, workflowJobSchema).optional(),
 }).strict().superRefine((workflow, context) => {
-  const names = new Set(Object.keys(workflow.jobs));
-  if (names.size === 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: "a workflow needs at least one job" });
-  for (const [name, job] of Object.entries(workflow.jobs)) {
+  if (!workflow.use && !workflow.jobs) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: "declare 'jobs', or 'uses' a reusable workflow file" });
+    return;
+  }
+  if (workflow.use && workflow.jobs) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: "a workflow that uses a reusable file cannot also declare jobs" });
+    return;
+  }
+  // A reusable file is validated when it is read, not here: its jobs are not
+  // in this document.
+  if (!workflow.jobs) return;
+  validateJobGraph(workflow.jobs, context, ["jobs"]);
+});
+
+/** Shared by inline workflows and reusable files, which have the same job rules. */
+export function validateJobGraph(jobs: Record<string, z.infer<typeof workflowJobSchema>>, context: z.RefinementCtx, path: (string | number)[]): void {
+  const names = new Set(Object.keys(jobs));
+  if (names.size === 0) context.addIssue({ code: z.ZodIssueCode.custom, path, message: "a workflow needs at least one job" });
+  for (const [name, job] of Object.entries(jobs)) {
     for (const [index, need] of needList(job.needs).entries()) {
       const target = typeof need === "string" ? need.split(".")[0] : need.job;
-      if (target === name) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs", name, "needs", index], message: `job '${name}' cannot need itself` });
-      else if (!names.has(target)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs", name, "needs", index], message: `unknown job '${target}'` });
+      if (target === name) context.addIssue({ code: z.ZodIssueCode.custom, path: [...path, name, "needs", index], message: `job '${name}' cannot need itself` });
+      else if (!names.has(target)) context.addIssue({ code: z.ZodIssueCode.custom, path: [...path, name, "needs", index], message: `unknown job '${target}'` });
     }
   }
-  for (const cycle of dependencyCycles(workflow.jobs)) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: `needs form a cycle: ${cycle.join(" -> ")}` });
+  for (const cycle of dependencyCycles(jobs)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path, message: `needs form a cycle: ${cycle.join(" -> ")}` });
   }
-});
+}
 
 function needList(needs: z.infer<typeof workflowJobSchema>["needs"]): readonly z.infer<typeof workflowNeedSchema>[] {
   if (needs === undefined) return [];
@@ -184,7 +236,7 @@ export const relayConfigV2Schema = z.object({
     if (ids.has(name)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name], message: `'${name}' is already used by a trigger` });
     ids.add(name);
     if (!config.sources[workflow.on.source]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name, "on", "source"], message: `unknown source '${workflow.on.source}'` });
-    for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
       // A named action is reusable across workflows; anything else is a plugin.
       if (config.actions[job.use] && !config.actions[job.use].enabled) {
         context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name, "jobs", jobName, "use"], message: `action '${job.use}' is disabled` });
@@ -198,6 +250,7 @@ export type RelayTriggerV2 = z.infer<typeof triggerV2Schema>;
 export type RelayWorkflowV2 = z.infer<typeof workflowSchema>;
 export type RelayWorkflowJobV2 = z.infer<typeof workflowJobSchema>;
 export type RelayWorkflowNeedV2 = z.infer<typeof workflowNeedSchema>;
+export type ReusableWorkflowFile = z.infer<typeof reusableWorkflowFileSchema>;
 export type RelayActionReference = z.infer<typeof triggerActionV2Schema>;
 export type WorkerTargetSelectorConfig = z.infer<typeof workerTargetSelectorSchema>;
 

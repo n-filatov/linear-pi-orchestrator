@@ -412,6 +412,63 @@ dependency cannot stall a workflow for ever.
 | `on-change` | A new run each time the item changes |
 | `every-poll` | A new run once the previous one has finished, so a reopened ticket runs again while a live one is never duplicated |
 
+### One workflow, several variants
+
+`strategy.matrix` runs one job once per combination, against the same item. Use
+it to race two harnesses on one ticket, not to fan out across tickets — that
+belongs in the source.
+
+```yaml
+jobs:
+  implement:
+    strategy:
+      matrix:
+        harness: [codex, claude]
+    uses: launch
+    with:
+      harness: ${{ matrix.harness }}
+      mode: interactive
+  review:
+    needs: implement          # waits for every instance
+    uses: launch
+    with: { harness: claude, workspace: { fromAction: implement } }
+```
+
+Each combination becomes its own job — `implement (harness=codex)` — and they
+share the declared name as a group. `needs: implement` therefore means *every*
+instance: it is met when all succeed, and becomes impossible as soon as one
+fails.
+
+### One run at a time
+
+```yaml
+workflows:
+  feature:
+    concurrency:
+      group: "feature-{{item.id}}"   # one group per ticket
+      cancelInProgress: false
+```
+
+At most one run per group is live. `cancelInProgress: false` (the default) makes
+a new item yield while another holds the group; `true` stops the older run's
+workers, marks its unfinished jobs `omitted`, and starts the new one. The group
+is a Handlebars template rendered per item, so `group: feature` is one group for
+the whole workflow and `feature-{{item.id}}` is one per ticket.
+
+### Timeouts and retries
+
+`timeoutMinutes` on a workflow fails the whole run; on a job it fails that job
+alone and lets the rest continue.
+
+```bash
+relay workflow retry feature ENG-123            # every settled job
+relay workflow retry feature ENG-123 --job review
+```
+
+Retry clears settled jobs back to `pending` and reopens the run. A job whose
+worker is still live keeps its state, so a retry never launches a second agent
+beside a running one.
+
 ### Inspecting a run
 
 ```bash
@@ -437,6 +494,48 @@ JSON at any time.
 
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
+
+### Reusing a whole workflow
+
+A workflow's jobs can live in their own file, so one definition serves several
+repositories. The file declares typed inputs; the workflow that uses it supplies
+them.
+
+```yaml
+# relay-workflows/review.yaml
+inputs:
+  harness: { required: true }
+  model: { default: claude-opus-5 }
+  focus: { default: "correctness and missing tests" }
+jobs:
+  review:
+    uses: launch
+    with:
+      harness: ${{ inputs.harness }}
+      model: ${{ inputs.model }}
+      mode: interactive
+      prompt: "Review {{item.id}}. Focus on ${{ inputs.focus }}."
+```
+
+```yaml
+workflows:
+  review-pr:
+    uses: ./relay-workflows/review.yaml
+    with: { harness: claude, focus: "security" }
+    on:
+      source: linear
+      match: { labels: { all: [relay:review] } }
+```
+
+`uses` takes a path relative to the repository, or `<package>/<file>.yaml` for a
+workflow shipped inside an installed plugin package — so a workflow versions and
+travels with the package that owns it.
+
+Inputs are substituted when the configuration loads, which is earlier than `if:`
+and `needs:` are evaluated. Only `${{ inputs.* }}` is resolved at that point:
+`${{ needs.* }}`, `${{ matrix.* }}`, and Handlebars `{{ }}` all pass through
+untouched, because they belong to later stages. A workflow either declares
+`jobs:` or uses a file — never both.
 
 ### Editor completion
 
@@ -574,6 +673,7 @@ relay config schema --write        # JSON Schema for editor completion
 relay trigger test implement-linear-issue
 relay workflow test feature       # preview a workflow's job graph
 relay workflow runs               # persisted workflow runs and job states
+relay workflow retry feature ENG-123
 relay signal ENG-123 done --output changed=true
 relay once --trigger implement-linear-issue
 relay watch --trigger implement-linear-issue
