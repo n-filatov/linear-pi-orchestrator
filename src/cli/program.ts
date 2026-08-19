@@ -186,6 +186,22 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       if (!options.handlers?.signal) noHandler("signal");
       await options.handlers.signal(context, target, outcome, { outputs, message: flags.message });
     });
+  const config = program.command("config").description("Inspect and describe this repository's configuration.");
+  config.command("schema")
+    .description(`Emit a JSON Schema for ${CONFIG_FILE}, for editor completion and validation.`)
+    .option("--write [path]", `write the schema to a file (default .task-relay.schema.json) and print the ${CONFIG_FILE} header to add`)
+    .action(async (flags: { write?: string | boolean }) => {
+      const { relayJsonSchema, schemaDirective } = await import("../config/json-schema.js");
+      const schema = relayJsonSchema();
+      if (!flags.write) { print(JSON.stringify(schema, null, 2)); return; }
+      const root = await findProjectRoot(cwd());
+      const relative = typeof flags.write === "string" ? flags.write : ".task-relay.schema.json";
+      await writeFile(resolve(root, relative), `${JSON.stringify(schema, null, 2)}\n`);
+      print(`Wrote ${resolve(root, relative)}`);
+      print(`Add this as the first line of ${CONFIG_FILE} for completion in your editor:`);
+      print(`  ${schemaDirective(`./${relative}`)}`);
+    });
+
   const workflow = program.command("workflow").description("Inspect workflow runs and their job graphs.");
   workflow.command("test <id>").description("Preview a workflow's items, jobs, and what would start now.").action(async (id: string) => {
     const context = await resolveContext(cwd, print);

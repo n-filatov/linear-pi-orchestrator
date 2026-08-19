@@ -423,6 +423,24 @@ relay workflow runs --json
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
 
+### Editor completion
+
+The configuration is data, so an editor can check it for you. Generate a JSON
+Schema from the same definitions Relay validates with:
+
+```bash
+relay config schema --write
+```
+
+Then add its first line to `.task-relay.yaml`:
+
+```yaml
+# yaml-language-server: $schema=./.task-relay.schema.json
+```
+
+Every key, enum, and default above is then completed and validated as you type.
+`relay config schema` alone prints the schema to stdout.
+
 ## Custom plugins
 
 Built-in short names such as `linear`, `launch`, `cleanup`, and `codex` are ordinary plugin names. Use a package or a local module for a custom source or action plugin:
@@ -476,6 +494,7 @@ relay status                    # sources, harnesses, actions, triggers, and run
 relay runs                      # persisted worker/run table
 relay logs --level error
 relay logs --task ENG-123 --follow
+relay config schema --write        # JSON Schema for editor completion
 relay trigger test implement-linear-issue
 relay workflow test feature       # preview a workflow's job graph
 relay workflow runs               # persisted workflow runs and job states

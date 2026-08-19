@@ -182,6 +182,27 @@ describe("workflow configuration", () => {
   });
 });
 
+describe("configuration schema", () => {
+  it("describes workflows, jobs, and needs so an editor can complete them", async () => {
+    const { relayJsonSchema, schemaDirective } = await import("../src/config/json-schema.js");
+    const schema = relayJsonSchema() as Record<string, never>;
+    const properties = schema.properties as Record<string, never>;
+    expect(Object.keys(properties)).toContain("workflows");
+
+    const workflow = (properties.workflows as Record<string, never>).additionalProperties as Record<string, never>;
+    expect(Object.keys(workflow.properties as Record<string, never>)).toEqual(
+      expect.arrayContaining(["enabled", "on", "maxConcurrent", "targets", "timeoutMinutes", "jobs"]),
+    );
+
+    const job = ((workflow.properties as Record<string, never>).jobs as Record<string, never>).additionalProperties as Record<string, never>;
+    expect(Object.keys(job.properties as Record<string, never>)).toEqual(
+      expect.arrayContaining(["use", "with", "needs", "if", "continueOnError"]),
+    );
+
+    expect(schemaDirective("./.task-relay.schema.json")).toBe("# yaml-language-server: $schema=./.task-relay.schema.json");
+  });
+});
+
 describe("workflow runs end to end", () => {
   function run(root: string, ...argv: string[]): Promise<{ output: string; errors: string }> {
     const stdout = new PassThrough();
