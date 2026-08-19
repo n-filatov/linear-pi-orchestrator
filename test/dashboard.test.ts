@@ -153,6 +153,30 @@ describe("dashboard API", () => {
     } finally { await app.server.stop(); }
   });
 
+  it("describes each plugin's own configuration so a form can be built from it", async () => {
+    const app = await dashboard({
+      ...workflowProject,
+      actions: { ...workflowProject.actions, ghost: { uses: "@nobody/relay-absent", with: {} } },
+    });
+    try {
+      const { body } = await app.get("/api/plugins/schemas");
+      const schemas = body.schemas as unknown as Record<string, { kind: string; schema: Record<string, never> }>;
+
+      // Built-in actions describe themselves without anything being installed.
+      expect(Object.keys(schemas)).toEqual(expect.arrayContaining(["launch", "cleanup", "command", "worker-exec", "worker-send"]));
+      const properties = (use: string) => schemas[use].schema.properties as Record<string, { enum?: string[] }>;
+      expect(Object.keys(properties("launch"))).toEqual(expect.arrayContaining(["harness", "mode", "model", "prompt", "workspace"]));
+      // Enums drive a select; the UI needs no knowledge of what a mode is.
+      expect(properties("launch").mode.enum).toEqual(["oneshot", "interactive"]);
+      expect(schemas.launch.schema.required).toEqual(["harness"]);
+      expect(properties("worker-exec").open.enum).toEqual(["pane", "window"]);
+
+      // A plugin that cannot be resolved is reported, not thrown, so the editor
+      // still opens when one of several plugins is missing.
+      expect((body.errors as unknown as Record<string, string>)["@nobody/relay-absent"]).toMatch(/Could not load plugin/);
+    } finally { await app.server.stop(); }
+  });
+
   it("serves a JSON Schema that describes workflows", async () => {
     const app = await dashboard(workflowProject);
     try {

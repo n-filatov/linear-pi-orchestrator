@@ -55,7 +55,7 @@ export function renderDashboardHtml(projectName: string): string {
   <a class="tab tab-sm font-medium" :class="mainTab === 'workers' && 'tab-active'" @click="mainTab = 'workers'">Workers</a>
   <a class="tab tab-sm font-medium" :class="mainTab === 'workflows' && 'tab-active'" @click="switchToWorkflows()">
     Workflows
-    <span class="badge badge-xs badge-ghost ml-1.5" x-show="workflows.length" x-text="workflows.length"></span>
+    <span class="badge badge-xs badge-ghost ml-1.5" x-show="workflowRuns.length" x-text="workflowRuns.length"></span>
   </a>
   <a class="tab tab-sm font-medium" :class="mainTab === 'plugins' && 'tab-active'" @click="switchToPlugins()">
     Plugins
@@ -137,14 +137,14 @@ export function renderDashboardHtml(projectName: string): string {
   <template x-if="loadingWorkflows">
     <div class="text-center py-10 text-base-content/30">Loading…</div>
   </template>
-  <template x-if="!loadingWorkflows && workflows.length === 0">
+  <template x-if="!loadingWorkflows && workflowRuns.length === 0">
     <div class="rounded-lg border border-base-300 p-8 text-center space-y-2">
       <p class="text-base-content/60 text-sm">No workflows configured.</p>
       <p class="text-base-content/40 text-xs">Add a <code class="text-primary">workflows:</code> block to run jobs in parallel or make one wait for another.</p>
     </div>
   </template>
 
-  <template x-for="wf in workflows" :key="wf.id">
+  <template x-for="wf in workflowRuns" :key="wf.id">
     <div class="rounded-lg border border-base-300 overflow-hidden">
       <div class="bg-base-200 px-4 py-2.5 flex items-center gap-3 flex-wrap">
         <span class="font-bold text-primary text-sm" x-text="wf.id"></span>
@@ -588,6 +588,174 @@ export function renderDashboardHtml(projectName: string): string {
         <button class="btn btn-sm btn-dashed btn-block gap-2 border-dashed" @click="addTrigger()">${IC.plus} Add trigger</button>
       </div>
 
+      <!-- WORKFLOWS -->
+      <div x-show="!loadingConfig && configSection === 'workflows'">
+        <div class="mb-5">
+          <h2 class="text-base font-semibold">Workflows</h2>
+          <p class="text-xs text-base-content/50 mt-1">
+            Named jobs that run in parallel or wait for each other, tracked in a durable run.
+            A job's <span class="text-primary">uses</span> may name an action above, or a plugin.
+          </p>
+        </div>
+        <div class="space-y-2 mb-3">
+          <template x-for="(w, wi) in workflows" :key="wi">
+            <div class="border border-base-300 rounded-lg overflow-hidden">
+              <div class="flex items-center gap-2 px-3 py-2 bg-base-200 cursor-pointer" @click="w.collapsed = !w.collapsed">
+                <span :class="!w.collapsed && 'rotate-90'">${IC.chevron}</span>
+                <span class="font-medium text-sm" x-text="w.key || '(unnamed)'"></span>
+                <span class="text-xs text-base-content/40" x-text="w.jobs.length + (w.jobs.length === 1 ? ' job' : ' jobs')"></span>
+                <span class="badge badge-xs badge-ghost" x-show="!w.enabled">disabled</span>
+                <div class="flex-1"></div>
+                <button class="btn btn-ghost btn-xs text-error" @click.stop="workflows.splice(wi,1)">${IC.trash}</button>
+              </div>
+              <div x-show="!w.collapsed" class="p-3 space-y-3">
+                <div class="grid grid-cols-4 gap-3">
+                  <label class="form-control">
+                    <span class="label-text text-xs uppercase tracking-wide">Name</span>
+                    <input class="input input-sm input-bordered" x-model="w.key" placeholder="feature">
+                  </label>
+                  <label class="form-control">
+                    <span class="label-text text-xs uppercase tracking-wide">Source</span>
+                    <select class="select select-sm select-bordered" x-model="w.source">
+                      <template x-for="s in sources" :key="s.key"><option :value="s.key" x-text="s.key"></option></template>
+                    </select>
+                  </label>
+                  <label class="form-control">
+                    <span class="label-text text-xs uppercase tracking-wide">Fire</span>
+                    <select class="select select-sm select-bordered" x-model="w.firePolicy">
+                      <option value="once-per-match">once-per-match</option>
+                      <option value="once-per-item">once-per-item</option>
+                      <option value="on-change">on-change</option>
+                      <option value="every-poll">every-poll</option>
+                    </select>
+                  </label>
+                  <label class="form-control">
+                    <span class="label-text text-xs uppercase tracking-wide">Timeout (min)</span>
+                    <input type="number" class="input input-sm input-bordered" x-model="w.timeoutMinutes">
+                  </label>
+                </div>
+                <label class="label cursor-pointer justify-start gap-2 py-0">
+                  <input type="checkbox" class="checkbox checkbox-xs" x-model="w.enabled">
+                  <span class="label-text text-xs">Enabled</span>
+                </label>
+                <div class="form-control">
+                  <label class="label py-1">
+                    <span class="label-text text-xs uppercase tracking-wide">Match</span>
+                    <span class="label-text-alt text-base-content/30">JSON, owned by the source plugin</span>
+                  </label>
+                  <textarea class="textarea textarea-bordered form-textarea h-24" x-model="w.matchJson" spellcheck="false"></textarea>
+                </div>
+
+                <div class="border-t border-base-300 pt-3">
+                  <div class="text-xs uppercase tracking-widest text-base-content/40 font-medium mb-2">Jobs</div>
+                  <div class="space-y-2">
+                    <template x-for="(j, ji) in w.jobs" :key="ji">
+                      <div class="border border-base-300/70 rounded">
+                        <div class="flex items-center gap-2 px-3 py-1.5 cursor-pointer" @click="j.collapsed = !j.collapsed">
+                          <span :class="!j.collapsed && 'rotate-90'">${IC.chevron}</span>
+                          <span class="font-medium text-xs" x-text="j.key || '(unnamed)'"></span>
+                          <span class="text-xs text-base-content/40" x-text="j.use"></span>
+                          <template x-for="n in (j.needs || '').split(',').map(function(x){return x.trim();}).filter(Boolean)">
+                            <span class="badge badge-xs badge-ghost" x-text="n"></span>
+                          </template>
+                          <div class="flex-1"></div>
+                          <button class="btn btn-ghost btn-xs text-error" @click.stop="w.jobs.splice(ji,1)">${IC.trash}</button>
+                        </div>
+                        <div x-show="!j.collapsed" class="px-3 pb-3 space-y-2">
+                          <div class="grid grid-cols-3 gap-2">
+                            <label class="form-control">
+                              <span class="label-text text-xs uppercase tracking-wide">Job name</span>
+                              <input class="input input-sm input-bordered" x-model="j.key" placeholder="implement">
+                            </label>
+                            <label class="form-control col-span-2">
+                              <span class="label-text text-xs uppercase tracking-wide">Uses</span>
+                              <input class="input input-sm input-bordered" list="relay-uses" x-model="j.use" @change="syncJobFields(j)" placeholder="launch">
+                            </label>
+                          </div>
+                          <div class="grid grid-cols-2 gap-2">
+                            <label class="form-control">
+                              <span class="label-text text-xs uppercase tracking-wide">Needs</span>
+                              <input class="input input-sm input-bordered" x-model="j.needs" placeholder="implement.Started, lint">
+                            </label>
+                            <label class="form-control">
+                              <span class="label-text text-xs uppercase tracking-wide">If</span>
+                              <input class="input input-sm input-bordered" x-model="j.if" placeholder="\${{ always() }}">
+                            </label>
+                          </div>
+                          <div class="flex gap-4">
+                            <label class="label cursor-pointer justify-start gap-2 py-0">
+                              <input type="checkbox" class="checkbox checkbox-xs" x-model="j.enabled">
+                              <span class="label-text text-xs">Enabled</span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-2 py-0">
+                              <input type="checkbox" class="checkbox checkbox-xs" x-model="j.continueOnError">
+                              <span class="label-text text-xs">Continue on error</span>
+                            </label>
+                          </div>
+
+                          <!-- Schema-driven configuration for the selected plugin -->
+                          <div class="border-t border-base-300/60 pt-2">
+                            <div class="flex items-center gap-2 mb-1.5">
+                              <span class="text-xs uppercase tracking-wide text-base-content/40">Configuration</span>
+                              <span class="text-xs text-base-content/30" x-show="schemaFields(j.use).length" x-text="'from ' + j.use + ' schema'"></span>
+                              <span class="text-xs text-warning" x-show="!schemaFields(j.use).length" x-text="pluginSchemaErrors[j.use] || 'no schema available — edit as JSON'"></span>
+                              <div class="flex-1"></div>
+                              <button class="btn btn-ghost btn-xs" x-show="schemaFields(j.use).length" @click="j.rawWith = !j.rawWith"
+                                x-text="j.rawWith ? 'form' : 'JSON'"></button>
+                            </div>
+
+                            <template x-if="!j.rawWith && schemaFields(j.use).length">
+                              <div class="grid grid-cols-2 gap-2">
+                                <template x-for="f in schemaFields(j.use)" :key="f.name">
+                                  <label class="form-control" :class="f.wide && 'col-span-2'">
+                                    <span class="label-text text-xs">
+                                      <span x-text="f.name"></span>
+                                      <span class="text-error" x-show="f.required">*</span>
+                                      <span class="text-base-content/30 ml-1" x-text="f.description || ''"></span>
+                                    </span>
+                                    <template x-if="f.control === 'enum'">
+                                      <select class="select select-sm select-bordered" x-model="j.with[f.name]">
+                                        <option value="">(default)</option>
+                                        <template x-for="o in f.options" :key="o"><option :value="o" x-text="o"></option></template>
+                                      </select>
+                                    </template>
+                                    <template x-if="f.control === 'boolean'">
+                                      <input type="checkbox" class="checkbox checkbox-sm mt-1" x-model="j.with[f.name]">
+                                    </template>
+                                    <template x-if="f.control === 'number'">
+                                      <input type="number" class="input input-sm input-bordered" x-model="j.with[f.name]" :placeholder="f.placeholder">
+                                    </template>
+                                    <template x-if="f.control === 'text'">
+                                      <input class="input input-sm input-bordered" x-model="j.with[f.name]" :placeholder="f.placeholder">
+                                    </template>
+                                    <template x-if="f.control === 'multiline' || f.control === 'list' || f.control === 'json'">
+                                      <textarea class="textarea textarea-bordered form-textarea h-20" x-model="j.with[f.name]" spellcheck="false" :placeholder="f.placeholder"></textarea>
+                                    </template>
+                                  </label>
+                                </template>
+                              </div>
+                            </template>
+
+                            <template x-if="j.rawWith || !schemaFields(j.use).length">
+                              <textarea class="textarea textarea-bordered form-textarea h-28 w-full" x-model="j.withJson" spellcheck="false" placeholder="{}"></textarea>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                  <button class="btn btn-xs btn-dashed btn-block gap-2 border-dashed mt-2" @click="addJob(w)">${IC.plus} Add job</button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <datalist id="relay-uses">
+          <template x-for="u in knownUses()" :key="u"><option :value="u"></option></template>
+        </datalist>
+        <button class="btn btn-sm btn-dashed btn-block gap-2 border-dashed" @click="addWorkflow()">${IC.plus} Add workflow</button>
+      </div>
+
       <!-- WORKSPACE -->
       <div x-show="!loadingConfig && configSection === 'workspace'">
         <div class="mb-5">
@@ -847,11 +1015,12 @@ function relay() {
     configSections: [
       {id:'project',label:'Project'},{id:'sources',label:'Sources'},
       {id:'harnesses',label:'Harnesses'},{id:'actions',label:'Actions'},
-      {id:'triggers',label:'Triggers'},{id:'workspace',label:'Workspace'},
+      {id:'triggers',label:'Triggers'},{id:'workflows',label:'Workflows'},{id:'workspace',label:'Workspace'},
       {id:'execution',label:'Execution'},{id:'logging',label:'Logging'},
     ],
     project: {name:''},
-    sources: [], harnesses: [], actions: [], triggers: [],
+    sources: [], harnesses: [], actions: [], triggers: [], workflows: [],
+    pluginSchemas: {}, pluginSchemaErrors: {},
     workspace: {adapter:'wt',directory:'.task-relay/workspaces',baseBranch:'main',branchPrefix:'relay',branchTemplate:''},
     execution: {maxConcurrent:2,retries:2,adapter:'tmux',tmuxSession:'',tmuxWindowName:''},
     logging: {level:'info',pretty:true},
@@ -859,7 +1028,7 @@ function relay() {
     /** Config keys the form does not model, preserved verbatim across a save. */
     passthrough: {},
     cleanupTarget: null, cleaningUp: false,
-    workflows: [], loadingWorkflows: true, testing: null, testOutput: null, testOutputFor: '',
+    workflowRuns: [], loadingWorkflows: true, testing: null, testOutput: null, testOutputFor: '',
     pluginsInstalled: [], pluginRefs: [], pluginDirectory: '', loadingPlugins: true,
     controlTarget: null, controlKind: 'send', controlBusy: false, controlError: '',
     controlText: '', controlSubmit: true, controlCommand: '', controlArgs: '', controlName: '', controlOpen: 'pane',
@@ -903,7 +1072,7 @@ function relay() {
     async loadWorkflows() {
       try {
         var d = await fetch('/api/workflows').then(function(r){return r.json();});
-        this.workflows = d.workflows || [];
+        this.workflowRuns = d.workflows || [];
       } catch(e) {}
       this.loadingWorkflows = false;
     },
@@ -1033,6 +1202,13 @@ function relay() {
     async loadConfig() {
       this.loadingConfig = true;
       try {
+        // Plugin schemas first: populateForm spreads saved values across the
+        // fields each schema declares, so it needs them before it runs.
+        try {
+          var ps = await fetch('/api/plugins/schemas').then(function(r){return r.json();});
+          this.pluginSchemas = ps.schemas || {};
+          this.pluginSchemaErrors = ps.errors || {};
+        } catch(e) { this.pluginSchemas = {}; this.pluginSchemaErrors = {}; }
         var d = await fetch('/api/config/json').then(function(r){return r.json();});
         this.configPath = d.path || '';
         this.populateForm(d.config);
@@ -1137,16 +1313,39 @@ function relay() {
       var ex={maxConcurrent:Number(this.execution.maxConcurrent),retries:Number(this.execution.retries),adapter:this.execution.adapter};
       if (this.execution.tmuxSession) ex.tmuxSession=this.execution.tmuxSession;
       if (this.execution.tmuxWindowName) ex.tmuxWindowName=this.execution.tmuxWindowName;
+      var workflows = {};
+      for (var i=0;i<this.workflows.length;i++) {
+        var w=this.workflows[i]; if (!w.key) continue;
+        var match={}; try{match=JSON.parse(w.matchJson||'{}');}catch(e){throw new Error('Workflow "'+w.key+'" match JSON: '+e.message);}
+        var jobs={};
+        for (var k=0;k<w.jobs.length;k++) {
+          var j=w.jobs[k]; if (!j.key) continue;
+          var job={uses:j.use,enabled:j.enabled!==false,continueOnError:!!j.continueOnError};
+          var jw=this.jobWith(j);
+          if (Object.keys(jw).length>0) job.with=jw;
+          var needs=(j.needs||'').split(',').map(function(n){return n.trim();}).filter(Boolean);
+          if (needs.length===1) job.needs=needs[0]; else if (needs.length>1) job.needs=needs;
+          if (j.if&&j.if.trim()) job.if=j.if.trim();
+          jobs[j.key]=job;
+        }
+        if (Object.keys(jobs).length===0) throw new Error('Workflow "'+w.key+'" needs at least one job.');
+        workflows[w.key]={
+          enabled:w.enabled!==false,
+          on:{source:w.source,match:match,fire:{policy:w.firePolicy}},
+          timeoutMinutes:Number(w.timeoutMinutes)||1440,
+          jobs:jobs,
+        };
+      }
       var proj={}; if (this.project.name) proj.name=this.project.name;
       // Anything this form does not model is carried through untouched. Without
       // this, saving from the form would silently delete blocks it cannot edit.
-      var built={version:2,project:proj,sources,harnesses,actions,triggers,workspace:ws,execution:ex,logging:{level:this.logging.level,pretty:this.logging.pretty}};
+      var built={version:2,project:proj,sources,harnesses,actions,triggers,workflows,workspace:ws,execution:ex,logging:{level:this.logging.level,pretty:this.logging.pretty}};
       for (var key in this.passthrough) if (Object.prototype.hasOwnProperty.call(this.passthrough,key)) built[key]=this.passthrough[key];
       return built;
     },
     populateForm(config) {
       var c=config||{};
-      var modelled={version:1,project:1,sources:1,harnesses:1,actions:1,triggers:1,workspace:1,execution:1,logging:1};
+      var modelled={version:1,project:1,sources:1,harnesses:1,actions:1,triggers:1,workflows:1,workspace:1,execution:1,logging:1};
       this.passthrough={};
       for (var key in c) if (Object.prototype.hasOwnProperty.call(c,key) && !modelled[key]) this.passthrough[key]=c[key];
       this.project={name:(c.project&&c.project.name)||''};
@@ -1179,6 +1378,47 @@ function relay() {
         var refs=(t.actions||[]).filter(function(a){return typeof a==='string';});
         return {id:t.id,source:t.source,enabled:t.enabled!==false,matchJson:t.match&&Object.keys(t.match).length?JSON.stringify(t.match,null,2):'{}',actionRefs:refs,firePolicy:(t.fire&&t.fire.policy)||'once-per-match',maxConcurrent:t.maxConcurrent||'',targetsJson:t.targets?JSON.stringify(t.targets,null,2):'',collapsed:true};
       });
+      var self=this;
+      this.workflows=Object.entries(c.workflows||{}).map(function(pair){
+        var key=pair[0],w=pair[1],on=w.on||{};
+        return {
+          key:key,
+          source:on.source||'',
+          enabled:w.enabled!==false,
+          matchJson:on.match&&Object.keys(on.match).length?JSON.stringify(on.match,null,2):'{}',
+          firePolicy:(on.fire&&on.fire.policy)||'once-per-match',
+          timeoutMinutes:w.timeoutMinutes||1440,
+          collapsed:true,
+          jobs:Object.entries(w.jobs||{}).map(function(jp){
+            var jobKey=jp[0],j=jp[1],jw=j.with||{};
+            var needs=j.needs===undefined?[]:(Array.isArray(j.needs)?j.needs:[j.needs]);
+            var job={
+              key:jobKey,
+              use:j.use,
+              needs:needs.map(function(n){return typeof n==='string'?n:(n.job+'.'+(n.status||'succeeded'));}).join(', '),
+              if:j.if||'',
+              enabled:j.enabled!==false,
+              continueOnError:!!j.continueOnError,
+              with:{},
+              withJson:Object.keys(jw).length?JSON.stringify(jw,null,2):'{}',
+              rawWith:false,
+              collapsed:true,
+            };
+            // Spread the saved values across the schema's fields where one
+            // exists, so the form opens on what is actually configured.
+            var fields=self.schemaFields(j.use);
+            if (fields.length===0) { job.rawWith=true; return job; }
+            for (var i=0;i<fields.length;i++) {
+              var f=fields[i],value=jw[f.name];
+              if (value===undefined) continue;
+              job.with[f.name]=f.control==='list'&&Array.isArray(value) ? value.join('\\n')
+                : f.control==='json'&&typeof value==='object' ? JSON.stringify(value,null,2)
+                : value;
+            }
+            return job;
+          }),
+        };
+      });
       var ws=c.workspace||{};
       this.workspace={adapter:ws.adapter||'wt',directory:ws.directory||'.task-relay/workspaces',baseBranch:ws.baseBranch||'main',branchPrefix:ws.branchPrefix||'relay',branchTemplate:ws.branchTemplate||''};
       var ex=c.execution||{};
@@ -1190,6 +1430,84 @@ function relay() {
     addHarness(){this.harnesses.push({key:'',use:'claude',withJson:'{}',collapsed:false});},
     addAction(){this.actions.push({key:'',use:'launch',enabled:true,withJson:'{}',launchHarness:this.harnesses.length?this.harnesses[0].key:'',launchMode:'interactive',launchModel:'',launchPrompt:'Implement {{item.id}}: {{item.title}}\\n\\n{{item.description}}',launchPromptFile:'',launchExtraJson:'{}',collapsed:false});},
     addTrigger(){this.triggers.push({id:'',source:this.sources.length?this.sources[0].key:'',enabled:true,matchJson:'{}',actionRefs:[],firePolicy:'once-per-match',maxConcurrent:'',targetsJson:'',collapsed:false});},
+    addWorkflow(){this.workflows.push({key:'',source:this.sources.length?this.sources[0].key:'',enabled:true,matchJson:'{}',firePolicy:'once-per-match',timeoutMinutes:1440,jobs:[],collapsed:false});},
+    addJob(w){w.jobs.push(this.blankJob('launch'));},
+    blankJob(use){return {key:'',use:use,needs:'',if:'',enabled:true,continueOnError:false,with:{},withJson:'{}',rawWith:false,collapsed:false};},
+    /** Every use a job could name: built-ins, reusable actions, and installed plugins. */
+    knownUses(){
+      var names = Object.keys(this.pluginSchemas);
+      for (var i=0;i<this.actions.length;i++) if (this.actions[i].key) names.push(this.actions[i].key);
+      return names.filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
+    },
+    /** Moving to another plugin invalidates fields shaped for the previous one. */
+    syncJobFields(job){ job.with = {}; job.withJson = '{}'; job.rawWith = false; },
+
+    /**
+     * Turns a plugin's JSON Schema into form fields. This is why an installed
+     * plugin becomes editable with no dashboard code written for it.
+     */
+    schemaFields(use){
+      var entry = this.pluginSchemas[use];
+      // A job may name a reusable action; describe the plugin behind it.
+      if (!entry) {
+        for (var i=0;i<this.actions.length;i++) {
+          if (this.actions[i].key === use) { entry = this.pluginSchemas[this.actions[i].use]; break; }
+        }
+      }
+      var schema = entry && entry.schema;
+      if (!schema || !schema.properties) return [];
+      var required = schema.required || [];
+      var fields = [];
+      for (var name in schema.properties) {
+        if (!Object.prototype.hasOwnProperty.call(schema.properties, name)) continue;
+        var p = schema.properties[name] || {};
+        var control = 'json', wide = false, options = null;
+        if (p.enum) { control = 'enum'; options = p.enum; }
+        else if (p.type === 'boolean') control = 'boolean';
+        else if (p.type === 'number' || p.type === 'integer') control = 'number';
+        else if (p.type === 'string') {
+          // Prompts and message bodies are the long strings in practice.
+          var long = /prompt|text|body|message|instructions/i.test(name);
+          control = long ? 'multiline' : 'text';
+          wide = long;
+        }
+        else if (p.type === 'array' && p.items && p.items.type === 'string') { control = 'list'; wide = true; }
+        else { control = 'json'; wide = true; }
+        fields.push({
+          name: name,
+          control: control,
+          options: options,
+          wide: wide,
+          required: required.indexOf(name) >= 0,
+          description: p.description || '',
+          placeholder: control === 'list' ? 'one per line'
+            : p.default !== undefined ? String(typeof p.default === 'object' ? JSON.stringify(p.default) : p.default) : '',
+        });
+      }
+      return fields;
+    },
+    /** Form values back to the shape the plugin's schema expects. */
+    jobWith(job){
+      var fields = this.schemaFields(job.use);
+      if (job.rawWith || fields.length === 0) {
+        try { return JSON.parse(job.withJson || '{}'); }
+        catch(e) { throw new Error('Job "'+(job.key||'?')+'" — invalid JSON: '+e.message); }
+      }
+      var out = {};
+      for (var i=0;i<fields.length;i++) {
+        var f = fields[i], value = job.with[f.name];
+        if (value === undefined || value === '' || value === null) continue;
+        if (f.control === 'number') out[f.name] = Number(value);
+        else if (f.control === 'boolean') out[f.name] = !!value;
+        else if (f.control === 'list') out[f.name] = String(value).split('\\n').map(function(v){return v.trim();}).filter(Boolean);
+        else if (f.control === 'json') {
+          try { out[f.name] = JSON.parse(String(value)); }
+          catch(e) { throw new Error('Job "'+(job.key||'?')+'" field "'+f.name+'" — invalid JSON: '+e.message); }
+        }
+        else out[f.name] = value;
+      }
+      return out;
+    },
     toggleRef(trigger,key){var idx=trigger.actionRefs.indexOf(key);if(idx>=0)trigger.actionRefs.splice(idx,1);else trigger.actionRefs.push(key);},
     filteredRuns(){return this.runs.filter((r) => this.hiddenStatuses.indexOf(r.status) < 0);},
     toggleStatus(s){var idx=this.hiddenStatuses.indexOf(s);if(idx>=0)this.hiddenStatuses.splice(idx,1);else this.hiddenStatuses.push(s);},

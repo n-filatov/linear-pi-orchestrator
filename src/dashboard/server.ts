@@ -55,6 +55,7 @@ export class DashboardServer {
       if (method === "PUT" && url.pathname === "/api/config/json") { await this.apiPutConfigJson(req, res); return; }
       if (method === "GET" && url.pathname === "/api/config/mtime") { this.apiConfigMtime(res); return; }
       if (method === "GET" && url.pathname === "/api/config/schema") { await this.apiSchema(res); return; }
+      if (method === "GET" && url.pathname === "/api/plugins/schemas") { await this.apiPluginSchemas(res); return; }
       if (method === "GET" && url.pathname === "/api/workflows") { await this.apiWorkflows(res); return; }
       if (method === "GET" && url.pathname === "/api/plugins") { await this.apiPlugins(res); return; }
       if (method === "GET" && url.pathname === "/api/events") { this.apiEvents(req, res); return; }
@@ -163,6 +164,11 @@ export class DashboardServer {
   private async apiSchema(res: http.ServerResponse): Promise<void> {
     const { relayJsonSchema } = await import("../config/json-schema.js");
     this.json(res, relayJsonSchema());
+  }
+
+  private async apiPluginSchemas(res: http.ServerResponse): Promise<void> {
+    const { pluginConfigSchemas } = await import("../config/json-schema.js");
+    this.json(res, await pluginConfigSchemas(this.context.config, this.context.projectRoot));
   }
 
   /**

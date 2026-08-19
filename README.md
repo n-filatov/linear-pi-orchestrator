@@ -428,6 +428,13 @@ project references and whether it is installed, and its Workers tab can send a
 prompt into a live worker or open a pane beside it. A live event feed streams
 the structured log at the bottom of every tab.
 
+Workflows are editable there too, under **Configuration → Workflows**. A job's
+configuration form is generated from the selected plugin's own schema, so an
+installed plugin's fields — with their types, enums, defaults, and which are
+required — appear without a line of dashboard code written for it. Anything the
+schema cannot describe falls back to a JSON editor, and a toggle switches to raw
+JSON at any time.
+
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
 
