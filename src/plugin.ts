@@ -49,7 +49,13 @@ export type {
   WorkerOpenTarget,
   WorkerRuntime,
   WorkerRuntimeCapabilities,
+  WorkflowDefinition,
+  WorkflowJobDefinition,
+  WorkflowJobState,
+  WorkflowJobStatus,
+  WorkflowNeed,
+  WorkflowRunRecord,
   Workspace,
 } from "./domain/types.js";
 
-export { isActiveRun, isTerminalWorkItem, workerChildren } from "./domain/types.js";
+export { isActiveRun, isTerminalJobStatus, isTerminalWorkItem, workerChildren } from "./domain/types.js";

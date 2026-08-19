@@ -82,6 +82,149 @@ export interface TriggerTargetDefinition {
   };
 }
 
+export type FirePolicy = "once-per-match" | "once-per-item" | "on-change" | "every-poll";
+
+/**
+ * The state of one job inside a workflow run.
+ *
+ * `started` is the state GitHub Actions has no need for and Relay cannot do
+ * without: a job that launched an agent which is still running. A dev-server
+ * pane depends on the agent having started; a review job depends on it having
+ * finished. Those are different edges, so they need different states.
+ */
+export type WorkflowJobStatus =
+  | "pending"
+  | "started"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "omitted";
+
+/** One dependency edge. An absent status means `succeeded` or `skipped`, as in Argo. */
+export interface WorkflowNeed {
+  job: string;
+  status?: "started" | "succeeded" | "failed" | "skipped";
+}
+
+export interface WorkflowJobDefinition {
+  id: string;
+  use: string;
+  config?: unknown;
+  needs?: readonly WorkflowNeed[];
+  /** GitHub Actions expression. Defaults to `success()` when omitted. */
+  if?: string;
+  continueOnError?: boolean;
+}
+
+/** A named, ordered set of jobs evaluated for every item its source matches. */
+export interface WorkflowDefinition {
+  id: string;
+  sourceId: string;
+  repository: RepositoryScope;
+  enabled: boolean;
+  /** Source-owned matching configuration, opaque to the engine. */
+  selector?: Record<string, unknown>;
+  firePolicy?: FirePolicy;
+  maxConcurrent?: number;
+  targets?: TriggerTargetDefinition;
+  metadata?: Record<string, unknown>;
+  /** Milliseconds after which a run with unsatisfiable jobs is failed. */
+  timeoutMs?: number;
+  /** Declaration order. `needs` refines it; it does not replace it. */
+  jobs: readonly WorkflowJobDefinition[];
+}
+
+export interface WorkflowJobState {
+  status: WorkflowJobStatus;
+  /** Set when this job launched a worker. */
+  runId?: string;
+  workerId?: string;
+  outputs?: Record<string, unknown>;
+  message?: string;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  attempts: number;
+}
+
+export interface WorkflowRunIdentity {
+  repository: RepositoryScope;
+  workflowId: string;
+  sourceId: string;
+  itemId: string;
+  /** Separates reruns of one workflow for one item; derived from the fire policy. */
+  occurrence: string;
+}
+
+export interface WorkflowRunRecord {
+  id: string;
+  identity: WorkflowRunIdentity;
+  item: WorkItem;
+  status: "running" | "succeeded" | "failed";
+  jobs: Record<string, WorkflowJobState>;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  /** Absolute deadline. A run that passes it is failed rather than left pending. */
+  timeoutAt?: string;
+}
+
+/** A narrow, generation-safe patch applied to one job inside one run. */
+export interface WorkflowJobTransition {
+  status: WorkflowJobStatus;
+  runId?: string;
+  workerId?: string;
+  outputs?: Record<string, unknown>;
+  message?: string;
+  error?: string;
+  at: string;
+  /** Count this evaluation as an attempt. */
+  attempted?: boolean;
+}
+
+export interface WorkflowRunStore {
+  /** Returns the open run for this identity, creating it when none exists. */
+  openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string }): Promise<WorkflowRunRecord>;
+  findWorkflowRun(identity: WorkflowRunIdentity): Promise<WorkflowRunRecord | undefined>;
+  /** Highest occurrence recorded for a workflow and item, used to open a rerun. */
+  latestWorkflowRun(identity: Omit<WorkflowRunIdentity, "occurrence">): Promise<WorkflowRunRecord | undefined>;
+  updateWorkflowJob(identity: WorkflowRunIdentity, jobId: string, transition: WorkflowJobTransition): Promise<WorkflowRunRecord | undefined>;
+  finishWorkflowRun(identity: WorkflowRunIdentity, status: "succeeded" | "failed", completedAt: string): Promise<WorkflowRunRecord | undefined>;
+  listWorkflowRuns(repository: RepositoryScope): Promise<readonly WorkflowRunRecord[]>;
+}
+
+/** A reversible key for one workflow run. */
+export function createWorkflowRunKey(identity: WorkflowRunIdentity): string {
+  return JSON.stringify([
+    identity.repository.id,
+    identity.repository.root,
+    identity.workflowId,
+    identity.sourceId,
+    identity.itemId,
+    identity.occurrence,
+  ]);
+}
+
+export function isTerminalJobStatus(status: WorkflowJobStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "skipped" || status === "omitted";
+}
+
+/** Whether a need is met, still reachable, or permanently impossible. */
+export function needSatisfaction(need: WorkflowNeed, state: WorkflowJobState | undefined): "met" | "waiting" | "impossible" {
+  const status = state?.status ?? "pending";
+  const wanted = need.status;
+  if (!wanted) {
+    if (status === "succeeded" || status === "skipped") return "met";
+    if (status === "failed" || status === "omitted") return "impossible";
+    return "waiting";
+  }
+  if (status === wanted) return "met";
+  // A job passes through each state once. Once it is terminal it can never
+  // reach a different status, so a dependency on one is impossible rather than
+  // merely unmet. `pending` and `started` can both still advance.
+  return isTerminalJobStatus(status) ? "impossible" : "waiting";
+}
+
 /** All dimensions that make a dispatch unique. */
 export interface RunIdentity {
   repository: RepositoryScope;
@@ -272,6 +415,12 @@ export interface RunStore {
    * while a pane is being opened for it, and that result must survive.
    */
   recordWorkerChild?(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined>;
+  /**
+   * Atomically merges outputs an agent reported for itself. Recorded before the
+   * run is finished, so a workflow job that reads `needs.<job>.outputs` never
+   * observes a completed job with its outputs missing.
+   */
+  recordWorkerOutputs?(identity: RunIdentity, claimedAt: string, outputs: Record<string, unknown>, recordedAt: string): Promise<RunRecord | undefined>;
   update(run: RunRecord): Promise<void>;
   listActive?(repository: RepositoryScope): Promise<readonly RunRecord[]>;
   /** Find workers created for a source item, regardless of the trigger that launched them. */

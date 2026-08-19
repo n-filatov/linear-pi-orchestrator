@@ -67,6 +67,9 @@ source item -> source-specific match -> ordered actions -> outputs/workers
 - `harnesses` declare coding-agent executors. A model is an opaque string owned by the chosen harness, so Relay does not need a stale global model allow-list.
 - `actions` are reusable units such as `launch`, `cleanup`, a Slack notification, or a company-specific action.
 - `triggers` choose a source, pass it an opaque `match`, select optional worker targets, and run named or inline actions in order.
+- `workflows` do the same, but as named jobs with `needs` and `if`, tracked in a durable run. Use one when steps must run in parallel or wait for each other; see [Workflows](#workflows-parallel-jobs-and-dependencies).
+
+`use` and `uses` are accepted interchangeably wherever a plugin is named.
 
 The core does not interpret fields under `match` or `with`. Their selected source/action/harness plugin validates them when Relay resolves that plugin.
 
@@ -287,6 +290,139 @@ templates happen to render the same name.
 
 The cleanup trigger does not need a worker ID in YAML. `targets.workers.sourceItem: current` resolves workers associated with the current source item; `runs` can be `latest`, `active`, or `all`. Cleanup only removes Relay-owned workspaces/branches and is idempotent once a worker has `workspaceCleanedAt`.
 
+## Workflows: parallel jobs and dependencies
+
+A `triggers:` entry runs its actions in order, every poll. A `workflows:` entry
+adds what that cannot express: jobs that run in parallel, jobs that wait for
+another job, and a durable record of where the whole thing got to.
+
+Relay borrows GitHub Actions' vocabulary — `jobs`, `needs`, `if`, `outputs`,
+`uses` — but not its execution model. GitHub holds a workflow run in a live
+controller and every job finishes inside it. A Relay job launches an agent that
+outlives the tick, so a workflow run is a **persisted record that each poll
+advances by one step**. Nothing blocks and nothing is held open in memory.
+
+```yaml
+workflows:
+  feature:
+    on:
+      source: linear
+      match:
+        labels: { all: [relay-implement], none: [relay:running, relay:done] }
+        assignee: me
+      fire: { policy: every-poll }
+    timeoutMinutes: 720
+    jobs:
+      implement:
+        uses: "@notwhale/relay-implement-linear"
+        with: { harness: codex, mode: interactive }
+
+      # Both of these start as soon as the agent's window exists.
+      dev-server:
+        needs: implement.Started
+        uses: worker-exec
+        with: { worker: { action: implement }, open: pane, name: dev, command: npm, args: [run, dev] }
+
+      lint:
+        needs: implement.Started
+        uses: worker-exec
+        with: { worker: { action: implement }, open: pane, name: lint, command: npm, args: [run, check] }
+
+      # This one waits for the agent to finish.
+      review:
+        needs: implement
+        if: ${{ needs.implement.outputs.changed == 'true' }}
+        uses: launch
+        with:
+          harness: claude
+          model: claude-opus-5
+          mode: interactive
+          workspace: { fromAction: implement }
+          prompt: "Review {{branch}} for {{item.id}}."
+
+      report:
+        needs: [review, lint]
+        if: ${{ always() }}
+        uses: command
+        with: { command: gh, args: [pr, comment, "--body", "review: ${{ needs.review.result }}"] }
+```
+
+### Job states
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Not started, or waiting for a dependency |
+| `started` | Launched an agent that is still running |
+| `succeeded` | Finished without error |
+| `failed` | Raised, or its agent exited non-zero |
+| `skipped` | Its `if:` was false |
+| `omitted` | A dependency can no longer be satisfied, or the run timed out |
+
+`started` is the state GitHub Actions has no need for and Relay cannot do
+without. A dev-server pane depends on the agent having **started**; a review
+agent depends on it having **finished**. Write those as `needs: implement.Started`
+and `needs: implement`.
+
+### needs
+
+`needs` takes a job name, a name with a status suffix, or a list of either.
+A bare name means `Succeeded` or `Skipped`, the same default Argo Workflows uses.
+Suffixes are `Started`, `Succeeded`, `Failed`, and `Skipped`.
+
+A dependency that can never be met settles the job as `omitted` rather than
+leaving it pending for ever — unless the job has an `if:`, which is then given
+the chance to run it anyway.
+
+### if
+
+`if:` is a GitHub Actions expression, evaluated by GitHub's own parser. `${{ }}`
+is optional. Available contexts are `item`, `needs`, and `jobs`; available status
+functions are `success()`, `failure()`, `cancelled()`, and `always()`. Omitting
+`if:` means `success()`.
+
+Two template languages, split by **when** they are evaluated:
+
+- `${{ }}` is evaluated by the scheduler, before a job starts — `if`, `needs`, `outputs`.
+- `{{ }}` is Handlebars, evaluated by the launcher when a prompt is rendered.
+
+### Telling Relay a job is done
+
+An interactive agent does not exit when it stops working, so `needs: implement`
+would never fire. End the prompt by telling the agent to report itself:
+
+```bash
+relay signal "$TASK_RELAY_WORKER_ID" done --output changed=true --output pr="$URL"
+```
+
+Relay sets `TASK_RELAY_WORKER_ID`, `TASK_RELAY_ITEM_ID`, and
+`TASK_RELAY_REPOSITORY` in every worker's environment. Outputs are recorded
+before the result, so a dependent job never sees a finished job with its outputs
+missing. `mode: oneshot` jobs need no signal — the process exit is the result.
+
+A job whose action reports "nothing to do yet" stays `pending` and is retried on
+the next poll. `timeoutMinutes` (default 1440) is the backstop: when it passes,
+every unfinished job becomes `omitted` and the run fails, so an unsatisfiable
+dependency cannot stall a workflow for ever.
+
+### Reruns
+
+| `fire.policy` | Behaviour |
+| --- | --- |
+| `once-per-item`, `once-per-match` | One run per item, ever |
+| `on-change` | A new run each time the item changes |
+| `every-poll` | A new run once the previous one has finished, so a reopened ticket runs again while a live one is never duplicated |
+
+### Inspecting a run
+
+```bash
+relay workflow test feature    # matched items, each job, and what would start now
+relay workflow runs            # every run, with each job's state and why it is blocked
+relay workflow runs --json
+```
+
+Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
+case that action's `with` is the base and the job's `with` overrides it.
+
 ## Custom plugins
 
 Built-in short names such as `linear`, `launch`, `cleanup`, and `codex` are ordinary plugin names. Use a package or a local module for a custom source or action plugin:
@@ -341,6 +477,9 @@ relay runs                      # persisted worker/run table
 relay logs --level error
 relay logs --task ENG-123 --follow
 relay trigger test implement-linear-issue
+relay workflow test feature       # preview a workflow's job graph
+relay workflow runs               # persisted workflow runs and job states
+relay signal ENG-123 done --output changed=true
 relay once --trigger implement-linear-issue
 relay watch --trigger implement-linear-issue
 relay attach ENG-123              # enter the latest matching tmux worker

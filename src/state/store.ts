@@ -3,7 +3,26 @@ import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import writeFileAtomic from "write-file-atomic";
 import { stateDirectory } from "../logging/events.js";
-import { createRunKey, isActiveRun, workerChildren, type RepositoryScope, type RunClaim, type RunIdentity, type RunRecord, type RunStore, type RunTerminalTransition, type WorkerChildHandle } from "../domain/types.js";
+import {
+  createRunKey,
+  createWorkflowRunKey,
+  isActiveRun,
+  isTerminalJobStatus,
+  workerChildren,
+  type RepositoryScope,
+  type RunClaim,
+  type RunIdentity,
+  type RunRecord,
+  type RunStore,
+  type RunTerminalTransition,
+  type WorkerChildHandle,
+  type WorkflowJobState,
+  type WorkflowJobTransition,
+  type WorkflowRunIdentity,
+  type WorkflowRunRecord,
+  type WorkflowRunStore,
+  type WorkItem,
+} from "../domain/types.js";
 
 /** JSON-safe data passed between configurable actions. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -84,13 +103,18 @@ export interface WorkerTargetLookup {
   includeCleaned?: boolean;
 }
 
-type StateData = { version: 1; runs: Record<string, RunRecord>; actions: Record<string, ActionExecutionRecord> };
+type StateData = {
+  version: 1;
+  runs: Record<string, RunRecord>;
+  actions: Record<string, ActionExecutionRecord>;
+  workflows: Record<string, WorkflowRunRecord>;
+};
 
 export { type RunRecord } from "../domain/types.js";
 export function taskStateKey(identity: RunIdentity): string { return createRunKey(identity); }
 
 /** JSON state with an advisory write lock. One file is used per repository scope. */
-export class RepositoryStateStore implements RunStore {
+export class RepositoryStateStore implements RunStore, WorkflowRunStore {
   readonly directory: string;
   readonly file: string;
   constructor(projectRoot: string) { this.directory = stateDirectory(projectRoot); this.file = join(this.directory, "state.json"); }
@@ -100,10 +124,10 @@ export class RepositoryStateStore implements RunStore {
     this.ensure();
     try {
       const value = JSON.parse(readFileSync(this.file, "utf8")) as Partial<StateData>;
-      // `actions` was added without changing the state-file version. Existing
-      // v1 repositories therefore read exactly as before, with an empty action
-      // ledger on first use.
-      return { version: 1, runs: value.runs || {}, actions: value.actions || {} };
+      // `actions` and later `workflows` were added without changing the
+      // state-file version. Existing repositories therefore read exactly as
+      // before, with empty ledgers on first use.
+      return { version: 1, runs: value.runs || {}, actions: value.actions || {}, workflows: value.workflows || {} };
     } catch { return emptyState(); }
   }
   async snapshot(): Promise<StateData> { return this.read(); }
@@ -265,6 +289,21 @@ export class RepositoryStateStore implements RunStore {
       return run;
     } finally { await release(); }
   }
+  async recordWorkerOutputs(identity: RunIdentity, claimedAt: string, outputs: Record<string, unknown>, recordedAt: string): Promise<RunRecord | undefined> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const run = state.runs[taskStateKey(identity)];
+      if (!run || run.claimedAt !== claimedAt || !run.worker) return undefined;
+      const previous = run.worker.metadata?.outputs;
+      const merged = previous !== null && typeof previous === "object" && !Array.isArray(previous) ? { ...previous, ...outputs } : { ...outputs };
+      run.worker = { ...run.worker, metadata: { ...run.worker.metadata, outputs: merged } };
+      run.updatedAt = recordedAt;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return run;
+    } finally { await release(); }
+  }
   async update(run: RunRecord): Promise<void> {
     this.ensure();
     const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
@@ -274,9 +313,97 @@ export class RepositoryStateStore implements RunStore {
   async listActive(repository: RepositoryScope): Promise<readonly RunRecord[]> {
     return (await this.listRuns()).filter((run) => isActiveRun(run.status) && run.identity.repository.id === repository.id && run.identity.repository.root === repository.root);
   }
+
+  // ── Workflow runs ─────────────────────────────────────────────────────────
+
+  async openWorkflowRun(input: { identity: WorkflowRunIdentity; item: WorkItem; startedAt: string; timeoutAt?: string }): Promise<WorkflowRunRecord> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const id = createWorkflowRunKey(input.identity);
+      const existing = state.workflows[id];
+      if (existing) return existing;
+      const created: WorkflowRunRecord = {
+        id,
+        identity: input.identity,
+        item: input.item,
+        status: "running",
+        jobs: {},
+        startedAt: input.startedAt,
+        updatedAt: input.startedAt,
+        ...(input.timeoutAt ? { timeoutAt: input.timeoutAt } : {}),
+      };
+      state.workflows[id] = created;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return created;
+    } finally { await release(); }
+  }
+
+  async findWorkflowRun(identity: WorkflowRunIdentity): Promise<WorkflowRunRecord | undefined> {
+    return (await this.snapshot()).workflows[createWorkflowRunKey(identity)];
+  }
+
+  async latestWorkflowRun(identity: Omit<WorkflowRunIdentity, "occurrence">): Promise<WorkflowRunRecord | undefined> {
+    return Object.values((await this.snapshot()).workflows)
+      .filter((run) => sameRepository(run.identity.repository, identity.repository)
+        && run.identity.workflowId === identity.workflowId
+        && run.identity.sourceId === identity.sourceId
+        && run.identity.itemId === identity.itemId)
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+  }
+
+  async updateWorkflowJob(identity: WorkflowRunIdentity, jobId: string, transition: WorkflowJobTransition): Promise<WorkflowRunRecord | undefined> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const run = state.workflows[createWorkflowRunKey(identity)];
+      if (!run) return undefined;
+      const previous: WorkflowJobState = run.jobs[jobId] ?? { status: "pending", attempts: 0 };
+      run.jobs[jobId] = {
+        ...previous,
+        status: transition.status,
+        ...(transition.runId === undefined ? {} : { runId: transition.runId }),
+        ...(transition.workerId === undefined ? {} : { workerId: transition.workerId }),
+        ...(transition.outputs === undefined ? {} : { outputs: { ...previous.outputs, ...transition.outputs } }),
+        ...(transition.message === undefined ? {} : { message: transition.message }),
+        // A retry must clear the previous attempt's error, or a job that later
+        // succeeds still reads as broken.
+        error: transition.error,
+        startedAt: previous.startedAt ?? transition.at,
+        ...(isTerminalJobStatus(transition.status) ? { completedAt: transition.at } : { completedAt: undefined }),
+        attempts: previous.attempts + (transition.attempted ? 1 : 0),
+      };
+      run.updatedAt = transition.at;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return run;
+    } finally { await release(); }
+  }
+
+  async finishWorkflowRun(identity: WorkflowRunIdentity, status: "succeeded" | "failed", completedAt: string): Promise<WorkflowRunRecord | undefined> {
+    this.ensure();
+    const release = await lockfile.lock(this.file, { retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 }, stale: 10_000 });
+    try {
+      const state = this.read();
+      const run = state.workflows[createWorkflowRunKey(identity)];
+      if (!run || run.status !== "running") return undefined;
+      run.status = status;
+      run.completedAt = completedAt;
+      run.updatedAt = completedAt;
+      await writeFileAtomic(this.file, `${JSON.stringify(state, null, 2)}\n`);
+      return run;
+    } finally { await release(); }
+  }
+
+  async listWorkflowRuns(repository: RepositoryScope): Promise<readonly WorkflowRunRecord[]> {
+    return Object.values((await this.snapshot()).workflows)
+      .filter((run) => sameRepository(run.identity.repository, repository))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
 }
 
-function emptyState(): StateData { return { version: 1, runs: {}, actions: {} }; }
+function emptyState(): StateData { return { version: 1, runs: {}, actions: {}, workflows: {} }; }
 
 function sameRepository(left: RepositoryScope, right: RepositoryScope): boolean {
   return left.id === right.id && left.root === right.root;

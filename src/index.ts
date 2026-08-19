@@ -5,6 +5,7 @@ export * from "./agents/index.js";
 export * from "./actions/index.js";
 export * from "./plugins/index.js";
 export * from "./runtime/index.js";
+export * from "./workflows/index.js";
 export * from "./workspaces/index.js";
 export * from "./config/schema.js";
 export * from "./config/load.js";

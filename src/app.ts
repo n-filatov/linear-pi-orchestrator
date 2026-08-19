@@ -3,10 +3,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import pRetry from "p-retry";
 import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js";
-import type { RelayActionReference, RelayConfigV2, RelayTriggerV2 } from "./config/index.js";
+import type { RelayActionReference, RelayConfigV2, RelayTriggerV2, RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkSource } from "./domain/index.js";
+import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, type AgentModelProfile, type CommandAgentProfile } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
 import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, loadRelayPlugin, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
@@ -16,11 +16,13 @@ import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSe
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
 import { tickTable, type TickTableRow } from "./logging/tables.js";
+import { decideJob } from "./workflows/reconciler.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
   sources: Map<string, WorkSource>;
   triggers: TriggerDefinition[];
+  workflows: WorkflowDefinition[];
   launcher: CommandAgentLauncher;
   workspace: WtWorkspaceProvider | GitWorktreeProvider;
   runStore: EventingRunStore;
@@ -78,6 +80,58 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         context.write("Dry run only; no action, source, workspace, or worker changes were made.");
       } finally { await runtime.relay.stop(); }
     },
+    signal: async (context, target, outcome, options) => {
+      const candidates = (await context.store.listRuns())
+        .filter((run) => run.id === target || run.worker?.id === target || run.item.id.toLowerCase() === target.toLowerCase())
+        .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+      if (candidates.length === 0) throw new Error(`No run or worker found for '${target}'.`);
+      const active = candidates.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
+      const selectable = active.length > 0 ? active : candidates;
+      if (selectable.length > 1) throw new Error(`More than one worker matches '${target}'. Use the exact worker id from 'relay runs --json'.`);
+      const run = selectable[0];
+      const at = new Date().toISOString();
+      // Outputs are recorded before the terminal transition: a workflow job that
+      // reads needs.<job>.outputs must never see a finished job without them.
+      const outputs = { ...options.outputs, ...(options.message ? { message: options.message } : {}) };
+      if (Object.keys(outputs).length > 0) {
+        await context.store.recordWorkerOutputs(run.identity, run.claimedAt, outputs, at);
+      }
+      if (!active.includes(run)) {
+        context.write(`${run.item.id}: worker already ${run.status}; recorded ${Object.keys(outputs).length} output(s).`);
+        return;
+      }
+      const status = outcome === "done" ? "succeeded" : "failed";
+      const finished = await context.store.finishActive(run.identity, run.claimedAt, { status, completedAt: at, ...(outcome === "failed" ? { error: options.message ?? "Worker reported failure." } : {}) });
+      if (!finished) throw new Error(`Worker for ${run.item.id} changed before its result could be recorded.`);
+      const runtime = await composeRuntime(context);
+      try {
+        const source = runtime.sources.get(run.identity.sourceId);
+        if (source) await source.report({ type: status, sourceId: source.id, run: finished, occurredAt: at, error: finished.error });
+      } finally { await runtime.relay.stop(); }
+      context.write(`${run.item.id}: recorded ${status}${Object.keys(outputs).length ? ` with ${Object.keys(outputs).length} output(s)` : ""}.`);
+    },
+    workflowTest: async (context, id) => {
+      const runtime = await composeRuntime(context, { trigger: id });
+      try {
+        const workflow = runtime.workflows[0];
+        const source = workflow && runtime.sources.get(workflow.sourceId);
+        if (!workflow || !source) throw new Error(`Workflow ${id} could not be composed.`);
+        const items = await source.discover({ trigger: { id: workflow.id, sourceId: workflow.sourceId, repository: workflow.repository, enabled: true, selector: workflow.selector } });
+        context.write(`Workflow: ${workflow.id}\nSource: ${workflow.sourceId}\nFire: ${workflow.firePolicy ?? "once-per-match"}\nMatches: ${items.length}`);
+        for (const item of items) {
+          const existing = await context.store.latestWorkflowRun({ repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id });
+          const states = existing?.jobs ?? {};
+          context.write(`  ${item.id}  ${item.title}${existing ? `  [run ${existing.identity.occurrence}: ${existing.status}]` : "  [no run yet]"}`);
+          const known = new Set(workflow.jobs.map((job) => job.id));
+          for (const job of workflow.jobs) {
+            const decision = decideJob({ job, states, item, known });
+            const detail = decision.action === "run" ? "would start now" : decision.reason;
+            context.write(`      ${job.id.padEnd(20)} ${job.use.padEnd(28)} ${detail}`);
+          }
+        }
+        context.write("Dry run only; no action, source, workspace, or worker changes were made.");
+      } finally { await runtime.relay.stop(); }
+    },
     daemon: async (context, action) => {
       const daemon = new RepositoryDaemon(context.projectRoot);
       context.write(action === "start" ? await daemon.start() : action === "stop" ? await daemon.stop() : await daemon.status());
@@ -122,13 +176,19 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
     .map((trigger) => domainTrigger(context.config, trigger, repository));
-  if (filters.trigger && triggers.length === 0) throw new Error(`Unknown trigger '${filters.trigger}'.`);
+  const workflows = Object.entries(context.config.workflows)
+    .filter(([id]) => !filters.trigger || id === filters.trigger)
+    .map(([id, workflow]) => domainWorkflow(context.config, id, workflow, repository));
+  if (filters.trigger && triggers.length === 0 && workflows.length === 0) throw new Error(`Unknown trigger or workflow '${filters.trigger}'.`);
   for (const trigger of triggers) {
     for (const action of trigger.actions ?? []) plugins.parseActionConfig(action.use, action.config ?? {});
   }
+  for (const workflow of workflows) {
+    for (const job of workflow.jobs) plugins.parseActionConfig(job.use, job.config ?? {});
+  }
 
   const sources = new Map<string, WorkSource>();
-  for (const sourceId of new Set(triggers.map((trigger) => trigger.sourceId))) {
+  for (const sourceId of new Set([...triggers.map((trigger) => trigger.sourceId), ...workflows.map((workflow) => workflow.sourceId)])) {
     const definition = context.config.sources[sourceId];
     if (!definition?.enabled) continue;
     let source = await createSource(sourceId, definition, context.projectRoot, repository, plugins);
@@ -148,6 +208,8 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const triggerProvider: TriggerProvider = { list: async () => triggers };
   const relay = new TaskRelay({
     triggers: triggerProvider,
+    workflows: { list: async () => workflows },
+    workflowRuns: context.store,
     sources: sources.values(),
     runStore: eventStore,
     workspaceProvider: workspace,
@@ -157,7 +219,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
     validateLaunch: (request, where) => validateLaunchRequest(context.config, request, `Action '${where.actionId}' in trigger '${where.triggerId}'`),
     logger: relayLogger(context.logger, repository.id),
   });
-  return { relay, sources, triggers, launcher, workspace, runStore: eventStore, plugins };
+  return { relay, sources, triggers, workflows, launcher, workspace, runStore: eventStore, plugins };
 }
 
 function domainTrigger(config: RelayConfigV2, trigger: RelayTriggerV2, repository: RepositoryScope): TriggerDefinition {
@@ -187,6 +249,69 @@ function domainTrigger(config: RelayConfigV2, trigger: RelayTriggerV2, repositor
       branchTemplate: config.workspace.branchTemplate || `${branchPrefix}/{{key}}-{{slug}}`,
     },
   };
+}
+
+/**
+ * Turns one `workflows:` entry into the engine's workflow definition. A job's
+ * `use` may name a reusable `actions:` entry or a plugin directly, so the same
+ * action can be shared by several workflows without being copied.
+ */
+export function domainWorkflow(config: RelayConfigV2, id: string, workflow: RelayWorkflowV2, repository: RepositoryScope): WorkflowDefinition {
+  const source = config.sources[workflow.on.source];
+  if (source?.use === "linear" && !isLinearTriggerSelector(workflow.on.match)) {
+    throw new Error(`Workflow '${id}' has an invalid Linear match configuration.`);
+  }
+  const jobs = Object.entries(workflow.jobs)
+    .filter(([, job]) => job.enabled)
+    .map(([jobId, job]): WorkflowJobDefinition => {
+      const reused = config.actions[job.use];
+      const use = reused?.use ?? job.use;
+      const merged = reused ? { ...asRecord(reused.with), ...asRecord(job.with) } : job.with;
+      if (use === "launch") {
+        const launchConfig = asRecord(merged);
+        validateLaunchRequest(config, { harness: stringValue(launchConfig.harness) ?? "", mode: launchConfig.mode as LaunchWorkerActionRequest["mode"] }, `Job '${jobId}' in workflow '${id}'`);
+      }
+      return {
+        id: jobId,
+        use,
+        config: merged,
+        needs: parseNeeds(job.needs),
+        ...(job.if ? { if: job.if } : {}),
+        continueOnError: job.continueOnError,
+      };
+    });
+  if (jobs.length === 0) throw new Error(`Workflow '${id}' has no enabled jobs.`);
+  return {
+    id,
+    sourceId: workflow.on.source,
+    repository,
+    enabled: workflow.enabled,
+    selector: asRecord(workflow.on.match),
+    firePolicy: workflow.on.fire.policy,
+    maxConcurrent: workflow.maxConcurrent || config.execution.maxConcurrent,
+    targets: workflow.targets,
+    timeoutMs: workflow.timeoutMinutes * 60_000,
+    metadata: {
+      baseBranch: config.workspace.baseBranch,
+      branchTemplate: config.workspace.branchTemplate || `${config.workspace.branchPrefix}/{{key}}-{{slug}}`,
+    },
+    jobs,
+  };
+}
+
+/** Accepts `implement`, `implement.Started`, and the explicit object form. */
+function parseNeeds(needs: RelayWorkflowV2["jobs"][string]["needs"]): WorkflowNeed[] {
+  const list = needs === undefined ? [] : Array.isArray(needs) ? needs : [needs];
+  return list.map((need) => {
+    if (typeof need !== "string") return need.status ? { job: need.job, status: need.status } : { job: need.job };
+    const [job, suffix] = need.split(".", 2);
+    if (!suffix) return { job };
+    const status = suffix.toLowerCase();
+    if (status !== "started" && status !== "succeeded" && status !== "failed" && status !== "skipped") {
+      throw new Error(`Unknown job status '${suffix}' in needs '${need}'. Use Started, Succeeded, Failed, or Skipped.`);
+    }
+    return { job, status };
+  });
 }
 
 function resolveActions(config: RelayConfigV2, references: readonly RelayActionReference[]): TriggerActionDefinition[] {
@@ -365,6 +490,7 @@ class EventingRunStore implements RunStore {
   async finishActive(identity: RunIdentity, claimedAt: string, transition: RunTerminalTransition): Promise<RunRecord | undefined> { const run = await this.store.finishActive(identity, claimedAt, transition); if (run) this.write(run, `run.${run.status}`); return run; }
   async markWorkspaceCleaned(identity: RunIdentity, claimedAt: string, cleanedAt: string): Promise<RunRecord | undefined> { const run = await this.store.markWorkspaceCleaned(identity, claimedAt, cleanedAt); if (run) this.write(run, "run.workspace.cleaned"); return run; }
   async recordWorkerChild(identity: RunIdentity, claimedAt: string, child: WorkerChildHandle, recordedAt: string): Promise<RunRecord | undefined> { const run = await this.store.recordWorkerChild?.(identity, claimedAt, child, recordedAt); if (run) this.write(run, "run.worker.child.opened"); return run; }
+  async recordWorkerOutputs(identity: RunIdentity, claimedAt: string, outputs: Record<string, unknown>, recordedAt: string): Promise<RunRecord | undefined> { const run = await this.store.recordWorkerOutputs?.(identity, claimedAt, outputs, recordedAt); if (run) this.write(run, "run.worker.outputs.recorded"); return run; }
   async update(run: RunRecord): Promise<void> { await this.store.update(run); this.write(run, `run.${run.status}`); }
   private write(run: RunRecord, event: string): void {
     const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, title: run.item.title, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };

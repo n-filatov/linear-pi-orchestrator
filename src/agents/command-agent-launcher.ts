@@ -160,6 +160,13 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       trigger: spec.trigger,
       workspace: spec.workspace,
       prompt: renderTemplate(promptTemplate, values),
+      // An agent needs to be able to name itself to `relay signal`, which is how
+      // an interactive worker closes its own workflow job.
+      environment: {
+        TASK_RELAY_ITEM_ID: spec.item.id,
+        TASK_RELAY_WORKER_ID: `${itemKey(spec.item)}:${spec.agent.agentId}`,
+        TASK_RELAY_REPOSITORY: spec.run.identity.repository.root,
+      },
       overrides: {
         agent: spec.agent.agentId,
         model: spec.agent.model,

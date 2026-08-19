@@ -15,19 +15,33 @@ import {
   type WorkerChildSpec,
   type WorkerInputSpec,
   type WorkerRuntime,
+  type WorkflowDefinition,
+  type WorkflowJobDefinition,
+  type WorkflowJobStatus,
+  type WorkflowRunRecord,
+  type WorkflowRunStore,
   type WorkSource,
   type WorkspaceProvider,
   isActiveRun,
+  isTerminalJobStatus,
   workerChildren,
 } from "../domain/index.js";
+import { decideJob, runOutcome, timedOut, type JobDecision } from "../workflows/reconciler.js";
 import type { ActionContext, ActionResult, LaunchWorkerActionRequest, RelayPluginRegistry, ResolvedWorker, WorkerRef } from "../plugins/index.js";
 
 export interface TriggerProvider {
   list(): Promise<readonly TriggerDefinition[]>;
 }
 
+export interface WorkflowProvider {
+  list(): Promise<readonly WorkflowDefinition[]>;
+}
+
 export interface TaskRelayDependencies {
   triggers: TriggerProvider;
+  /** Workflows are evaluated after triggers, against their own durable runs. */
+  workflows?: WorkflowProvider;
+  workflowRuns?: WorkflowRunStore;
   sources: Iterable<WorkSource>;
   runStore: RunStore;
   workspaceProvider: WorkspaceProvider;
@@ -154,7 +168,249 @@ export class TaskRelay {
       result.triggersVisited += 1;
       await this.runTrigger(trigger, result);
     }
+    for (const workflow of await this.dependencies.workflows?.list() ?? []) {
+      if (this.stopController.signal.aborted) break;
+      if (!workflow.enabled) continue;
+      result.triggersVisited += 1;
+      await this.runWorkflow(workflow, result);
+    }
     return result;
+  }
+
+  // ── Workflows ─────────────────────────────────────────────────────────────
+
+  private async runWorkflow(workflow: WorkflowDefinition, result: TickResult): Promise<void> {
+    const source = this.sources.get(workflow.sourceId);
+    if (!source) {
+      this.dependencies.logger.error("Configured workflow has no matching work source", { workflowId: workflow.id, sourceId: workflow.sourceId });
+      return;
+    }
+    const runs = this.dependencies.workflowRuns;
+    if (!runs) throw new Error(`Workflow '${workflow.id}' needs a workflow run store, but none is configured.`);
+
+    let items: readonly WorkItem[];
+    try {
+      items = await source.discover({ trigger: workflowAsTrigger(workflow), signal: this.stopController.signal });
+    } catch (error) {
+      this.dependencies.logger.error("Work source discovery failed", { workflowId: workflow.id, sourceId: source.id, error: messageFor(error) });
+      return;
+    }
+    result.itemsDiscovered += items.length;
+
+    const queue = new PQueue({ concurrency: normaliseConcurrency(workflow.maxConcurrent) });
+    for (const item of items) {
+      void queue.add(async () => this.reconcileWorkflow(workflow, source, item, runs, result)).catch((error: unknown) => {
+        this.dependencies.logger.error("Workflow reconciliation failed unexpectedly", {
+          workflowId: workflow.id, itemId: item.id, title: item.title, error: messageFor(error),
+        });
+      });
+    }
+    await queue.onIdle();
+  }
+
+  private async reconcileWorkflow(
+    workflow: WorkflowDefinition,
+    source: WorkSource,
+    item: WorkItem,
+    runs: WorkflowRunStore,
+    result: TickResult,
+  ): Promise<void> {
+    const occurrence = await this.workflowOccurrence(workflow, item, runs);
+    const identity = { repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id, occurrence };
+    const startedAt = this.now().toISOString();
+    let run = await runs.openWorkflowRun({
+      identity,
+      item,
+      startedAt,
+      ...(workflow.timeoutMs ? { timeoutAt: new Date(this.now().getTime() + workflow.timeoutMs).toISOString() } : {}),
+    });
+    if (run.status !== "running") {
+      // Say so rather than returning silently: an item that keeps matching but
+      // never advances is otherwise indistinguishable from a broken workflow.
+      result.skipped += 1;
+      this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped", `Workflow run ${occurrence} already ${run.status}.`);
+      return;
+    }
+
+    // A worker launched on an earlier tick may have finished since. Job state is
+    // derived from the run record, never assumed from the last decision.
+    run = await this.refreshWorkflowJobs(workflow, run, runs) ?? run;
+
+    if (timedOut(run, this.now())) {
+      await this.expireWorkflow(workflow, run, runs, result, item);
+      return;
+    }
+
+    const known = new Set(workflow.jobs.map((job) => job.id));
+    const outputs: Record<string, ActionResult> = actionOutputsOf(run);
+    for (const job of workflow.jobs) {
+      if (this.stopController.signal.aborted) break;
+      let decision: JobDecision;
+      try {
+        decision = decideJob({ job, states: run.jobs, item, known });
+      } catch (error) {
+        // A bad `if:` must not silently hold a workflow open for ever.
+        decision = { action: "settle", status: "omitted", reason: messageFor(error) };
+      }
+      if (decision.action === "hold") continue;
+      if (decision.action === "settle") {
+        run = await runs.updateWorkflowJob(identity, job.id, { status: decision.status, message: decision.reason, at: this.now().toISOString() }) ?? run;
+        result.skipped += 1;
+        this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "skipped", `${job.id}: ${decision.reason}`);
+        continue;
+      }
+      run = await this.executeWorkflowJob(workflow, source, item, job, identity, runs, outputs, result) ?? run;
+    }
+
+    const outcome = runOutcome(workflow.jobs, run.jobs);
+    if (outcome.done) await runs.finishWorkflowRun(identity, outcome.status, this.now().toISOString());
+  }
+
+  /** Maps each job's launched run onto a job status, so `needs` sees the truth. */
+  private async refreshWorkflowJobs(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+  ): Promise<WorkflowRunRecord | undefined> {
+    let current: WorkflowRunRecord | undefined = run;
+    for (const job of workflow.jobs) {
+      const state = run.jobs[job.id];
+      if (!state?.runId || state.status !== "started") continue;
+      const record = (await this.dependencies.runStore.findWorkerTargets?.({
+        repository: workflow.repository,
+        sourceId: run.identity.sourceId,
+        itemId: run.identity.itemId,
+        selection: "all",
+        includeCleaned: true,
+      }) ?? []).find((candidate) => candidate.id === state.runId);
+      if (!record || isActiveRun(record.status)) continue;
+      const status: WorkflowJobStatus = record.status === "succeeded" || record.status === "stopped" ? "succeeded" : "failed";
+      current = await runs.updateWorkflowJob(run.identity, job.id, {
+        status,
+        outputs: signalOutputs(record),
+        ...(record.error ? { error: record.error } : {}),
+        at: this.now().toISOString(),
+      }) ?? current;
+      if (current) run = current;
+    }
+    return current;
+  }
+
+  private async executeWorkflowJob(
+    workflow: WorkflowDefinition,
+    source: WorkSource,
+    item: WorkItem,
+    job: WorkflowJobDefinition,
+    identity: WorkflowRunRecord["identity"],
+    runs: WorkflowRunStore,
+    outputs: Record<string, ActionResult>,
+    result: TickResult,
+  ): Promise<WorkflowRunRecord | undefined> {
+    const registry = this.dependencies.actionPlugins;
+    if (!registry) throw new Error(`Workflow ${workflow.id} declares jobs, but no action registry is configured.`);
+    const plugin = registry.action(job.use);
+    if (!plugin) throw new Error(`Unknown action plugin '${job.use}' in workflow ${workflow.id}.`);
+    const config = registry.parseActionConfig(job.use, job.config ?? {});
+    const trigger = workflowAsTrigger(workflow, job.id);
+    const executionId = JSON.stringify([identity.repository.id, identity.repository.root, workflow.id, identity.itemId, identity.occurrence, job.id]);
+
+    this.dependencies.logger.info("Workflow job started", { workflowId: workflow.id, jobId: job.id, actionType: job.use, itemId: item.id, title: item.title });
+    try {
+      const context: ActionContext = {
+        executionId,
+        actionId: job.id,
+        triggerId: workflow.id,
+        repository: workflow.repository,
+        sourceId: source.id,
+        item,
+        outputs,
+        targets: workflow.targets?.workers,
+        workers: {
+          launch: (request) => this.launchFromAction(source, trigger, item, job.id, request, result, outputs),
+          cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
+          resolve: (ref) => this.resolveWorkers(trigger, item, outputs, ref),
+          exec: (ref, spec) => this.execInWorker(trigger, item, outputs, ref, spec),
+          send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
+          capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
+          stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
+        },
+        signal: this.stopController.signal,
+      };
+      const actionResult = await plugin.execute(context, config);
+      outputs[job.id] = actionResult;
+      result.actionsExecuted += 1;
+
+      // A plugin that reports `skipped` has nothing to do *yet* — no worker has
+      // appeared, for instance — so the job stays pending and is retried on a
+      // later tick. Only `if:` and an unsatisfiable dependency settle a job as
+      // skipped or omitted.
+      if (actionResult.status === "skipped") {
+        result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", `${job.id}: ${actionResult.message ?? "Nothing to do yet."}`);
+        return runs.updateWorkflowJob(identity, job.id, { status: "pending", message: actionResult.message, at: this.now().toISOString(), attempted: true });
+      }
+
+      const runId = stringOutput(actionResult, "runId");
+      const workerId = stringOutput(actionResult, "workerId");
+      // A job that launched a live worker is `started`, not `succeeded`: the
+      // agent is still running, and a later job may depend on either fact.
+      const status: WorkflowJobStatus = runId ? "started" : "succeeded";
+      if (job.use !== "launch") this.recordItemOutcome(result, trigger, item, "action", `${job.id}: ${status}.`, workerId);
+      return runs.updateWorkflowJob(identity, job.id, {
+        status,
+        runId,
+        workerId,
+        outputs: jsonOutputs(actionResult),
+        at: this.now().toISOString(),
+        attempted: true,
+      });
+    } catch (error) {
+      result.actionsFailed += 1;
+      this.dependencies.logger.error("Workflow job failed", { workflowId: workflow.id, jobId: job.id, itemId: item.id, title: item.title, error: messageFor(error) });
+      this.recordItemOutcome(result, trigger, item, "failed", `${job.id}: ${messageFor(error)}`);
+      return runs.updateWorkflowJob(identity, job.id, { status: "failed", error: messageFor(error), at: this.now().toISOString(), attempted: true });
+    }
+  }
+
+  private async expireWorkflow(
+    workflow: WorkflowDefinition,
+    run: WorkflowRunRecord,
+    runs: WorkflowRunStore,
+    result: TickResult,
+    item: WorkItem,
+  ): Promise<void> {
+    const at = this.now().toISOString();
+    for (const job of workflow.jobs) {
+      const status = run.jobs[job.id]?.status ?? "pending";
+      if (isTerminalJobStatus(status)) continue;
+      await runs.updateWorkflowJob(run.identity, job.id, { status: "omitted", message: "Workflow run timed out.", at });
+    }
+    await runs.finishWorkflowRun(run.identity, "failed", at);
+    result.skipped += 1;
+    this.recordItemOutcome(result, workflowAsTrigger(workflow), item, "failed", "Workflow run timed out.");
+    this.dependencies.logger.warn("Workflow run timed out", { workflowId: workflow.id, itemId: run.identity.itemId, startedAt: run.startedAt });
+  }
+
+  /**
+   * Which occurrence of a workflow this item belongs to. `once-per-item` never
+   * reruns; `on-change` opens a new occurrence when the item changes; and
+   * `every-poll` opens a new one only after the previous occurrence finished, so
+   * a reopened ticket runs again without a poll ever duplicating live work.
+   */
+  private async workflowOccurrence(
+    workflow: WorkflowDefinition,
+    item: WorkItem,
+    runs: WorkflowRunStore,
+  ): Promise<string> {
+    const base = { repository: workflow.repository, workflowId: workflow.id, sourceId: item.sourceId, itemId: item.id };
+    const policy = workflow.firePolicy ?? "once-per-match";
+    if (policy === "on-change") return `change-${actionFingerprint({ selector: workflow.selector } as TriggerDefinition, item)}`;
+    if (policy !== "every-poll") return "item";
+    const latest = await runs.latestWorkflowRun(base);
+    if (!latest) return "run-1";
+    if (latest.status === "running") return latest.identity.occurrence;
+    const previous = Number(/^run-(\d+)$/.exec(latest.identity.occurrence)?.[1] ?? "0");
+    return `run-${previous + 1}`;
   }
 
   private async runTrigger(trigger: TriggerDefinition, result: TickResult): Promise<void> {
@@ -802,4 +1058,60 @@ function runGeneration(run: Pick<RunRecord, "id" | "claimedAt">): string {
 
 function isPersistentWorker(run: RunRecord): boolean {
   return run.worker?.metadata?.persistent === true;
+}
+
+
+/**
+ * Workflows reuse the trigger-shaped plumbing for discovery, worker resolution,
+ * and launching. The derived trigger is never persisted as configuration; it
+ * exists so one engine serves both models.
+ */
+function workflowAsTrigger(workflow: WorkflowDefinition, jobId?: string): TriggerDefinition {
+  return {
+    id: jobId ? `${workflow.id}:${jobId}` : workflow.id,
+    sourceId: workflow.sourceId,
+    repository: workflow.repository,
+    enabled: workflow.enabled,
+    selector: workflow.selector,
+    maxConcurrent: workflow.maxConcurrent,
+    targets: workflow.targets,
+    firePolicy: workflow.firePolicy,
+    metadata: workflow.metadata,
+  };
+}
+
+/** Earlier job results, shaped as action outputs so `{ action: <id> }` refs work. */
+function actionOutputsOf(run: WorkflowRunRecord): Record<string, ActionResult> {
+  const outputs: Record<string, ActionResult> = {};
+  for (const [id, state] of Object.entries(run.jobs)) {
+    if (state.status === "pending") continue;
+    outputs[id] = {
+      status: state.status === "skipped" || state.status === "omitted" ? "skipped" : "succeeded",
+      output: {
+        ...state.outputs,
+        ...(state.runId ? { runId: state.runId } : {}),
+        ...(state.workerId ? { workerId: state.workerId } : {}),
+      },
+      ...(state.message ? { message: state.message } : {}),
+    };
+  }
+  return outputs;
+}
+
+function stringOutput(result: ActionResult, key: string): string | undefined {
+  const value = result.output?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Only JSON-safe scalars and containers reach the expression context. */
+function jsonOutputs(result: ActionResult): Record<string, unknown> | undefined {
+  if (!result.output) return undefined;
+  const entries = Object.entries(result.output).filter(([, value]) => typeof value !== "function" && typeof value !== "symbol");
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** Outputs an agent reported for itself through `relay signal`. */
+function signalOutputs(run: RunRecord): Record<string, unknown> | undefined {
+  const value = run.worker?.metadata?.outputs;
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }

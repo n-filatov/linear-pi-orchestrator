@@ -57,6 +57,84 @@ export const triggerV2Schema = z.object({
   maxConcurrent: z.number().int().min(1).max(32).optional(),
 }).strict();
 
+/**
+ * A dependency edge. The string form takes GitHub's shape with Argo's status
+ * suffix: `implement` waits for success, `implement.Started` waits only for the
+ * agent to be running.
+ */
+export const workflowNeedSchema = z.union([
+  z.string().min(1).regex(/^[a-zA-Z0-9._:-]+$/),
+  z.object({
+    job: identifier,
+    status: z.enum(["started", "succeeded", "failed", "skipped"]).optional(),
+  }).strict(),
+]);
+
+export const workflowJobSchema = z.object({
+  use: pluginUse,
+  with: z.unknown().optional(),
+  needs: z.union([workflowNeedSchema, z.array(workflowNeedSchema)]).optional(),
+  /** GitHub Actions expression. Defaults to `success()` when omitted. */
+  if: z.string().min(1).optional(),
+  continueOnError: z.boolean().default(false),
+  enabled: z.boolean().default(true),
+}).strict();
+
+export const workflowSchema = z.object({
+  enabled: z.boolean().default(true),
+  on: z.object({
+    source: identifier,
+    /** Opaque to Relay; the selected source plugin validates it. */
+    match: z.unknown().default({}),
+    fire: firePolicySchema,
+  }).strict(),
+  maxConcurrent: z.number().int().min(1).max(32).optional(),
+  targets: triggerTargetsV2Schema,
+  /** A run whose jobs can no longer advance is failed rather than left pending. */
+  timeoutMinutes: z.number().int().min(1).max(10_080).default(1_440),
+  jobs: z.record(identifier, workflowJobSchema),
+}).strict().superRefine((workflow, context) => {
+  const names = new Set(Object.keys(workflow.jobs));
+  if (names.size === 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: "a workflow needs at least one job" });
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    for (const [index, need] of needList(job.needs).entries()) {
+      const target = typeof need === "string" ? need.split(".")[0] : need.job;
+      if (target === name) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs", name, "needs", index], message: `job '${name}' cannot need itself` });
+      else if (!names.has(target)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs", name, "needs", index], message: `unknown job '${target}'` });
+    }
+  }
+  for (const cycle of dependencyCycles(workflow.jobs)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["jobs"], message: `needs form a cycle: ${cycle.join(" -> ")}` });
+  }
+});
+
+function needList(needs: z.infer<typeof workflowJobSchema>["needs"]): readonly z.infer<typeof workflowNeedSchema>[] {
+  if (needs === undefined) return [];
+  return Array.isArray(needs) ? needs : [needs];
+}
+
+/** A cycle can never be satisfied, so it is a configuration error, not a stall. */
+function dependencyCycles(jobs: Record<string, z.infer<typeof workflowJobSchema>>): string[][] {
+  const edges = new Map<string, string[]>();
+  for (const [name, job] of Object.entries(jobs)) {
+    edges.set(name, needList(job.needs).map((need) => typeof need === "string" ? need.split(".")[0] : need.job));
+  }
+  const cycles: string[][] = [];
+  const state = new Map<string, "visiting" | "done">();
+  const walk = (name: string, path: string[]): void => {
+    if (state.get(name) === "done") return;
+    if (state.get(name) === "visiting") {
+      cycles.push([...path.slice(path.indexOf(name)), name]);
+      return;
+    }
+    state.set(name, "visiting");
+    for (const next of edges.get(name) ?? []) if (edges.has(next)) walk(next, [...path, name]);
+    state.set(name, "done");
+  };
+  for (const name of edges.keys()) walk(name, []);
+  return cycles;
+}
+
 const workspaceSchema = z.object({
   adapter: z.enum(["wt", "git-worktree"]).default("wt"),
   directory: z.string().min(1).default(".task-relay/workspaces"),
@@ -85,6 +163,8 @@ export const relayConfigV2Schema = z.object({
   harnesses: z.record(identifier, harnessDefinitionV2Schema).default({}),
   actions: z.record(identifier, actionDefinitionV2Schema).default({}),
   triggers: z.array(triggerV2Schema).default([]),
+  /** Named, ordered job graphs. Sugar over triggers plus a durable run record. */
+  workflows: z.record(identifier, workflowSchema).default({}),
   workspace: workspaceSchema,
   execution: executionSchema,
   logging: loggingSchema,
@@ -98,17 +178,56 @@ export const relayConfigV2Schema = z.object({
       if (typeof action === "string" && !config.actions[action]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["triggers", index, "actions", actionIndex], message: `unknown action '${action}'` });
     }
   }
+  for (const [name, workflow] of Object.entries(config.workflows)) {
+    // Triggers and workflows share one id space: both are addressed by
+    // `relay once --trigger <id>` and both appear in the tick table.
+    if (ids.has(name)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name], message: `'${name}' is already used by a trigger` });
+    ids.add(name);
+    if (!config.sources[workflow.on.source]) context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name, "on", "source"], message: `unknown source '${workflow.on.source}'` });
+    for (const [jobName, job] of Object.entries(workflow.jobs)) {
+      // A named action is reusable across workflows; anything else is a plugin.
+      if (config.actions[job.use] && !config.actions[job.use].enabled) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["workflows", name, "jobs", jobName, "use"], message: `action '${job.use}' is disabled` });
+      }
+    }
+  }
 });
 
 export type RelayConfigV2 = z.infer<typeof relayConfigV2Schema>;
 export type RelayTriggerV2 = z.infer<typeof triggerV2Schema>;
+export type RelayWorkflowV2 = z.infer<typeof workflowSchema>;
+export type RelayWorkflowJobV2 = z.infer<typeof workflowJobSchema>;
+export type RelayWorkflowNeedV2 = z.infer<typeof workflowNeedSchema>;
 export type RelayActionReference = z.infer<typeof triggerActionV2Schema>;
 export type WorkerTargetSelectorConfig = z.infer<typeof workerTargetSelectorSchema>;
 
 /** Parses native v2 configuration, or maps the released v1 shape into v2. */
 export function normalizeRelayConfig(input: unknown): RelayConfigV2 {
-  if (isRecord(input) && input.version === 2) return relayConfigV2Schema.parse(input);
+  if (isRecord(input) && input.version === 2) return relayConfigV2Schema.parse(withUsesAlias(input));
   return legacyToV2(relayConfigSchema.parse(input));
+}
+
+/**
+ * `uses` is accepted everywhere `use` is, because that is the word GitHub
+ * Actions users already know. One key is normalized to the other before
+ * validation so every schema below stays single-keyed and strict.
+ */
+export function withUsesAlias(document: Record<string, unknown>): Record<string, unknown> {
+  const rename = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(rename);
+    if (!isRecord(value)) return value;
+    const mapped: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      // `with` belongs to a plugin, which may legitimately have its own `uses`.
+      if (key === "with") { mapped[key] = entry; continue; }
+      mapped[key === "uses" ? "use" : key] = rename(entry);
+    }
+    if ("use" in mapped && "uses" in value && "use" in value) {
+      throw new Error("Use either 'use' or 'uses', not both.");
+    }
+    return mapped;
+  };
+  return rename(document) as Record<string, unknown>;
 }
 
 /** Compatibility adapter used by config migration and by consumers moving to the action model. */
