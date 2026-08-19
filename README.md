@@ -2,7 +2,7 @@
 
 Task Relay is a repository-scoped automation engine for coding agents. It is not tied to Pi, Linear, Codex, or any one model: a source discovers items, its provider evaluates source-specific match rules, and Relay runs an ordered action pipeline.
 
-The built-ins provide Linear, coding-agent launch, worker cleanup, and the common harnesses (`codex`, `claude`, `pi`, and `opencode`). Other source providers and actions can be added as explicit trusted packages or local modules. Custom CLI harnesses are supported through the built-in `command` harness definition; externally loaded `HarnessPlugin` execution is a future extension seam.
+The built-ins provide Linear, coding-agent launch, worker control, worker cleanup, and the common harnesses (`codex`, `claude`, `pi`, and `opencode`). Sources, actions, and harnesses can all be added as installed packages or local modules; see [Custom plugins](#custom-plugins).
 
 ## Install
 
@@ -471,6 +471,65 @@ triggers:
 
 Only explicitly configured modules are loaded. Treat plugin modules as trusted code and keep secrets out of YAML.
 
+### Installing a plugin
+
+```bash
+relay plugin install @company/relay-github-source
+relay plugin install ../relay-implement-linear      # a local directory
+relay plugin install ./relay-thing-1.0.0.tgz        # a packed tarball
+relay plugin list
+relay plugin remove @company/relay-github-source
+```
+
+Plugins install into a user-level directory —
+`${XDG_DATA_HOME:-~/.local/share}/task-relay/plugins`, or `RELAY_PLUGIN_HOME` if
+set — and are recorded in `plugins.json` with their version, kind, `use`, the
+absolute path of their entry point, and a SHA-256 of it. Project configuration
+holds only the package name.
+
+That absolute path is the point. The released `relay` is a single compiled
+executable whose module root has no `node_modules`, so it cannot resolve a bare
+package name at all. Resolving through the lockfile is what lets an installed
+plugin work from the released binary as well as from a checkout. A plugin's own
+dependencies resolve normally, because npm installs them into the same managed
+directory.
+
+`relay doctor` reports every configured plugin as installed, not installed,
+missing on disk, or changed since install, before any worker is launched.
+`relay plugin remove` refuses while the current project still references the
+plugin, unless you pass `--force`.
+
+To publish one, `relay plugin pack` produces a checksummed tarball:
+
+```bash
+relay plugin init @company/relay-github-source --kind source
+relay plugin validate .
+relay plugin pack . --out dist
+```
+
+### Harness plugins
+
+A `kind: harness` plugin starts and owns its own agent process, rather than
+being launched through Relay's execution adapter. It receives a rendered prompt,
+a workspace, and its validated configuration, and returns the worker handle
+Relay persists:
+
+```yaml
+harnesses:
+  my-agent:
+    uses: "@company/relay-my-agent-harness"
+    with: { endpoint: https://agents.internal }
+```
+
+Relay routes `launch`, `wait`, `reconcile`, and `stop` for that harness to the
+plugin, and everything else — the run store, workflows, cleanup — behaves as it
+does for a built-in harness. A harness plugin does not need
+`execution.adapter: tmux`, because Relay is not hosting its terminal. It also
+has no attachable session, and `worker-exec` and `worker-send` do not apply to
+its workers. Implement `reconcile` if the worker should survive a relay restart;
+without it, Relay reports the worker as failed after a restart rather than
+guessing.
+
 Plugin packages import the extension contracts from `task-relay/plugin`:
 
 ```ts
@@ -484,12 +543,14 @@ exports is covered by Relay's semantic versioning: a breaking change to those
 types requires a major release. Do not import from `task-relay` itself or from
 `task-relay/src/...`.
 
-For a custom local coding CLI today, use the built-in `command` harness with its executable configuration. Relay's external `HarnessPlugin` contract is reserved for a future runtime adapter.
+For a custom local coding CLI, the built-in `command` harness is usually enough: give it an executable, its arguments, and how it takes a prompt. Reach for a harness plugin when the agent is not a local command — a hosted service, or anything whose lifecycle Relay cannot express as one process.
 
 ## Commands and observability
 
 ```bash
-relay doctor                    # config + codex/claude/pi/opencode checks
+relay doctor                    # config, plugin health, and harness checks
+relay plugin install <package>  # install into the managed plugin directory
+relay plugin list               # installed plugins and what this project uses
 relay status                    # sources, harnesses, actions, triggers, and run state
 relay runs                      # persisted worker/run table
 relay logs --level error

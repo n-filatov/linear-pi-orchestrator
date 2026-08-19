@@ -2,6 +2,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { execa } from "execa";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { createRuntimeHandlers } from "../src/app.js";
@@ -161,6 +162,63 @@ describe("v2 app/config integration", () => {
     expect(tick.output).toContain("1 action failures");
     expect(tick.output).toContain("unknown harness 'not-configured'");
     expect(tick.output).toContain("Configured harnesses: codex.");
+  });
+
+  it("launches a worker through an external harness plugin", async () => {
+    const root = await mkdtemp(join(tmpdir(), "task-relay-harness-plugin-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-harness-state-"));
+    temporaryStateHomes.push(stateHome);
+    process.env.XDG_STATE_HOME = stateHome;
+    const marker = join(root, "harness-launched.json");
+
+    // A harness plugin owns its own process. Relay hands it a rendered prompt
+    // and a workspace, and records the WorkerHandle it returns.
+    await writeFile(join(root, "harness.mjs"), [
+      "import { writeFileSync } from 'node:fs';",
+      "export default {",
+      "  kind: 'harness',",
+      "  use: 'fixture-harness',",
+      "  configSchema: { parse: (value) => value ?? {} },",
+      "  async launch(request) {",
+      `    writeFileSync(${JSON.stringify(marker)}, JSON.stringify({`,
+      "      workerId: request.workerId, prompt: request.prompt, model: request.model,",
+      "      workspace: request.workspace.path, config: request.config,",
+      "    }));",
+      "    return { id: request.workerId, startedAt: '2026-08-19T00:00:00.000Z' };",
+      "  },",
+      "  async wait() { return { status: 'succeeded' }; },",
+      "  async stop() {},",
+      "};",
+    ].join("\n"));
+
+    const discover = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'ENG-8',title:'Harness plugin task'}]}))";
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2,
+      project: { name: "harness-plugin-test" },
+      sources: { queue: { uses: "command", with: { discover: { command: process.execPath, args: ["-e", discover] } } } },
+      harnesses: { custom: { uses: "./harness.mjs", with: { flavour: "configured" } } },
+      actions: { implement: { uses: "launch", with: { harness: "custom", model: "some-model", prompt: "Do {{key}} in {{workspace}}" } } },
+      triggers: [{ id: "ready", source: "queue", actions: ["implement"] }],
+      // A harness plugin starts its own process, so no tmux adapter is needed.
+      execution: { adapter: "process" },
+      workspace: { adapter: "git-worktree", directory: ".task-relay/workspaces", baseBranch: "main" },
+      logging: { level: "silent", pretty: false },
+    }));
+
+    // A worker needs a real workspace, so the fixture needs a real repository.
+    for (const args of [["init", "-b", "main"], ["config", "user.email", "relay@example.invalid"], ["config", "user.name", "Relay Test"], ["commit", "--allow-empty", "-m", "init"]]) {
+      await execa("git", ["-C", root, ...args]);
+    }
+
+    const tick = await run(root, "once", "--trigger", "ready");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("1 workers launched");
+
+    const launched = JSON.parse(await readFile(marker, "utf8")) as Record<string, unknown>;
+    expect(launched.workerId).toBe("ENG-8:custom");
+    expect(launched.model).toBe("some-model");
+    expect(launched.config).toEqual({ flavour: "configured" });
+    expect(launched.prompt).toContain("Do ENG-8 in ");
   });
 
   it("normalizes v1 files and reloads the v2 document printed by init dry-run", async () => {

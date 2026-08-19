@@ -95,6 +95,37 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
   });
 }
 
+/** Health of every plugin this configuration names, for `relay doctor`. */
+async function pluginHealth(config: RelayConfigV2 | undefined): Promise<[string, string][]> {
+  if (!config) return [];
+  const { BUILT_IN_ACTIONS, BUILT_IN_HARNESSES, BUILT_IN_SOURCES } = await import("../plugins/built-ins.js");
+  const { checkPlugin, readPluginLock } = await import("../plugins/store.js");
+  const uses = new Set<string>();
+  for (const source of Object.values(config.sources)) if (!BUILT_IN_SOURCES.has(source.use)) uses.add(source.use);
+  for (const action of Object.values(config.actions)) if (!BUILT_IN_ACTIONS.has(action.use)) uses.add(action.use);
+  for (const harness of Object.values(config.harnesses)) if (!BUILT_IN_HARNESSES.has(harness.use)) uses.add(harness.use);
+  for (const trigger of config.triggers) {
+    for (const action of trigger.actions) if (typeof action !== "string" && !BUILT_IN_ACTIONS.has(action.use)) uses.add(action.use);
+  }
+  for (const workflow of Object.values(config.workflows)) {
+    for (const job of Object.values(workflow.jobs)) if (!BUILT_IN_ACTIONS.has(job.use) && !config.actions[job.use]) uses.add(job.use);
+  }
+  if (uses.size === 0) return [];
+
+  const lock = await readPluginLock();
+  const rows: [string, string][] = [];
+  for (const use of uses) {
+    // A local module path is resolved against the project, not the plugin store.
+    if (use.startsWith(".") || use.startsWith("/")) { rows.push([use, "local module"]); continue; }
+    const health = await checkPlugin(use, lock);
+    rows.push([use, health.state === "ok" ? `installed ${health.plugin.version}`
+      : health.state === "not-installed" ? "not installed — run 'relay plugin install'"
+      : health.state === "missing-file" ? "missing on disk — reinstall"
+      : "changed since install — reinstall"]);
+  }
+  return rows;
+}
+
 async function resolveContext(cwd: () => string, write: (value: string) => void): Promise<RelayCommandContext> {
   const loaded = await loadRelayConfig(cwd());
   return { projectRoot: loaded.projectRoot, config: loaded.config, store: new RepositoryStateStore(loaded.projectRoot), logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty), write };
@@ -142,10 +173,16 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       await writeFile(target, document); print(`Created ${target}`);
     });
 
-  program.command("doctor").description("Check repository configuration and required local executables.").action(async () => {
+  program.command("doctor").description("Check repository configuration, plugins, and required local executables.").action(async () => {
     const root = await findProjectRoot(cwd()); let configuration = "missing";
-    try { await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
-    print(statusTable([["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)]]));
+    let loaded: Awaited<ReturnType<typeof loadRelayConfig>> | undefined;
+    try { loaded = await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
+    const { pluginDirectory } = await import("../plugins/store.js");
+    const rows: [string, string | number][] = [["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)], ["Plugin directory", pluginDirectory()]];
+    // A configured plugin that is missing or altered must be reported before a
+    // worker is launched, not when the first tick tries to import it.
+    for (const [use, health] of await pluginHealth(loaded?.config)) rows.push([`Plugin ${use}`, health]);
+    print(statusTable(rows));
   });
 
   program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Workflows", Object.values(context.config.workflows).filter((workflow) => workflow.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });

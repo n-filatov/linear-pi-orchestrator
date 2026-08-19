@@ -6,10 +6,10 @@ import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js
 import type { RelayActionReference, RelayConfigV2, RelayTriggerV2, RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, WorkSource } from "./domain/index.js";
-import { builtInHarnessProfile, CommandAgentLauncher, type AgentModelProfile, type CommandAgentProfile } from "./agents/index.js";
+import type { AgentLauncher, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, WorkSource } from "./domain/index.js";
+import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, type AgentModelProfile, type CommandAgentProfile, type ConfiguredHarnessPlugin } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
-import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, loadRelayPlugin, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
+import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
@@ -23,7 +23,8 @@ type RuntimeComposition = {
   sources: Map<string, WorkSource>;
   triggers: TriggerDefinition[];
   workflows: WorkflowDefinition[];
-  launcher: CommandAgentLauncher;
+  /** Either the command launcher or a composite that also routes plugin harnesses. */
+  launcher: AgentLauncher;
   workspace: WtWorkspaceProvider | GitWorktreeProvider;
   runStore: EventingRunStore;
   plugins: RelayPluginRegistry;
@@ -157,7 +158,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       const wasActive = ["claimed", "provisioning", "launching", "running"].includes(run.status);
       const runtime = await composeRuntime(context);
       try {
-        if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) await runtime.launcher.stop(run.worker);
+        if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) await runtime.launcher.stop?.(run.worker, run);
         if (run.workspace) await runtime.workspace.cleanup(run.workspace, run);
         const stopped = wasActive ? await runtime.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt: new Date().toISOString() }) : undefined;
         const cleaned = await runtime.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, new Date().toISOString());
@@ -200,7 +201,9 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const executor = context.config.execution.adapter === "tmux"
     ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${repository.id}` })
     : new DirectProcessAdapter();
-  const launcher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName });
+  const commandLauncher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName });
+  const harnessPlugins = pluginHarnesses(context.config, plugins);
+  const launcher = harnessPlugins.length > 0 ? new CompositeAgentLauncher(commandLauncher, harnessPlugins) : commandLauncher;
   const workspace = context.config.workspace.adapter === "git-worktree"
     ? new GitWorktreeProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) })
     : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) });
@@ -344,25 +347,43 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
  */
 export function validateLaunchRequest(config: RelayConfigV2, request: Pick<LaunchWorkerActionRequest, "harness" | "mode">, subject: string): void {
   if (!request.harness) throw new Error(`${subject} requires 'with.harness'.`);
-  if (!config.harnesses[request.harness]) {
+  const harness = config.harnesses[request.harness];
+  if (!harness) {
     const known = Object.keys(config.harnesses);
     throw new Error(`${subject} references unknown harness '${request.harness}'.${known.length ? ` Configured harnesses: ${known.join(", ")}.` : " No harnesses are configured."}`);
   }
-  if (request.mode === "interactive" && config.execution.adapter !== "tmux") {
+  // Only a command harness needs a terminal from Relay. A harness plugin starts
+  // and owns its own process, so the adapter is not its concern.
+  if (request.mode === "interactive" && isCommandHarness(harness) && config.execution.adapter !== "tmux") {
     throw new Error(`${subject} uses interactive mode, which requires execution.adapter: tmux.`);
   }
 }
 
+/** True when this harness is run through Relay's command launcher rather than a plugin. */
+export function isCommandHarness(definition: RelayConfigV2["harnesses"][string]): boolean {
+  return definition.use === "command" || (BUILT_IN_HARNESS_PROFILES as readonly string[]).includes(definition.use);
+}
+
 export function harnessProfiles(config: RelayConfigV2): CommandAgentProfile[] {
-  return Object.entries(config.harnesses).map(([id, definition]) => {
-    const overrides = asRecord(definition.with);
-    if ((BUILT_IN_HARNESS_PROFILES as readonly string[]).includes(definition.use)) {
+  return Object.entries(config.harnesses)
+    .filter(([, definition]) => isCommandHarness(definition))
+    .map(([id, definition]) => {
+      const overrides = asRecord(definition.with);
+      if (definition.use === "command") return { ...overrides, id } as CommandAgentProfile;
       const base = builtInHarnessProfile(definition.use as typeof BUILT_IN_HARNESS_PROFILES[number]);
       return { ...base, ...overrides, id } as CommandAgentProfile;
-    }
-    if (definition.use === "command") return { ...overrides, id } as CommandAgentProfile;
-    throw new Error(`Harness plugin '${definition.use}' is not a command harness. External harness execution is not yet supported; use 'command' with an explicit executable.`);
-  });
+    });
+}
+
+/** Harness plugins bound to their validated configuration, in declaration order. */
+function pluginHarnesses(config: RelayConfigV2, plugins: RelayPluginRegistry): ConfiguredHarnessPlugin[] {
+  return Object.entries(config.harnesses)
+    .filter(([, definition]) => !isCommandHarness(definition))
+    .map(([id, definition]) => {
+      const plugin = plugins.harness(definition.use);
+      if (!plugin) throw new Error(`Harness '${id}' uses unknown harness plugin '${definition.use}'.`);
+      return { id, plugin, config: plugins.parseHarnessConfig(definition.use, definition.with) };
+    });
 }
 
 /** @deprecated Compatibility helper for consumers of the v1 programmatic API. */
@@ -391,9 +412,13 @@ async function pluginRegistry(config: RelayConfigV2, projectRoot: string): Promi
   for (const plugin of builtInActionPlugins()) registry.register(plugin);
   const externalUses = new Set<string>();
   for (const source of Object.values(config.sources)) if (!BUILT_IN_SOURCES.has(source.use)) externalUses.add(source.use);
+  for (const harness of Object.values(config.harnesses)) if (!isCommandHarness(harness)) externalUses.add(harness.use);
   for (const action of Object.values(config.actions)) if (!registry.action(action.use)) externalUses.add(action.use);
+  for (const workflow of Object.values(config.workflows)) for (const job of Object.values(workflow.jobs)) if (!registry.action(job.use) && !config.actions[job.use]) externalUses.add(job.use);
   for (const trigger of config.triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
-  for (const use of externalUses) registry.registerAs(use, await loadRelayPlugin(use, projectRoot));
+  // Read the managed lockfile once, not once per plugin.
+  const lock = externalUses.size > 0 ? await readPluginLock() : undefined;
+  for (const use of externalUses) registry.registerAs(use, await loadRelayPlugin(use, projectRoot, lock));
   return registry;
 }
 
