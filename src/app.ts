@@ -265,6 +265,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
     actionPlugins: plugins,
     actionExecutions: context.store,
     validateLaunch: (request, where) => validateLaunchRequest(context.config, request, `Action '${where.actionId}' in trigger '${where.triggerId}'`),
+    oneWorkerPerItem: context.config.execution.oneWorkerPerItem,
     logger: relayLogger(context.logger, repository.id),
   });
   return { relay, sources, triggers, workflows, launcher, workspace, runStore: eventStore, plugins };

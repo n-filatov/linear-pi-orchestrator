@@ -57,6 +57,11 @@ export interface TaskRelayDependencies {
    * engine deliberately does not read.
    */
   validateLaunch?(request: LaunchWorkerActionRequest, context: { triggerId: string; actionId: string }): void;
+  /**
+   * Refuse a launch when the ticket already has a live worker, whichever
+   * trigger or workflow job launched it. Defaults to true.
+   */
+  oneWorkerPerItem?: boolean;
   now?: () => Date;
 }
 
@@ -561,6 +566,24 @@ export class TaskRelay {
     await queue.onIdle();
   }
 
+  /**
+   * The live worker for a ticket, if any, across every trigger and workflow job
+   * in this repository. A run whose worker has since exited is reconciled by
+   * `reconcilePersistedRuns`, so a stale record cannot block a ticket forever.
+   */
+  private async activeWorkerForItem(trigger: TriggerDefinition, sourceId: string, itemId: string): Promise<RunRecord | undefined> {
+    if (this.dependencies.oneWorkerPerItem === false) return undefined;
+    const findRunsForItem = this.dependencies.runStore.findRunsForItem;
+    if (!findRunsForItem) return undefined;
+    const runs = await findRunsForItem.call(this.dependencies.runStore, {
+      repository: trigger.repository,
+      sourceId,
+      itemId,
+      selection: "active",
+    });
+    return runs.find((run) => run.worker !== undefined);
+  }
+
   private async dispatchItem(
     source: WorkSource,
     trigger: TriggerDefinition,
@@ -588,6 +611,16 @@ export class TaskRelay {
     const activeRun = await this.dependencies.runStore.findActive(identity);
     if (activeRun) {
       return { claimed: false, launched: false, skipped: true, reason: `Worker ${activeRun.worker?.id ?? "run"} is already active.` };
+    }
+
+    // `findActive` keys on the trigger id, and both a trigger action and a
+    // workflow job compose their own id into it. Two of them aimed at one
+    // ticket therefore hold different keys, and neither sees the other's live
+    // worker. This guard is the one that keeps a ticket to a single worktree,
+    // tmux window, and branch.
+    const sibling = await this.activeWorkerForItem(trigger, source.id, item.id);
+    if (sibling) {
+      return { claimed: false, launched: false, skipped: true, reason: `Worker ${sibling.worker?.id ?? sibling.id} is already active for ${item.id}.` };
     }
 
     let agent;
