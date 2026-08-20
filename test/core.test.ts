@@ -35,6 +35,12 @@ class MemoryStore implements RunStore {
   }
   async update(run: RunRecord) { this.runs.set(run.id, structuredClone(run)); }
   async listActive(scope: RepositoryScope) { return [...this.runs.values()].filter((run) => run.identity.repository.id === scope.id && isActiveRun(run.status)); }
+  async findRunsForItem(query: { repository: RepositoryScope; sourceId: string; itemId: string; selection?: "latest" | "active" | "all" }) {
+    const matches = [...this.runs.values()].filter((run) => run.identity.repository.id === query.repository.id
+      && run.identity.sourceId === query.sourceId
+      && run.identity.itemId === query.itemId);
+    return query.selection === "active" ? matches.filter((run) => isActiveRun(run.status)) : matches;
+  }
 }
 
 const logger: RelayLogger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -257,5 +263,64 @@ describe("TaskRelay", () => {
     await vi.waitFor(() => expect(store.runs.get(active.id)?.status).toBe("stopped"));
     expect(reports.filter((type) => type === "stopped")).toHaveLength(1);
     expect(reports).not.toContain("succeeded");
+  });
+
+  it("keeps one live worker per ticket across triggers, and releases it when the worker is gone", async () => {
+    const store = new MemoryStore();
+    const launched: string[] = [];
+    const ticket = items[0]!;
+    const source: WorkSource = { id: "queue", discover: async () => [ticket], report: async () => {} };
+    const agent: AgentLauncher = {
+      resolve: async (profile): Promise<AgentResolution> => ({ agentId: profile?.id || "codex" }),
+      launch: async (spec) => { launched.push(spec.trigger.id); return { id: `${spec.item.id}:codex`, startedAt: "2026-08-20T00:00:00.000Z" }; },
+    };
+    const deps = {
+      sources: [source],
+      runStore: store,
+      workspaceProvider: { provision: async () => ({ path: "/work" }) } as WorkspaceProvider,
+      agentLauncher: agent,
+      logger,
+    };
+
+    // Two ids for one ticket: what a trigger action and a workflow job produce.
+    const first = await new TaskRelay({ ...deps, triggers: { list: async () => [{ ...trigger, id: "ready:implement" }] } }).tick();
+    expect(first.runsLaunched).toBe(1);
+
+    const second = await new TaskRelay({ ...deps, triggers: { list: async () => [{ ...trigger, id: "ready:implement:implement" }] } }).tick();
+    expect(second.runsLaunched).toBe(0);
+    expect(second.skipped).toBe(1);
+    expect(second.items).toEqual([expect.objectContaining({
+      status: "skipped",
+      reason: `Worker ${ticket.id}:codex is already active for ${ticket.id}.`,
+    })]);
+    expect(launched).toEqual(["ready:implement"]);
+
+    // The guard must not outlive the worker it protects.
+    const live = [...store.runs.values()][0]!;
+    await store.finishActive(live.identity, live.claimedAt, { status: "stopped", completedAt: "cleanup" });
+    const third = await new TaskRelay({ ...deps, triggers: { list: async () => [{ ...trigger, id: "ready:implement:implement" }] } }).tick();
+    expect(third.runsLaunched).toBe(1);
+    expect(launched).toEqual(["ready:implement", "ready:implement:implement"]);
+  });
+
+  it("allows several workers on one ticket when oneWorkerPerItem is off", async () => {
+    const store = new MemoryStore();
+    const ticket = items[0]!;
+    const source: WorkSource = { id: "queue", discover: async () => [ticket], report: async () => {} };
+    const deps = {
+      sources: [source],
+      runStore: store,
+      workspaceProvider: { provision: async () => ({ path: "/work" }) } as WorkspaceProvider,
+      agentLauncher: {
+        resolve: async (): Promise<AgentResolution> => ({ agentId: "codex" }),
+        launch: async (spec) => ({ id: `${spec.item.id}:codex`, startedAt: "2026-08-20T00:00:00.000Z" }),
+      } as AgentLauncher,
+      logger,
+      oneWorkerPerItem: false,
+    };
+
+    await new TaskRelay({ ...deps, triggers: { list: async () => [{ ...trigger, id: "implement" }] } }).tick();
+    const review = await new TaskRelay({ ...deps, triggers: { list: async () => [{ ...trigger, id: "review" }] } }).tick();
+    expect(review.runsLaunched).toBe(1);
   });
 });

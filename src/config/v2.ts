@@ -198,6 +198,13 @@ const workspaceSchema = z.object({
 const executionSchema = z.object({
   maxConcurrent: z.number().int().min(1).max(32).default(2),
   retries: z.number().int().min(0).max(10).default(2),
+  /**
+   * One live worker per source item. Triggers and workflow jobs compose their
+   * own ids into the run key, so the per-run guard cannot see a worker another
+   * trigger or job launched for the same ticket. Set false to allow a workflow
+   * to run several workers on one ticket at the same time.
+   */
+  oneWorkerPerItem: z.boolean().default(true),
   adapter: z.enum(["process", "tmux"]).default("process"),
   tmuxSession: z.string().min(1).optional(),
   tmuxWindowName: z.string().min(1).optional(),
