@@ -353,27 +353,51 @@ export class TaskRelay {
 
     this.dependencies.logger.info("Workflow job started", { workflowId: workflow.id, jobId: job.id, actionType: job.use, itemId: item.id, title: item.title });
     try {
-      const context: ActionContext = {
-        executionId,
-        actionId: job.id,
-        triggerId: workflow.id,
-        repository: workflow.repository,
-        sourceId: source.id,
-        item,
-        outputs,
-        targets: workflow.targets?.workers,
-        workers: {
-          launch: (request) => this.launchFromAction(source, trigger, item, job.id, request, result, outputs),
-          cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
-          resolve: (ref) => this.resolveWorkers(trigger, item, outputs, ref),
-          exec: (ref, spec) => this.execInWorker(trigger, item, outputs, ref, spec),
-          send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
-          capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
-          stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
-        },
-        signal: this.stopController.signal,
-      };
-      const actionResult = await plugin.execute(context, config);
+      // Workflow jobs share the action plugin contract with trigger actions.
+      // In particular, worker-targeted plugins (such as `cleanup`) must run
+      // once for every selected run. Previously we merely exposed `targets` in
+      // the context, leaving `context.worker` undefined and making cleanup a
+      // permanent no-op.
+      const targetRuns = plugin.target === "worker" ? await this.workerTargets(trigger, item) : [undefined];
+      if (plugin.target === "worker" && targetRuns.length === 0) {
+        const actionResult: ActionResult = { status: "skipped", message: "No matching workers." };
+        outputs[job.id] = actionResult;
+        result.skipped += 1;
+        this.recordItemOutcome(result, trigger, item, "skipped", `${job.id}: ${actionResult.message}`);
+        return runs.updateWorkflowJob(identity, job.id, { status: "pending", message: actionResult.message, at: this.now().toISOString(), attempted: true });
+      }
+
+      const actionResults: ActionResult[] = [];
+      for (const targetRun of targetRuns) {
+        const context: ActionContext = {
+          executionId,
+          actionId: job.id,
+          triggerId: workflow.id,
+          repository: workflow.repository,
+          sourceId: source.id,
+          item,
+          outputs,
+          targets: workflow.targets?.workers,
+          worker: targetRun?.worker,
+          run: targetRun,
+          workers: {
+            launch: (request) => this.launchFromAction(source, trigger, item, job.id, request, result, outputs),
+            cleanup: (workerId) => this.cleanupFromAction(source, trigger, item, workerId),
+            resolve: (ref) => this.resolveWorkers(trigger, item, outputs, ref),
+            exec: (ref, spec) => this.execInWorker(trigger, item, outputs, ref, spec),
+            send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
+            capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
+            stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
+          },
+          signal: this.stopController.signal,
+        };
+        const actionResult = await plugin.execute(context, config);
+        actionResults.push(actionResult);
+        if (actionResult.status !== "skipped" && job.use !== "launch") {
+          this.recordItemOutcome(result, trigger, item, "action", `${job.id}: succeeded.`, targetRun?.worker?.id);
+        }
+      }
+      const actionResult = actionResults.find((candidate) => candidate.status === "succeeded") ?? actionResults[0]!;
       outputs[job.id] = actionResult;
       result.actionsExecuted += 1;
 
@@ -391,7 +415,10 @@ export class TaskRelay {
       const workerId = stringOutput(actionResult, "workerId");
       // A job that launched a live worker is `started`, not `succeeded`: the
       // agent is still running, and a later job may depend on either fact.
-      const status: WorkflowJobStatus = runId ? "started" : "succeeded";
+      // `cleanup` returns the cleaned run ID for auditability, not because this
+      // workflow job launched a new worker. Only item-targeted actions can put
+      // a workflow job into the live `started` state.
+      const status: WorkflowJobStatus = plugin.target === "worker" ? "succeeded" : runId ? "started" : "succeeded";
       if (job.use !== "launch") this.recordItemOutcome(result, trigger, item, "action", `${job.id}: ${status}.`, workerId);
       return runs.updateWorkflowJob(identity, job.id, {
         status,
@@ -823,7 +850,21 @@ export class TaskRelay {
     if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) {
       await this.dependencies.agentLauncher.stop?.(run.worker, run);
     }
-    if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
+    // A trigger/workflow migration can leave two worker records for the same
+    // workspace. Stop every worker, but remove that shared worktree only once;
+    // the later record still needs its cleanup marker persisted.
+    const alreadyCleaned = run.workspace && this.dependencies.runStore.findRunsForItem
+      ? (await this.dependencies.runStore.findRunsForItem({
+        repository: trigger.repository,
+        sourceId: item.sourceId,
+        itemId: item.id,
+        selection: "all",
+        includeCleaned: true,
+      })).some((candidate) => candidate.id !== run.id
+        && candidate.workspace?.path === run.workspace?.path
+        && Boolean(candidate.workspaceCleanedAt))
+      : false;
+    if (run.workspace && !alreadyCleaned) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
     const cleaned = await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, completedAt);
     if (!cleaned) throw new Error(`Workspace was removed, but worker ${workerId} changed before cleanup was recorded.`);
     if (stopped) await this.report(source, "stopped", stopped);
