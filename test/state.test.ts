@@ -4,11 +4,65 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RepositoryStateStore } from "../src/state/store.js";
 import { TaskRelay } from "../src/core/task-relay.js";
-import type { AgentLauncher, RelayLogger, RepositoryScope, TriggerDefinition, WorkItem, WorkSource, WorkspaceProvider } from "../src/domain/index.js";
+import { builtInActionPlugins } from "../src/actions/builtins.js";
+import { RelayPluginRegistry } from "../src/plugins/index.js";
+import type { AgentLauncher, RelayLogger, RepositoryScope, TriggerDefinition, WorkItem, WorkflowDefinition, WorkSource, WorkspaceProvider } from "../src/domain/index.js";
 
 const logger: RelayLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
 describe("RepositoryStateStore", () => {
+  it("resolves worker targets for a workflow cleanup job", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "task-relay-workflow-cleanup-"));
+    const originalStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateHome;
+    try {
+      const repository: RepositoryScope = { id: "workflow-cleanup", root: join(stateHome, "repo") };
+      const item: WorkItem = { sourceId: "queue", id: "DONE-1", title: "Done", terminal: true };
+      const implementation: TriggerDefinition = { id: "implementation", sourceId: "queue", repository, enabled: true };
+      const store = new RepositoryStateStore(repository.root);
+      const claimed = await store.claim({
+        id: "unused", identity: { repository, sourceId: "queue", itemId: item.id, triggerId: implementation.id },
+        item, trigger: implementation, agent: { agentId: "codex" }, claimedAt: "claimed", maxConcurrent: 1,
+      });
+      await store.update({ ...claimed!, status: "running", workspace: { path: "/work/DONE-1" }, worker: { id: "worker-DONE-1", startedAt: "started" } });
+      const migratedImplementation = { ...implementation, id: "implementation:job" };
+      const migrated = await store.claim({
+        id: "unused", identity: { repository, sourceId: "queue", itemId: item.id, triggerId: migratedImplementation.id },
+        item, trigger: migratedImplementation, agent: { agentId: "codex" }, claimedAt: "migrated", maxConcurrent: 1,
+      });
+      await store.update({ ...migrated!, status: "running", workspace: { path: "/work/DONE-1" }, worker: { id: "worker-DONE-1-migrated", startedAt: "started" } });
+
+      const workflow: WorkflowDefinition = {
+        id: "cleanup-terminal", sourceId: "queue", repository, enabled: true,
+        targets: { workers: { sourceItem: "current", runs: "all" } },
+        jobs: [{ id: "cleanup", use: "cleanup", config: { activeWorker: "stop" } }],
+      };
+      const plugins = new RelayPluginRegistry();
+      for (const plugin of builtInActionPlugins()) plugins.registerAction(plugin);
+      const stopped: string[] = [];
+      const cleaned: string[] = [];
+      const relay = new TaskRelay({
+        triggers: { list: async () => [] }, workflows: { list: async () => [workflow] }, workflowRuns: store,
+        sources: [{ id: "queue", discover: async () => [item], report: async () => {} }], runStore: store,
+        workspaceProvider: { provision: async () => ({ path: "/unused" }), cleanup: async (workspace) => { cleaned.push(workspace.path); } },
+        agentLauncher: { resolve: async () => ({ agentId: "codex" }), launch: async () => ({ id: "unused", startedAt: "now" }), stop: async (worker) => { stopped.push(worker.id); } },
+        actionPlugins: plugins, logger,
+      });
+
+      await relay.tick();
+      expect(stopped).toEqual(["worker-DONE-1-migrated", "worker-DONE-1"]);
+      expect(cleaned).toEqual(["/work/DONE-1"]);
+      expect((await store.getRun(claimed!.id))?.workspaceCleanedAt).toBeTruthy();
+      expect((await store.getRun(migrated!.id))?.workspaceCleanedAt).toBeTruthy();
+      const workflowRun = (await store.listWorkflowRuns(repository))[0];
+      expect(workflowRun?.jobs.cleanup.status).toBe("succeeded");
+    } finally {
+      if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = originalStateHome;
+      await rm(stateHome, { recursive: true, force: true });
+    }
+  });
+
   it("claims capacity atomically when two relays dispatch different work", async () => {
     const stateHome = await mkdtemp(join(tmpdir(), "task-relay-state-"));
     const originalStateHome = process.env.XDG_STATE_HOME;
