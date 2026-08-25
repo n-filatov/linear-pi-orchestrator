@@ -412,6 +412,24 @@ describe("workflow runs end to end", () => {
     expect(again.output).toContain("0 actions");
   });
 
+  it("settles a cleanup workflow when its terminal item has no worker", async () => {
+    const root = await project({ cleanup: { use: "cleanup" } });
+    const projectRoot = (await loadRelayConfig(root)).projectRoot;
+    const repository = { id: "workflow-test", root: projectRoot };
+    const store = new RepositoryStateStore(projectRoot);
+
+    const tick = await run(root, "once", "--trigger", "feature");
+    expect(tick.errors).toBe("");
+    expect(tick.output).toContain("0 action failures");
+
+    const [workflowRun] = await store.listWorkflowRuns(repository);
+    expect(workflowRun.status).toBe("succeeded");
+    expect(workflowRun.jobs.cleanup).toMatchObject({ status: "skipped", message: "No matching workers." });
+
+    const again = await run(root, "once", "--trigger", "feature");
+    expect(again.output).toContain("Workflow run item already succeeded.");
+  });
+
   it("advances a started job to succeeded when its agent signals, then releases the dependent job", async () => {
     const root = await project({
       one: echo("unused"),

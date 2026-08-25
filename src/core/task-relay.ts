@@ -364,7 +364,11 @@ export class TaskRelay {
         outputs[job.id] = actionResult;
         result.skipped += 1;
         this.recordItemOutcome(result, trigger, item, "skipped", `${job.id}: ${actionResult.message}`);
-        return runs.updateWorkflowJob(identity, job.id, { status: "pending", message: actionResult.message, at: this.now().toISOString(), attempted: true });
+        // Cleanup is terminal-workflow housekeeping. If its ticket has no
+        // worker, there is nothing left to wait for; keeping the job pending
+        // makes every terminal item retry and contend on the shared state lock.
+        const status: WorkflowJobStatus = job.use === "cleanup" ? "skipped" : "pending";
+        return runs.updateWorkflowJob(identity, job.id, { status, message: actionResult.message, at: this.now().toISOString(), attempted: true });
       }
 
       const actionResults: ActionResult[] = [];
