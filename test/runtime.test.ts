@@ -115,6 +115,51 @@ describe("TmuxExecutionAdapter", () => {
 });
 
 describe("TmuxExecutionAdapter worker runtime", () => {
+  it("tags workers and safely rebinds a stale window target before control operations", async (context) => {
+    const session = `task-relay-rebind-${randomUUID()}`;
+    const directory = await mkdtemp(join(tmpdir(), "task-relay-rebind-"));
+    const adapter = new TmuxExecutionAdapter({ session });
+    try {
+      const probe = await execa("tmux", ["has-session", "-t", session], { reject: false });
+      if (probe.stderr.includes("Operation not permitted")) return context.skip();
+
+      const execution = await adapter.execute({
+        command: "sh", args: ["-c", "sleep 5"], cwd: directory, env: {},
+        workerName: "ENG-777 durable identity", workerId: "wrk_runtime_rebind", issue: "ENG-777",
+      });
+      expect(execution.tmux?.workerId).toBe("wrk_runtime_rebind");
+      await expect(execa("tmux", ["show-window-options", "-v", "-t", execution.tmux!.target!, "@task_relay_worker_id"])).resolves.toMatchObject({ stdout: "wrk_runtime_rebind" });
+      await expect(execa("tmux", ["show-window-options", "-v", "-t", execution.tmux!.target!, "@task_relay_issue"])).resolves.toMatchObject({ stdout: "ENG-777" });
+
+      // @window ids are transient across tmux server restarts. The generation tag is
+      // authoritative, so a stale id is rebound before Relay opens or stops.
+      const worker: WorkerHandle = {
+        id: "wrk_runtime_rebind",
+        startedAt: "now",
+        metadata: { workspace: directory, tmux: { ...execution.tmux, target: "@999999" } },
+      };
+      expect(await adapter.exists(worker)).toBe(true);
+      expect((worker.metadata?.tmux as { target?: string }).target).toBe(execution.tmux?.target);
+
+      // A legacy/recreated window may have no tag yet. Exact issue/name plus
+      // workspace CWD can recover it once, after which Relay upgrades it with
+      // the durable tag for every later operation.
+      await execa("tmux", ["set-window-option", "-u", "-t", execution.tmux!.target!, "@task_relay_worker_id"]);
+      (worker.metadata?.tmux as { target?: string }).target = "@999999";
+      expect(await adapter.exists(worker)).toBe(true);
+      await expect(execa("tmux", ["show-window-options", "-v", "-t", execution.tmux!.target!, "@task_relay_worker_id"])).resolves.toMatchObject({ stdout: "wrk_runtime_rebind" });
+
+      const child = await adapter.open(worker, { command: "sh", args: ["-c", "sleep 5"], open: "pane" });
+      await adapter.closeChild(worker, child);
+
+      (worker.metadata?.tmux as { target?: string }).target = "@999999";
+      await adapter.stop(worker);
+      expect(await adapter.exists(worker)).toBe(false);
+    } finally {
+      await execa("tmux", ["kill-session", "-t", session], { reject: false });
+    }
+  });
+
   it("opens, reads, and closes a pane beside a running worker", async (context) => {
     const session = `task-relay-pane-${randomUUID()}`;
     const directory = await mkdtemp(join(tmpdir(), "task-relay-pane-"));

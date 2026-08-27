@@ -14,6 +14,7 @@ import type {
   Workspace,
 } from "../domain/index.js";
 import { workerChildren } from "../domain/index.js";
+import { workerGenerationId } from "../state/global-worker-registry.js";
 import { renderEnvironment, renderTemplate, renderTemplates, templateValues } from "./templates.js";
 import type {
   AgentCliDefaults,
@@ -119,6 +120,8 @@ export type CommandAgentLauncherOptions = {
   promptFileName?: string;
   /** Handlebars template for the tmux window name. Available: {{item.id}}, {{item.title}}, {{slug}}, etc. */
   windowNameTemplate?: string;
+  /** Clone-stable repository key used in global worker generation ids. */
+  repositoryIdentity?: string;
 };
 
 /** Launches configured command agents without ever constructing a shell command. */
@@ -145,6 +148,7 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
   }
 
   async launch(spec: DomainAgentLaunchSpec): Promise<WorkerHandle> {
+    const workerId = workerGenerationId(spec.run, this.options.repositoryIdentity);
     const metadata = asRecord(spec.agent.metadata);
     const promptTemplate = spec.trigger.agent?.promptTemplate
       ?? stringField(metadata, "promptTemplate")
@@ -164,7 +168,7 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       // an interactive worker closes its own workflow job.
       environment: {
         TASK_RELAY_ITEM_ID: spec.item.id,
-        TASK_RELAY_WORKER_ID: `${itemKey(spec.item)}:${spec.agent.agentId}`,
+        TASK_RELAY_WORKER_ID: workerId,
         TASK_RELAY_REPOSITORY: spec.run.identity.repository.root,
       },
       overrides: {
@@ -248,7 +252,8 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
       ...(resolved.modelId ? { TASK_RELAY_MODEL: resolved.modelId } : {}),
       ...(resolved.reasoningEffort ? { TASK_RELAY_REASONING_EFFORT: resolved.reasoningEffort } : {}),
     };
-    const result = await this.options.executor.execute({
+    const requestedWorkerId = stringField(request.environment, "TASK_RELAY_WORKER_ID");
+    const execution = await this.options.executor.execute({
       command: renderTemplate(resolved.agent.command, values),
       args,
       cwd: workspacePath,
@@ -259,7 +264,12 @@ export class CommandAgentLauncher implements DomainAgentLauncher {
         this.options.windowNameTemplate ?? "{{item.id}} {{item.title}}",
         templateValues({ workItem: request.workItem, workspace: request.workspace }),
       ),
+      workerId: requestedWorkerId,
+      issue: request.workItem.id,
     });
+    // Adapters supplied by third parties may not yet echo `workerId`, but the
+    // launcher still owns the durable generation assigned to this run.
+    const result = requestedWorkerId && !execution.workerId ? { ...execution, workerId: requestedWorkerId } : execution;
 
     return {
       worker: workerHandle(request.workItem, request.workspace, resolved, result),
@@ -366,10 +376,13 @@ function workerHandle(
   item: WorkItem,
   workspace: Workspace,
   resolved: ResolvedAgentLaunch,
-  execution: { pid?: number; tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string } },
+  execution: { pid?: number; workerId?: string; tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string; workerId?: string; issue?: string } },
 ): WorkerHandle {
   return {
-    id: `${itemKey(item)}:${resolved.agentId}`,
+    // Tmux records this generation id in a window option. Keeping it as the worker id
+    // lets a subsequent Relay process prove it found the same worker rather
+    // than merely a similarly named window.
+    id: execution.workerId ?? execution.tmux?.workerId ?? `${itemKey(item)}:${resolved.agentId}`,
     startedAt: new Date().toISOString(),
     metadata: {
       workspace: workspace.path,

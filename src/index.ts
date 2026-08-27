@@ -11,6 +11,8 @@ export * from "./config/schema.js";
 export * from "./config/load.js";
 export * from "./logging/events.js";
 export * from "./state/store.js";
+export * from "./state/global-worker-registry.js";
+export * from "./state/repository-identity.js";
 export * from "./cli/program.js";
 export * from "./app.js";
 export * from "./daemon.js";

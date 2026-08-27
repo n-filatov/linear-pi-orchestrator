@@ -100,11 +100,17 @@ export type AgentExecution = {
   /** Initial text pasted into a live terminal and submitted after launch. */
   interactiveInput?: string;
   workerName: string;
+  /** Durable Relay identity used to rebind a recreated tmux target. */
+  workerId?: string;
+  /** Source-visible issue key used for operator discovery in tmux. */
+  issue?: string;
 };
 
 export type AgentExecutionResult = {
   pid?: number;
-  tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string };
+  /** The durable identity supplied at launch, when the adapter can retain it. */
+  workerId?: string;
+  tmux?: { session: string; window: string; index?: string; target?: string; exitKey?: string; workerId?: string; issue?: string };
 };
 
 export interface AgentExecutionAdapter {

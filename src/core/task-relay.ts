@@ -848,12 +848,13 @@ export class TaskRelay {
     if (!run) return { status: "skipped", message: `Worker ${workerId} was not found or was already cleaned.` };
     const wasActive = isActiveRun(run.status);
     const completedAt = this.now().toISOString();
-    // Mark stopped before killing the window so the concurrent wait() observer
-    // loses the finishActive race and emits nothing instead of run.failed.
-    const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;
+    // Runtime stop is verified before the durable run is declared stopped. A
+    // stale/recycled tmux address must leave the run recoverable, not produce a
+    // false terminal state followed by workspace deletion.
     if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) {
       await this.dependencies.agentLauncher.stop?.(run.worker, run);
     }
+    const stopped = wasActive ? await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt }) : undefined;
     // A trigger/workflow migration can leave two worker records for the same
     // workspace. Stop every worker, but remove that shared worktree only once;
     // the later record still needs its cleanup marker persisted.
@@ -1055,12 +1056,11 @@ export class TaskRelay {
       for (const run of await this.dependencies.runStore.listActive(repository)) {
         const source = this.sources.get(run.identity.sourceId);
         try {
-          // Mark stopped before killing the window (same race-prevention as cleanupFromAction).
+          if (run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
           const stopped = await this.dependencies.runStore.finishActive(run.identity, run.claimedAt, {
             status: "stopped",
             completedAt: this.now().toISOString(),
           });
-          if (run.worker) await this.dependencies.agentLauncher.stop?.(run.worker, run);
           if (run.workspace) await this.dependencies.workspaceProvider.cleanup?.(run.workspace, run);
           if (run.workspace) await this.dependencies.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, this.now().toISOString());
           if (source && stopped) await this.report(source, "stopped", stopped);

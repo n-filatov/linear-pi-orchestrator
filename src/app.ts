@@ -3,10 +3,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import pRetry from "p-retry";
 import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js";
-import type { RelayActionReference, RelayConfigV2, RelayTriggerV2, RelayWorkflowJobV2, RelayWorkflowV2 } from "./config/index.js";
+import { loadRelayConfig, type RelayActionReference, type RelayConfigV2, type RelayTriggerV2, type RelayWorkflowJobV2, type RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { AgentLauncher, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, WorkSource } from "./domain/index.js";
+import type { AgentLauncher, AgentProfile, AgentResolution, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkerCompletion, WorkerHandle, WorkerRuntime, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, Workspace, WorkspaceProvider, WorkItem, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, type AgentModelProfile, type CommandAgentProfile, type ConfiguredHarnessPlugin } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
 import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findInstalledPlugin, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
@@ -17,7 +17,11 @@ import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSe
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
 import { tickTable, type TickTableRow } from "./logging/tables.js";
+import { createEventLogger } from "./logging/events.js";
 import { decideJob } from "./workflows/reconciler.js";
+import { GlobalWorkerRegistry, type GlobalWorkerRecord } from "./state/global-worker-registry.js";
+import { getRepositoryIdentity } from "./state/repository-identity.js";
+import { RepositoryStateStore } from "./state/store.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
@@ -26,10 +30,76 @@ type RuntimeComposition = {
   workflows: WorkflowDefinition[];
   /** Either the command launcher or a composite that also routes plugin harnesses. */
   launcher: AgentLauncher;
-  workspace: WtWorkspaceProvider | GitWorktreeProvider;
+  workspace: WorkspaceProvider;
   runStore: EventingRunStore;
   plugins: RelayPluginRegistry;
 };
+
+async function ensureRegistryContext(context: RelayCommandContext): Promise<{ registry: GlobalWorkerRegistry; repository: RepositoryScope; registryRepository: RepositoryScope }> {
+  const identity = context.repositoryIdentity ?? await getRepositoryIdentity(context.projectRoot);
+  const repository = { id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot };
+  const registryRepository = { id: identity.id, root: identity.root };
+  const registry = context.registry ?? new GlobalWorkerRegistry();
+  const runs = await context.store.listRuns();
+  if (runs.length > 0) registry.importRuns(runs, { repository: registryRepository });
+  context.repositoryIdentity = identity;
+  context.registry = registry;
+  return { registry, repository, registryRepository };
+}
+
+function registryCandidates(registry: GlobalWorkerRegistry, target: string): GlobalWorkerRecord[] {
+  const normalized = target.toLowerCase();
+  return registry.list({ includeCleaned: true }).filter((entry) => entry.id === target
+    || entry.runId === target
+    || entry.snapshot.worker?.id === target
+    || entry.issueKey.toLowerCase() === normalized
+    || entry.itemId.toLowerCase() === normalized)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function chooseRegistryCandidate(candidates: GlobalWorkerRecord[], target: string): GlobalWorkerRecord | undefined {
+  if (candidates.length === 0) return undefined;
+  const scopes = new Set(candidates.map((entry) => `${entry.repository.id}\u0000${entry.sourceId}`));
+  if (scopes.size > 1) throw new Error(`More than one repository or source matches '${target}'. Use the exact worker id from 'relay worker list --json'.`);
+  return candidates.find((entry) => ["claimed", "provisioning", "launching", "running", "stopping"].includes(entry.status)) ?? candidates[0];
+}
+
+function addIssueToLegacyTmuxMetadata(run: RunRecord, workerId?: string): void {
+  const tmux = asRecord(run.worker?.metadata?.tmux);
+  if (Object.keys(tmux).length === 0) return;
+  if (typeof tmux.issue !== "string") tmux.issue = run.item.id;
+  if (workerId && typeof tmux.workerId !== "string") tmux.workerId = workerId;
+}
+
+function updateRegistryStatus(
+  registry: GlobalWorkerRegistry,
+  workerId: string,
+  status: Parameters<GlobalWorkerRegistry["updateStatus"]>[1],
+  options: Parameters<GlobalWorkerRegistry["updateStatus"]>[2] = {},
+): void {
+  const at = options.at ?? new Date().toISOString();
+  registry.updateStatus(workerId, status, { ...options, at });
+  registry.appendEvent(workerId, status, at, options.cleanupError ? { cleanupError: options.cleanupError } : undefined);
+}
+
+async function contextForRegistryRecord(context: RelayCommandContext, record: GlobalWorkerRecord): Promise<RelayCommandContext> {
+  if (path.resolve(record.repository.root) === path.resolve(context.projectRoot)) return context;
+  const loaded = await loadRelayConfig(record.repository.root);
+  const store = new RepositoryStateStore(loaded.projectRoot);
+  const repositoryIdentity = await getRepositoryIdentity(loaded.projectRoot);
+  const repository = { id: repositoryIdentity.id, root: repositoryIdentity.root };
+  const runs = await store.listRuns();
+  if (runs.length > 0) context.registry?.importRuns(runs, { repository });
+  return {
+    projectRoot: loaded.projectRoot,
+    config: loaded.config,
+    store,
+    logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty),
+    write: context.write,
+    registry: context.registry,
+    repositoryIdentity,
+  };
+}
 
 export function createRuntimeHandlers(): RelayCommandHandlers {
   return {
@@ -113,11 +183,15 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       context.write(`${run.item.id}: recorded ${status}${Object.keys(outputs).length ? ` with ${Object.keys(outputs).length} output(s)` : ""}.`);
     },
     workerControl: async (context, target, action) => {
+      const { registry, registryRepository } = await ensureRegistryContext(context);
       const candidates = (await context.store.listRuns())
         .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
         .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
       const run = candidates.find((candidate) => ["claimed", "provisioning", "launching", "running"].includes(candidate.status)) ?? candidates[0];
       if (!run?.worker) throw new Error(`No worker found for '${target}'.`);
+      const registered = registry.syncRun(run, { repository: registryRepository });
+      addIssueToLegacyTmuxMetadata(run, registered.id);
+      registry.syncRun(run, { repository: registryRepository });
 
       // Controlling a live worker needs only its execution adapter, not a whole
       // relay: composing one would connect every source for a single key press.
@@ -173,41 +247,79 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       context.write(action === "start" ? await daemon.start() : action === "stop" ? await daemon.stop() : await daemon.status());
     },
     attach: async (context, target) => {
-      const candidates = (await context.store.listRuns())
+      const { registry } = await ensureRegistryContext(context);
+      let targetContext = context;
+      let candidates = (await targetContext.store.listRuns())
         .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
-        .filter((run) => asRecord(run.worker?.metadata?.tmux).target)
+        .filter((run) => Object.keys(asRecord(run.worker?.metadata?.tmux)).length > 0)
         .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+      if (candidates.length === 0) {
+        const record = chooseRegistryCandidate(registryCandidates(registry, target), target);
+        if (record) {
+          targetContext = await contextForRegistryRecord(context, record);
+          candidates = (await targetContext.store.listRuns())
+            .filter((run) => run.worker && (run.id === record.runId || run.worker.id === record.id || run.item.id.toLowerCase() === record.itemId.toLowerCase()))
+            .filter((run) => Object.keys(asRecord(run.worker?.metadata?.tmux)).length > 0)
+            .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+          if (candidates.length === 0 && record.snapshot.worker) candidates = [record.snapshot];
+        }
+      }
       if (candidates.length === 0) throw new Error(`No attachable tmux worker found for '${target}'.`);
       const active = candidates.find((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
       const run = active ?? candidates[0];
-      const executor = new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${context.config.project.name || path.basename(context.projectRoot)}` });
+      const registered = registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
+      addIssueToLegacyTmuxMetadata(run, registered.id);
+      registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
+      const executor = new TmuxExecutionAdapter({ session: targetContext.config.execution.tmuxSession || `task-relay-${targetContext.config.project.name || path.basename(targetContext.projectRoot)}` });
       await executor.attach(run.worker!);
     },
     cleanup: async (context, target) => {
-      const candidates = (await context.store.listRuns()).filter((run) => run.id === target || run.worker?.id === target || run.item.id.toLowerCase() === target.toLowerCase());
+      const { registry } = await ensureRegistryContext(context);
+      let targetContext = context;
+      let candidates = (await targetContext.store.listRuns()).filter((run) => run.id === target || run.worker?.id === target || run.item.id.toLowerCase() === target.toLowerCase());
+      if (candidates.length === 0) {
+        const record = chooseRegistryCandidate(registryCandidates(registry, target), target);
+        if (record) {
+          targetContext = await contextForRegistryRecord(context, record);
+          candidates = (await targetContext.store.listRuns()).filter((run) => run.id === record.runId || run.worker?.id === record.id || run.item.id.toLowerCase() === record.itemId.toLowerCase());
+        }
+      }
       if (candidates.length === 0) throw new Error(`No run or worker found for '${target}'.`);
       const removable = candidates.filter((run) => run.workspace && !run.workspaceCleanedAt);
       if (removable.length === 0) throw new Error(`No removable workspace found for '${target}'.`);
       if (removable.length > 1) throw new Error(`More than one worker workspace matches '${target}'. Use the exact worker or run id from 'relay runs --json'.`);
       const run = removable[0];
       const wasActive = ["claimed", "provisioning", "launching", "running"].includes(run.status);
-      const runtime = await composeRuntime(context);
+      const runtime = await composeRuntime(targetContext);
+      const record = registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
+      addIssueToLegacyTmuxMetadata(run, record.id);
+      registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
       try {
-        if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) await runtime.launcher.stop?.(run.worker, run);
-        if (run.workspace) await runtime.workspace.cleanup(run.workspace, run);
-        const stopped = wasActive ? await runtime.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt: new Date().toISOString() }) : undefined;
-        const cleaned = await runtime.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, new Date().toISOString());
-        if (!cleaned) throw new Error(`Workspace was removed, but run ${run.id} changed before cleanup state could be recorded.`);
+        if (run.worker && (wasActive || run.worker.metadata?.interactive === true)) {
+          await runtime.launcher.stop?.(run.worker, run);
+        }
+        if (run.workspace) await runtime.workspace.cleanup?.(run.workspace, run);
+        let stopped: RunRecord | undefined;
+        let cleaned: RunRecord | undefined;
+        try {
+          stopped = wasActive ? await runtime.runStore.finishActive(run.identity, run.claimedAt, { status: "stopped", completedAt: new Date().toISOString() }) : undefined;
+          cleaned = await runtime.runStore.markWorkspaceCleaned(run.identity, run.claimedAt, new Date().toISOString());
+          if (!cleaned) throw new Error(`Workspace was removed, but run ${run.id} changed before cleanup state could be recorded.`);
+        } catch (error) {
+          updateRegistryStatus(registry, record.id, "cleanup_failed", { cleanupError: error instanceof Error ? error.message : String(error) });
+          throw error;
+        }
+        updateRegistryStatus(registry, record.id, "cleaned", { cleanedAt: cleaned.workspaceCleanedAt });
         const source = runtime.sources.get(run.identity.sourceId);
         if (source && stopped) await source.report({ type: "stopped", sourceId: source.id, run: stopped, occurredAt: stopped.completedAt! });
-        context.write(`Cleaned ${run.item.id}: ${stopped ? "worker stopped and " : ""}workspace removed.`);
+        targetContext.write(`Cleaned ${run.item.id}: ${stopped ? "worker stopped and " : ""}workspace removed.`);
       } finally { await runtime.relay.stop(); }
     },
   };
 }
 
 async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string } = {}): Promise<RuntimeComposition> {
-  const repository: RepositoryScope = { id: context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot };
+  const { registry, repository, registryRepository } = await ensureRegistryContext(context);
   const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger);
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
@@ -246,13 +358,15 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const executor = context.config.execution.adapter === "tmux"
     ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${repository.id}` })
     : new DirectProcessAdapter();
-  const commandLauncher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName });
+  const commandLauncher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName, repositoryIdentity: registryRepository.id });
   const harnessPlugins = pluginHarnesses(context.config, plugins);
-  const launcher = harnessPlugins.length > 0 ? new CompositeAgentLauncher(commandLauncher, harnessPlugins) : commandLauncher;
-  const workspace = context.config.workspace.adapter === "git-worktree"
+  const configuredLauncher = harnessPlugins.length > 0 ? new CompositeAgentLauncher(commandLauncher, harnessPlugins) : commandLauncher;
+  const launcher = new RegistryAgentLauncher(configuredLauncher, registry, registryRepository);
+  const configuredWorkspace = context.config.workspace.adapter === "git-worktree"
     ? new GitWorktreeProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) })
     : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) });
-  const eventStore = new EventingRunStore(context.store, context.logger, repository.id);
+  const workspace = new RegistryWorkspaceProvider(configuredWorkspace, registry, registryRepository);
+  const eventStore = new EventingRunStore(context.store, context.logger, repository.id, registry, registryRepository);
   const triggerProvider: TriggerProvider = { list: async () => triggers };
   const relay = new TaskRelay({
     triggers: triggerProvider,
@@ -611,8 +725,60 @@ function relayLogger(logger: Logger, project: string): RelayLogger {
   return { debug: (message, context) => write("debug", message, context), info: (message, context) => write("info", message, context), warn: (message, context) => write("warn", message, context), error: (message, context) => write("error", message, context) };
 }
 
+/** Adds global cleanup lifecycle tracking without coupling the core engine to SQLite. */
+class RegistryAgentLauncher implements AgentLauncher {
+  constructor(
+    private readonly launcher: AgentLauncher,
+    private readonly registry: GlobalWorkerRegistry,
+    private readonly repository: RepositoryScope,
+  ) {}
+
+  get runtime(): WorkerRuntime | undefined { return this.launcher.runtime; }
+  resolve(profile: AgentProfile | undefined, item: WorkItem, trigger: TriggerDefinition): Promise<AgentResolution> { return this.launcher.resolve(profile, item, trigger); }
+  launch(spec: Parameters<AgentLauncher["launch"]>[0]): Promise<WorkerHandle> { return this.launcher.launch(spec); }
+  wait(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined> { return this.launcher.wait?.(worker, run) ?? Promise.resolve(undefined); }
+  reconcile(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined> { return this.launcher.reconcile?.(worker, run) ?? Promise.resolve(undefined); }
+  async stop(worker: WorkerHandle, run: RunRecord): Promise<void> {
+    const record = this.registry.syncRun(run, { repository: this.repository });
+    updateRegistryStatus(this.registry, record.id, "stopping");
+    try {
+      if (!this.launcher.stop) throw new Error("The configured agent launcher cannot stop workers.");
+      await this.launcher.stop(worker, run);
+      updateRegistryStatus(this.registry, record.id, "processes_stopped");
+    } catch (error) {
+      updateRegistryStatus(this.registry, record.id, "cleanup_failed", { cleanupError: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+}
+
+class RegistryWorkspaceProvider implements WorkspaceProvider {
+  constructor(
+    private readonly workspace: WorkspaceProvider,
+    private readonly registry: GlobalWorkerRegistry,
+    private readonly repository: RepositoryScope,
+  ) {}
+
+  provision(run: RunRecord, signal?: AbortSignal): Promise<Workspace> { return this.workspace.provision(run, signal); }
+  async cleanup(workspace: Workspace, run: RunRecord): Promise<void> {
+    const record = this.registry.syncRun(run, { repository: this.repository });
+    updateRegistryStatus(this.registry, record.id, "workspace_removing");
+    try { await this.workspace.cleanup?.(workspace, run); }
+    catch (error) {
+      updateRegistryStatus(this.registry, record.id, "cleanup_failed", { cleanupError: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+}
+
 class EventingRunStore implements RunStore {
-  constructor(private readonly store: RunStore, private readonly logger: Logger, private readonly project: string) {}
+  constructor(
+    private readonly store: RunStore,
+    private readonly logger: Logger,
+    private readonly project: string,
+    private readonly registry: GlobalWorkerRegistry,
+    private readonly repository: RepositoryScope,
+  ) {}
   findActive(identity: RunIdentity) { return this.store.findActive(identity); }
   countActive(identity: Pick<RunIdentity, "repository" | "sourceId" | "triggerId">) { return this.store.countActive(identity); }
   listActive(repository: RepositoryScope) { return this.store.listActive?.(repository) ?? Promise.resolve([]); }
@@ -625,6 +791,8 @@ class EventingRunStore implements RunStore {
   async recordWorkerOutputs(identity: RunIdentity, claimedAt: string, outputs: Record<string, unknown>, recordedAt: string): Promise<RunRecord | undefined> { const run = await this.store.recordWorkerOutputs?.(identity, claimedAt, outputs, recordedAt); if (run) this.write(run, "run.worker.outputs.recorded"); return run; }
   async update(run: RunRecord): Promise<void> { await this.store.update(run); this.write(run, `run.${run.status}`); }
   private write(run: RunRecord, event: string): void {
+    const record = this.registry.syncRun(run, { repository: this.repository });
+    this.registry.appendEvent(record.id, event, run.updatedAt);
     const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, title: run.item.title, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };
     if (run.error) this.logger.error(fields, event); else this.logger.info(fields, event);
   }
