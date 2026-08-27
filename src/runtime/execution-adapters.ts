@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -73,7 +73,7 @@ export class DirectProcessAdapter implements AgentExecutionAdapter, WorkerRuntim
     });
     if (execution.stdin !== undefined) child.stdin?.end(execution.stdin);
     if (child.pid) this.children.set(child.pid, child);
-    return { pid: child.pid };
+    return { pid: child.pid, workerId: execution.workerId };
   }
 
   async wait(worker: WorkerHandle): Promise<WorkerCompletion | undefined> {
@@ -143,6 +143,7 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
   async execute(execution: AgentExecution): Promise<AgentExecutionResult> {
     await this.ensureSession();
     const window = sanitizeWindowName(execution.workerName);
+    const issue = execution.issue ?? execution.workerName;
     const exitKey = `task-relay-exit-${randomUUID()}`;
     const command = tmuxShellCommand(execution, exitKey);
     const created = await execa("tmux", [
@@ -158,7 +159,18 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
       command,
     ], { env: this.options.environment });
     const [target = "", index = "", actualWindow = window, panePid = ""] = created.stdout.trim().split("\t");
+    // CommandAgentLauncher always supplies the registry generation id. The
+    // target-derived fallback only preserves compatibility for direct callers
+    // of this adapter that predate durable worker identities.
+    const workerId = execution.workerId ?? `tmux-${target}`;
     const parsedPid = Number(panePid);
+    try {
+      await this.tagWorkerWindow(target, workerId, issue);
+    } catch (error) {
+      await execa("tmux", ["kill-window", "-t", target], { reject: false });
+      await execa("tmux", ["set-option", "-gu", `@${exitKey}`], { reject: false });
+      throw error;
+    }
     if (execution.interactiveInput !== undefined) {
       try {
         await this.prepareInteractiveWindow(target);
@@ -171,21 +183,24 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
     }
     return {
       ...(Number.isInteger(parsedPid) && parsedPid > 0 ? { pid: parsedPid } : {}),
-      tmux: { session: this.options.session, window: actualWindow, index, target, exitKey },
+      workerId,
+      tmux: { session: this.options.session, window: actualWindow, index, target, exitKey, workerId, issue },
     };
   }
 
   async wait(worker: WorkerHandle): Promise<WorkerCompletion | undefined> {
     const tmux = tmuxMetadata(worker);
-    if (!tmux.session || !tmux.target || !tmux.exitKey) return undefined;
+    const session = tmux.session ?? this.options.session;
+    if (!tmux.exitKey) return undefined;
     for (;;) {
-      const completion = await this.exitCompletion(tmux.session, tmux.exitKey);
+      const completion = await this.exitCompletion(session, tmux.exitKey);
       if (completion) return completion;
-      if (!await this.windowExists(tmux.session, tmux.target)) {
+      const target = await this.resolveWorkerTarget(worker);
+      if (!target) {
         // Window is gone. Retry exitCompletion — the shell may have written the
         // exit marker (tmux option or temp file) just as the window was closing.
         await delay(50);
-        const final = await this.exitCompletion(tmux.session, tmux.exitKey);
+        const final = await this.exitCompletion(session, tmux.exitKey);
         return final ?? { status: "failed", error: "Tmux worker exited without recording an exit status." };
       }
       // A detached tmux launch must not keep `relay once` alive solely for
@@ -196,23 +211,21 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
 
   async reconcile(worker: WorkerHandle): Promise<WorkerCompletion | undefined> {
     const tmux = tmuxMetadata(worker);
-    if (!tmux.session || !tmux.target) return { status: "failed", error: "Persisted tmux worker has no target." };
-    const completion = tmux.exitKey ? await this.exitCompletion(tmux.session, tmux.exitKey) : undefined;
+    const session = tmux.session ?? this.options.session;
+    if (!tmux.target && !tmux.workerId && !tmux.window) return { status: "failed", error: "Persisted tmux worker has no target." };
+    const completion = tmux.exitKey ? await this.exitCompletion(session, tmux.exitKey) : undefined;
     if (completion) return completion;
-    return await this.windowExists(tmux.session, tmux.target)
+    return await this.resolveWorkerTarget(worker)
       ? undefined
       : { status: "failed", error: "Tmux worker was no longer running when the relay restarted." };
   }
 
   async stop(worker: WorkerHandle): Promise<void> {
-    const tmux = recordMetadata(worker, "tmux");
-    const session = typeof tmux.session === "string" ? tmux.session : undefined;
-    const targetId = typeof tmux.target === "string" ? tmux.target : undefined;
-    const index = typeof tmux.index === "string" ? tmux.index : undefined;
-    const window = typeof tmux.window === "string" ? tmux.window : undefined;
+    const tmux = tmuxMetadata(worker);
+    const session = tmux.session ?? this.options.session;
     if (!session) throw new Error(`Worker ${worker.id} has no tmux session metadata.`);
-    const target = targetId || (index ? `${session}:${index}` : window ? `${session}:${window}` : undefined);
-    if (!target) throw new Error(`Worker ${worker.id} has no tmux window target metadata.`);
+    const target = await this.resolveWorkerTarget(worker);
+    if (!target) throw new Error(`Could not safely find tmux worker ${worker.id}; its persisted target is stale and no tagged window or matching workspace pane was found.`);
     const removed = await execa("tmux", ["kill-window", "-t", target], { reject: false });
     if (removed.exitCode !== 0 && await this.windowExists(session, target)) {
       throw new Error(`Could not stop tmux worker ${worker.id}: ${removed.stderr.trim() || `tmux exited with code ${removed.exitCode}`}`);
@@ -225,26 +238,27 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
   }
 
   async attach(worker: WorkerHandle): Promise<void> {
-    const tmux = recordMetadata(worker, "tmux");
-    const session = typeof tmux.session === "string" ? tmux.session : undefined;
-    const target = typeof tmux.target === "string" ? tmux.target : undefined;
-    const index = typeof tmux.index === "string" ? tmux.index : undefined;
-    const window = typeof tmux.window === "string" ? tmux.window : undefined;
-    if (!session || !target) throw new Error(`Worker ${worker.id} has no attachable tmux target.`);
-    if (!await this.windowExists(session, target)) throw new Error(`Tmux worker ${worker.id} is no longer available.`);
+    const tmux = tmuxMetadata(worker);
+    const session = tmux.session ?? this.options.session;
+    const target = await this.resolveWorkerTarget(worker);
+    if (!target) throw new Error(`Tmux worker ${worker.id} is no longer available.`);
 
     if (process.env.TMUX) {
       await execa("tmux", ["switch-client", "-t", target], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
       return;
     }
-    const attachTarget = `${session}:${index ?? window ?? ""}`.replace(/:$/, "");
-    await execa("tmux", ["attach-session", "-t", attachTarget], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    // attach-session accepts a session target, not a window id. Select the
+    // rebound window first so attaching from a fresh terminal opens the
+    // worker rather than whichever window was active most recently.
+    const selected = await execa("tmux", ["select-window", "-t", target], { reject: false });
+    if (selected.exitCode !== 0) throw new Error(`Could not select tmux worker ${worker.id}: ${selected.stderr.trim() || `tmux exited with code ${selected.exitCode}`}`);
+    await execa("tmux", ["attach-session", "-t", session], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   }
 
   // ── WorkerRuntime ─────────────────────────────────────────────────────────
 
   async open(worker: WorkerHandle, spec: WorkerChildSpec): Promise<WorkerChildHandle> {
-    const target = this.requireTarget(worker);
+    const target = await this.requireTarget(worker);
     const cwd = spec.cwd ?? stringMetadata(worker, "workspace");
     if (!cwd) throw new Error(`Worker ${worker.id} has no workspace directory to open a ${spec.open} in.`);
     if (!await this.aliveTarget(target)) throw new Error(`Worker ${worker.id} is no longer running, so Relay cannot open a ${spec.open} beside it.`);
@@ -293,13 +307,13 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
   }
 
   async sendInput(worker: WorkerHandle, spec: WorkerInputSpec): Promise<void> {
-    const target = spec.child ?? this.requireTarget(worker);
+    const target = spec.child ?? await this.requireTarget(worker);
     if (!await this.aliveTarget(target)) throw new Error(`Worker ${worker.id} is no longer running, so Relay cannot send input to it.`);
     await this.pasteInto(target, spec.text, spec.submit !== false);
   }
 
   async capture(worker: WorkerHandle, options: { child?: string; lines?: number } = {}): Promise<string> {
-    const target = options.child ?? this.requireTarget(worker);
+    const target = options.child ?? await this.requireTarget(worker);
     const args = ["capture-pane", "-p", "-t", target];
     if (options.lines && options.lines > 0) args.push("-S", `-${options.lines}`);
     const captured = await execa("tmux", args, { reject: false });
@@ -310,8 +324,7 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
   }
 
   async exists(worker: WorkerHandle, child?: string): Promise<boolean> {
-    const tmux = tmuxMetadata(worker);
-    const target = child ?? tmux.target;
+    const target = child ?? await this.resolveWorkerTarget(worker);
     return target ? await this.aliveTarget(target) : false;
   }
 
@@ -323,14 +336,95 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
     }
   }
 
-  private requireTarget(worker: WorkerHandle): string {
-    const tmux = tmuxMetadata(worker);
-    if (!tmux.target) throw new Error(`Worker ${worker.id} has no tmux target. Only workers launched by the tmux adapter can be controlled.`);
-    return tmux.target;
+  private async requireTarget(worker: WorkerHandle): Promise<string> {
+    const target = await this.resolveWorkerTarget(worker);
+    if (!target) throw new Error(`Worker ${worker.id} has no tmux target that is live. Only workers launched by the tmux adapter can be controlled.`);
+    return target;
   }
 
   private sessionOf(worker: WorkerHandle): string {
     return tmuxMetadata(worker).session ?? this.options.session;
+  }
+
+  /**
+   * Locate a persisted worker without trusting a recycled tmux window id.
+   * New records use a generation-id option. Old records are only rebound when the
+   * session/window name and a pane's working directory both agree.
+   */
+  private async resolveWorkerTarget(worker: WorkerHandle): Promise<string | undefined> {
+    const tmux = tmuxMetadata(worker);
+    const session = tmux.session ?? this.options.session;
+    if (!session) return undefined;
+
+    if (tmux.target && await this.windowExists(session, tmux.target)) {
+      if (!tmux.workerId || await this.windowOptionEquals(tmux.target, "@task_relay_worker_id", tmux.workerId)) {
+        return tmux.target;
+      }
+    }
+
+    if (tmux.workerId) {
+      const tagged = await this.windowsWithOption(session, "@task_relay_worker_id", tmux.workerId);
+      if (tagged.length === 1) return this.rebind(worker, tagged[0]!);
+      // Ambiguous identities are never selected by name or path: doing so
+      // could attach to or kill an unrelated operator-owned window.
+      if (tagged.length > 1) return undefined;
+    }
+
+    const workspace = stringMetadata(worker, "workspace");
+    if ((!tmux.window && !tmux.issue) || !workspace) return undefined;
+    const candidates = await this.windowsMatchingLegacyMetadata(session, tmux.window ?? "", workspace, tmux.issue);
+    return candidates.length === 1 ? this.rebind(worker, candidates[0]!) : undefined;
+  }
+
+  private async rebind(worker: WorkerHandle, target: string): Promise<string> {
+    const tmux = tmuxMetadata(worker);
+    if (tmux.workerId) await this.tagWorkerWindow(target, tmux.workerId, tmux.issue ?? worker.id);
+    const resolved = await execa("tmux", ["display-message", "-p", "-t", target, "#{window_id}\t#{window_index}\t#{window_name}"], { reject: false });
+    if (resolved.exitCode !== 0) return target;
+    const [windowId, index, window] = resolved.stdout.trim().split("\t");
+    const persisted = recordMetadata(worker, "tmux");
+    if (windowId) persisted.target = windowId;
+    if (index !== undefined) persisted.index = index;
+    if (window) persisted.window = window;
+    return windowId || target;
+  }
+
+  private async windowsWithOption(session: string, option: string, value: string): Promise<string[]> {
+    const listed = await execa("tmux", ["list-windows", "-t", session, "-F", `#{window_id}\t#{${option}}`], { reject: false });
+    if (listed.exitCode !== 0) return [];
+    return listed.stdout.split("\n")
+      .map((line) => line.split("\t"))
+      .filter(([target, optionValue]) => Boolean(target) && optionValue === value)
+      .map(([target]) => target!);
+  }
+
+  private async windowsMatchingLegacyMetadata(session: string, windowName: string, workspace: string, issue?: string): Promise<string[]> {
+    const listed = await execa("tmux", ["list-panes", "-s", "-t", session, "-F", "#{window_id}\t#{window_name}\t#{pane_current_path}"], { reject: false });
+    if (listed.exitCode !== 0) return [];
+    const issueName = issue ? sanitizeWindowName(issue) : undefined;
+    const canonicalWorkspace = await realpath(workspace).catch(() => workspace);
+    const matches = await Promise.all(listed.stdout.split("\n").map(async (line) => {
+      const [target, name, cwd] = line.split("\t");
+      if (!target || !cwd || !(name === windowName || Boolean(issueName && (name === issueName || name?.startsWith(`${issueName}-`))))) return undefined;
+      const canonicalCwd = await realpath(cwd).catch(() => cwd);
+      return canonicalCwd === canonicalWorkspace ? target : undefined;
+    }));
+    return [...new Set(matches.filter((target): target is string => Boolean(target)))];
+  }
+
+  private async tagWorkerWindow(target: string, workerId: string, issue: string): Promise<void> {
+    if (!target) throw new Error("tmux created a worker window but did not report its id.");
+    for (const [option, value] of [["@task_relay_worker_id", workerId], ["@task_relay_issue", issue]] as const) {
+      const tagged = await execa("tmux", ["set-window-option", "-t", target, option, value], { reject: false });
+      if (tagged.exitCode !== 0) {
+        throw new Error(`Could not persist tmux worker identity: ${tagged.stderr.trim() || `tmux exited with code ${tagged.exitCode}`}`);
+      }
+    }
+  }
+
+  private async windowOptionEquals(target: string, option: string, expected: string): Promise<boolean> {
+    const shown = await execa("tmux", ["show-window-options", "-v", "-t", target, option], { reject: false });
+    return shown.exitCode === 0 && shown.stdout.trim() === expected;
   }
 
   /** True for a window id, pane id, or `session:index` that tmux still knows. */
@@ -413,11 +507,12 @@ export class TmuxExecutionAdapter implements AgentExecutionAdapter, WorkerRuntim
     return undefined;
   }
 
-  private async windowExists(_session: string, target: string): Promise<boolean> {
+  private async windowExists(session: string, target: string): Promise<boolean> {
     // This accepts a window id, session:index, or session:name and therefore
     // remains compatible with worker metadata written by earlier versions.
-    const window = await execa("tmux", ["display-message", "-p", "-t", target, "#{window_id}"], { reject: false });
-    return window.exitCode === 0 && window.stdout.trim().length > 0;
+    const window = await execa("tmux", ["display-message", "-p", "-t", target, "#{session_name}\t#{window_id}"], { reject: false });
+    const [actualSession, windowId] = window.stdout.trim().split("\t");
+    return window.exitCode === 0 && actualSession === session && Boolean(windowId);
   }
 }
 
@@ -474,12 +569,16 @@ function recordMetadata(worker: WorkerHandle, key: string): Record<string, unkno
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 }
 
-function tmuxMetadata(worker: WorkerHandle): { session?: string; target?: string; exitKey?: string } {
+function tmuxMetadata(worker: WorkerHandle): { session?: string; window?: string; index?: string; target?: string; exitKey?: string; workerId?: string; issue?: string } {
   const tmux = recordMetadata(worker, "tmux");
   return {
     session: typeof tmux.session === "string" ? tmux.session : undefined,
+    window: typeof tmux.window === "string" ? tmux.window : undefined,
+    index: typeof tmux.index === "string" ? tmux.index : undefined,
     target: typeof tmux.target === "string" ? tmux.target : undefined,
     exitKey: typeof tmux.exitKey === "string" ? tmux.exitKey : undefined,
+    workerId: typeof tmux.workerId === "string" ? tmux.workerId : undefined,
+    issue: typeof tmux.issue === "string" ? tmux.issue : undefined,
   };
 }
 

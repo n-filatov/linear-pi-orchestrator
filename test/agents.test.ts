@@ -56,6 +56,8 @@ describe("agent resolution", () => {
       interactiveInput: undefined,
       stdin: undefined,
       workerName: "ENG-123 Review pull request",
+      workerId: undefined,
+      issue: "ENG-123",
     }]);
   });
 

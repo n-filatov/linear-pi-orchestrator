@@ -8,10 +8,22 @@ import { relayConfigV2Schema, type RelayConfigV2, type RelayTriggerV2 } from "..
 import { createEventLogger, eventLogPath, logEvent, readEvents, stateDirectory } from "../logging/events.js";
 import { errorTable, eventsTable, statusTable } from "../logging/tables.js";
 import { RepositoryStateStore } from "../state/store.js";
+import { GlobalWorkerRegistry, type GlobalWorkerRecord } from "../state/global-worker-registry.js";
+import { getRepositoryIdentity, type RepositoryIdentity } from "../state/repository-identity.js";
 import { writeFile } from "node:fs/promises";
 import { addPluginCommands } from "./plugin-commands.js";
 
-export type RelayCommandContext = { projectRoot: string; config: RelayConfigV2; store: RepositoryStateStore; logger: ReturnType<typeof createEventLogger>; write: (value: string) => void };
+export type RelayCommandContext = {
+  projectRoot: string;
+  config: RelayConfigV2;
+  store: RepositoryStateStore;
+  logger: ReturnType<typeof createEventLogger>;
+  write: (value: string) => void;
+  /** Machine-global worker index, shared by every checkout and Relay process. */
+  registry?: GlobalWorkerRegistry;
+  /** Stable across clones when a repository has an origin remote. */
+  repositoryIdentity?: RepositoryIdentity;
+};
 export type RelayCommandHandlers = {
   once?: (context: RelayCommandContext, options: { trigger?: string; task?: string }) => Promise<void>;
   watch?: (context: RelayCommandContext, options: { trigger?: string }) => Promise<void>;
@@ -133,7 +145,70 @@ async function pluginHealth(config: RelayConfigV2 | undefined): Promise<[string,
 
 async function resolveContext(cwd: () => string, write: (value: string) => void): Promise<RelayCommandContext> {
   const loaded = await loadRelayConfig(cwd());
-  return { projectRoot: loaded.projectRoot, config: loaded.config, store: new RepositoryStateStore(loaded.projectRoot), logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty), write };
+  const store = new RepositoryStateStore(loaded.projectRoot);
+  const repositoryIdentity = await getRepositoryIdentity(loaded.projectRoot);
+  const registry = new GlobalWorkerRegistry();
+  const repository = { id: repositoryIdentity.id, root: repositoryIdentity.root };
+  const runs = await store.listRuns();
+  if (runs.length > 0) registry.importRuns(runs, { repository });
+  return { projectRoot: loaded.projectRoot, config: loaded.config, store, logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty), write, registry, repositoryIdentity };
+}
+
+async function openGlobalRegistry(cwd: () => string): Promise<GlobalWorkerRegistry> {
+  const registry = new GlobalWorkerRegistry();
+  try {
+    const loaded = await loadRelayConfig(cwd());
+    const identity = await getRepositoryIdentity(loaded.projectRoot);
+    const repository = { id: identity.id, root: identity.root };
+    const store = new RepositoryStateStore(loaded.projectRoot);
+    const runs = await store.listRuns();
+    if (runs.length > 0) registry.importRuns(runs, { repository });
+  } catch {
+    // Global inspection intentionally works outside a configured repository.
+  }
+  return registry;
+}
+
+async function resolveWorkerContext(cwd: () => string, write: (value: string) => void, target: string): Promise<RelayCommandContext> {
+  try { return await resolveContext(cwd, write); }
+  catch (localError) {
+    const registry = await openGlobalRegistry(cwd);
+    const normalized = target.toLowerCase();
+    const candidates = registry.list({ includeCleaned: true }).filter((entry) => entry.id === target
+      || entry.runId === target
+      || entry.snapshot.worker?.id === target
+      || entry.issueKey.toLowerCase() === normalized
+      || entry.itemId.toLowerCase() === normalized);
+    const scopes = new Set(candidates.map((entry) => `${entry.repository.id}\u0000${entry.sourceId}`));
+    if (scopes.size > 1) {
+      registry.close();
+      throw new Error(`More than one repository or source matches '${target}'. Use the exact worker id from 'relay worker list --json'.`);
+    }
+    const record = candidates.find((entry) => ["claimed", "provisioning", "launching", "running", "stopping"].includes(entry.status)) ?? candidates[0];
+    if (!record) { registry.close(); throw localError; }
+    try {
+      const loaded = await loadRelayConfig(record.repository.root);
+      const store = new RepositoryStateStore(loaded.projectRoot);
+      const repositoryIdentity = await getRepositoryIdentity(loaded.projectRoot);
+      const repository = { id: repositoryIdentity.id, root: repositoryIdentity.root };
+      const runs = await store.listRuns();
+      if (runs.length > 0) registry.importRuns(runs, { repository });
+      return { projectRoot: loaded.projectRoot, config: loaded.config, store, logger: createEventLogger(loaded.projectRoot, loaded.config.logging.level, loaded.config.logging.pretty), write, registry, repositoryIdentity };
+    } catch (error) {
+      registry.close();
+      throw error;
+    }
+  }
+}
+
+function workerSummary(worker: GlobalWorkerRecord): string {
+  const tmux = [worker.runtime.tmuxSession, worker.runtime.tmuxWindow, worker.runtime.tmuxPane].filter(Boolean).join(":") || "not recorded";
+  return statusTable([
+    ["Issue", worker.issueKey], ["Status", worker.status], ["Worker", worker.id], ["Run", worker.runId],
+    ["Repository", worker.repository.id], ["Repository root", worker.repository.root], ["Source", worker.sourceId],
+    ["Workspace", worker.workspacePath || "not provisioned"], ["Branch", worker.branch || "not recorded"], ["Harness", worker.harness || "not recorded"], ["tmux", tmux],
+    ["Updated", worker.updatedAt], ...(worker.cleanupError ? [["Cleanup error", worker.cleanupError] as [string, string]] : []),
+  ]);
 }
 function noHandler(command: string): never { throw new Error(`${command} is available in the CLI but no runtime integration has been registered. Wire RelayCommandHandlers when composing the application.`); }
 
@@ -194,6 +269,43 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
 
   program.command("runs").description("List persisted runs.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); if (flags.json) print(JSON.stringify(runs, null, 2)); else print(eventsTable(runs.map((run) => ({ project: context.config.project.name || context.projectRoot, timestamp: run.claimedAt, level: run.status === "failed" ? "error" : "info", task: run.item.id, trigger: run.trigger.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event: run.status, error: run.error })))); });
 
+  const worker = program.command("worker").description("Find workers across repositories and Relay restarts.");
+  worker.command("list").description("List workers in the machine-global registry.")
+    .option("--all", "include workers whose workspace was cleaned")
+    .option("--repository <id>", "limit results to a normalized repository id")
+    .option("--json", "emit JSON")
+    .action(async (flags: { all?: boolean; repository?: string; json?: boolean }) => {
+      const registry = await openGlobalRegistry(cwd);
+      try {
+        const workers = registry.list({ includeCleaned: flags.all, repositoryId: flags.repository });
+        if (flags.json) { print(JSON.stringify(workers, null, 2)); return; }
+        if (workers.length === 0) { print("No workers recorded in the global registry."); return; }
+        print(eventsTable(workers.map((entry) => ({
+          project: entry.repository.id, timestamp: entry.updatedAt,
+          level: entry.status === "failed" || entry.status === "cleanup_failed" ? "error" : "info",
+          task: entry.issueKey, trigger: entry.triggerId, agent: entry.harness,
+          runId: entry.id, event: entry.status, error: entry.cleanupError,
+        }))));
+      } finally { registry.close(); }
+    });
+  worker.command("show <issue>").description("Show the latest worker for an issue key from any checkout.")
+    .option("--repository <id>", "disambiguate by normalized repository id")
+    .option("--source <id>", "disambiguate by source id")
+    .option("--all", "include workers whose workspace was cleaned")
+    .option("--json", "emit JSON")
+    .action(async (issue: string, flags: { repository?: string; source?: string; all?: boolean; json?: boolean }) => {
+      const registry = await openGlobalRegistry(cwd);
+      try {
+        const result = registry.lookupByIssueKey({ issueKey: issue, repositoryId: flags.repository, sourceId: flags.source, includeCleaned: flags.all });
+        if (result.kind === "not_found") throw new Error(`No worker found for issue '${issue}'.`);
+        if (result.kind === "ambiguous") {
+          const choices = [...new Set(result.workers.map((entry) => `${entry.repository.id} (${entry.sourceId})`))];
+          throw new Error(`Issue '${issue}' exists in more than one repository or source: ${choices.join(", ")}. Use --repository or --source.`);
+        }
+        if (flags.json) print(JSON.stringify(result.worker, null, 2)); else print(workerSummary(result.worker));
+      } finally { registry.close(); }
+    });
+
   program.command("logs").description("Read structured JSONL events.").option("--follow", "follow new events").option("--level <level>", "exact log level").option("--task <task>", "task identifier").option("--run <id>", "run id").option("--json", "emit JSON instead of a table").action(async (flags: { follow?: boolean; level?: string; task?: string; run?: string; json?: boolean }) => {
     const context = await resolveContext(cwd, print); const filtered = () => readEvents(context.projectRoot).filter((event) => (!flags.level || event.level === flags.level) && (!flags.task || event.task === flags.task) && (!flags.run || event.runId === flags.run));
     let seen = 0;
@@ -210,8 +322,8 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   program.command("once").description("Process one source poll.").option("--trigger <id>").option("--task <id>").action(async (flags) => { const context = await resolveContext(cwd, print); if (!options.handlers?.once) noHandler("once"); await options.handlers.once(context, flags); });
   program.command("watch").description("Run continuous polling in the foreground.").option("--trigger <id>").action(async (flags) => { const context = await resolveContext(cwd, print); if (!options.handlers?.watch) noHandler("watch"); await options.handlers.watch(context, flags); });
   program.command("update [version]").description("Check for or install a Task Relay CLI update.").option("--check", "check without installing").action(async (version: string | undefined, flags: { check?: boolean }) => { if (!options.handlers?.update) noHandler("update"); print(await options.handlers.update({ check: flags.check, version: version ?? "latest" })); });
-  program.command("attach <task-or-run>").description("Attach to an interactive tmux worker.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.attach) noHandler("attach"); await options.handlers.attach(context, target); });
-  program.command("cleanup <task-or-run>").description("Stop a worker and remove its isolated workspace.").action(async (target: string) => { const context = await resolveContext(cwd, print); if (!options.handlers?.cleanup) noHandler("cleanup"); await options.handlers.cleanup(context, target); });
+  program.command("attach <task-or-run>").description("Attach to an interactive tmux worker.").action(async (target: string) => { const context = await resolveWorkerContext(cwd, print, target); if (!options.handlers?.attach) noHandler("attach"); await options.handlers.attach(context, target); });
+  program.command("cleanup <task-or-run>").description("Stop a worker and remove its isolated workspace.").action(async (target: string) => { const context = await resolveWorkerContext(cwd, print, target); if (!options.handlers?.cleanup) noHandler("cleanup"); await options.handlers.cleanup(context, target); });
   program.command("signal <task-or-worker> <outcome>")
     .description("Report a worker's own result so a workflow job can finish. Outcome is 'done' or 'failed'.")
     .option("--output <key=value>", "record an output for later jobs (repeatable)", (value: string, previous: string[]) => [...previous, value], [])

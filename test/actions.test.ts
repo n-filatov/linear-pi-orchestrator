@@ -198,6 +198,36 @@ describe("generic action execution", () => {
     expect(store.runs.get(workerRun.id)).toMatchObject({ status: "stopped", workspaceCleanedAt: "2026-08-15T12:00:00.000Z" });
   });
 
+  it("keeps the run and workspace recoverable when worker stop cannot be verified", async () => {
+    const store = new MemoryRunStore();
+    const item: WorkItem = { sourceId: "linear", id: "ENG-124", title: "Done", terminal: true };
+    const launchedTrigger: TriggerDefinition = { id: "implementation", sourceId: "linear", repository, enabled: true };
+    const identity = { repository, sourceId: "linear", itemId: item.id, triggerId: launchedTrigger.id };
+    const workerRun: RunRecord = {
+      id: createRunKey(identity), identity, item, trigger: launchedTrigger, agent: { agentId: "codex" },
+      status: "running", claimedAt: "earlier", updatedAt: "earlier",
+      workspace: { path: "/workspace/ENG-124" }, worker: { id: "stale-tmux-worker", startedAt: "earlier" },
+    };
+    store.runs.set(workerRun.id, workerRun);
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins()) registry.registerAction(plugin);
+    const cleaned: string[] = [];
+    const activeRelay = relay({
+      trigger: baseTrigger([{ id: "cleanup", use: "cleanup", config: {} }]), items: [item], runStore: store, registry,
+      agent: {
+        resolve: async () => ({ agentId: "codex" }), launch: async () => ({ id: "unused", startedAt: "now" }),
+        stop: async () => { throw new Error("stale tmux target"); },
+      },
+      workspace: { provision: async () => ({ path: "/workspace" }), cleanup: async (workspace) => { cleaned.push(workspace.path); } },
+    });
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(1);
+    expect(store.runs.get(workerRun.id)?.status).toBe("running");
+    expect(store.runs.get(workerRun.id)?.workspaceCleanedAt).toBeUndefined();
+    expect(cleaned).toEqual([]);
+  });
+
   it("cleans a reopened worker generation even when its worker ID is reused", async () => {
     const store = new MemoryRunStore();
     const item: WorkItem = { sourceId: "linear", id: "ENG-123", title: "Done", terminal: true };

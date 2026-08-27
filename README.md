@@ -667,6 +667,9 @@ relay plugin install <package>  # install into the managed plugin directory
 relay plugin list               # installed plugins and what this project uses
 relay status                    # sources, harnesses, actions, triggers, and run state
 relay runs                      # persisted worker/run table
+relay worker list               # workers from every repository on this machine
+relay worker show ENG-123       # locate a worker by issue from any directory
+relay worker show ENG-123 --json
 relay logs --level error
 relay logs --task ENG-123 --follow
 relay config schema --write        # JSON Schema for editor completion
@@ -684,6 +687,22 @@ relay daemon start|stop|status
 ```
 
 `trigger test` should preview the source items, matching result, selected workers, planned actions, and rendered prompt without changing state. Events are structured JSONL under `${XDG_STATE_HOME:-~/.local/state}/task-relay/<repo>-<hash>/events.jsonl`; human tables are rendered from those records.
+
+Worker discovery is machine-global. Relay stores an SQLite registry at
+`${XDG_STATE_HOME:-~/.local/state}/task-relay/registry.sqlite`, while keeping the
+repository JSON state as the dispatch ledger. A normalized Git origin identifies
+the same repository across clones and linked worktrees; repositories without an
+origin use their canonical Git common-directory path. Existing JSON runs are
+indexed automatically when that repository is next opened; the repository JSON
+ledger remains backward-compatible and is not replaced.
+
+Interactive tmux windows carry `@task_relay_worker_id` and
+`@task_relay_issue` options. Persisted tmux window indexes are only cached
+addresses: attach, control, and cleanup verify the worker tag and rebind a stale
+address before acting. Cleanup is recorded as a durable sequence
+(`stopping` → `processes_stopped` → `workspace_removing` → `cleaned`); an
+unverified stop or workspace error becomes `cleanup_failed` and leaves the
+workspace available for recovery instead of reporting false success.
 
 Version 1 configuration remains accepted and is normalized in memory to version 2. A future `relay config migrate` command can write the equivalent v2 file; no existing repository must be migrated before upgrading.
 
