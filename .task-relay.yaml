@@ -75,6 +75,9 @@ workflows:
         label: relay-test
         statusTypes:
           - started
+        assignee: 14b08a5d-74b7-4824-99f9-e3f5c319fd91
+        statuses:
+          - In Progress
       fire:
         policy: on-change
     timeoutMinutes: 1440
