@@ -51,6 +51,13 @@ export class SdkMcpToolClient implements McpToolClient {
           args: options.transport.args,
           cwd: options.transport.cwd,
           env: options.transport.env,
+          // MCP servers reserve stdout for protocol messages, but many proxy
+          // tools also write verbose connection traces to stderr. The SDK
+          // inherits stderr by default, which floods Relay's dashboard pane
+          // with OAuth/JSON-RPC chatter on every poll. Connection failures
+          // still surface through `client.connect` / `callTool` and are logged
+          // by Relay with the source, ticket, and actionable error.
+          stderr: "ignore",
         })
       : new StreamableHTTPClientTransport(new URL(options.transport.url), {
           requestInit: options.transport.headers ? { headers: options.transport.headers } : undefined,

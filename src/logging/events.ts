@@ -35,15 +35,39 @@ export function createEventLogger(projectRoot: string, level: string = "info", p
   mkdirSync(directory, { recursive: true });
   const file = pino.destination({ dest: eventLogPath(projectRoot), sync: true, mkdir: true });
   const destination = prettyOutput
-    // The watch table is the live progress UI. Keep the console reserved for
-    // warnings and errors; the complete structured lifecycle stays in JSONL.
-    ? pino.multistream([{ level, stream: file }, { level: "warn", stream: createPrettyStream() }])
+    // Dashboard mode mirrors meaningful lifecycle events to its pane while
+    // retaining the full structured audit trail in JSONL.
+    ? pino.multistream([{ level, stream: file }, { level, stream: createPrettyStream() }])
     : file;
   return pino({ level, base: undefined, timestamp: pino.stdTimeFunctions.isoTime }, destination);
 }
 
-/** A pino-pretty stream for exceptional live command output. */
-export function createPrettyStream() { return pretty({ colorize: Boolean(process.stdout.isTTY), singleLine: true }); }
+/** A scannable pane view: one operational event per indented block. */
+export function createPrettyStream() {
+  return pretty({
+    colorize: Boolean(process.stdout.isTTY),
+    singleLine: false,
+    hideObject: true,
+    messageFormat: (log, messageKey) => {
+      const text = String(log[messageKey] ?? "");
+      const string = (key: string) => typeof log[key] === "string" ? log[key] : undefined;
+      const ticket = string("task") ?? string("itemId");
+      const scope = string("workflowId") ?? string("triggerId") ?? string("trigger");
+      const node = string("jobId") ?? string("actionId");
+      const actionType = string("actionType");
+      const duration = typeof log.duration === "number" ? ` · ${log.duration < 1000 ? `${log.duration}ms` : `${(log.duration / 1000).toFixed(1)}s`}` : "";
+      const detail = string("reason") ?? string("error");
+      const title = string("title");
+      return [
+        `${text}${duration}`,
+        ticket && `  Ticket:   ${ticket}${title ? ` — ${title}` : ""}`,
+        scope && `  Workflow: ${scope}`,
+        node && `  Node:     ${node}${actionType ? ` (${actionType})` : ""}`,
+        detail && `  Detail:   ${detail}`,
+      ].filter(Boolean).join("\n");
+    },
+  });
+}
 
 export function logEvent(logger: Logger, event: RelayEvent): void {
   const level = event.error ? "error" : "info";

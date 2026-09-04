@@ -939,7 +939,11 @@ class EventingRunStore implements RunStore {
     const record = this.registry.syncRun(run, { repository: this.repository });
     this.registry.appendEvent(record.id, event, run.updatedAt);
     const fields = { project: this.project, trigger: run.identity.triggerId, source: run.identity.sourceId, task: run.item.id, title: run.item.title, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event, ...(run.error ? { error: run.error } : {}) };
-    if (run.error) this.logger.error(fields, event); else this.logger.info(fields, event);
+    if (run.error) this.logger.error(fields, event);
+    // State persistence is frequent (claim, provisioning, child handles,
+    // terminal transitions and heartbeat updates). A workflow/action owns the
+    // human-facing outcome, so all run-store updates stay at debug.
+    else this.logger.debug(fields, event);
   }
 }
 

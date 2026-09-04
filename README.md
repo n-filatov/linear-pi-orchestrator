@@ -407,6 +407,22 @@ Later actions can also read earlier action results, for example
 `{{actions.plan.output.summary}}`. A prompt uses either `promptFile` or inline
 `prompt`, never both.
 
+### Operational logs
+
+Relay's default log is an operational audit, not a transcript of every source
+poll or MCP protocol message. An `info` entry answers: **what happened to
+which ticket, in which workflow/action, and how long did it take?** It records
+worker launches, completed actions, workflow transitions, warnings, and errors.
+Routine deduplication and "nothing to do" skips are `debug` entries so they do
+not flood the dashboard or terminal.
+
+Each useful event includes the ticket ID/title, trigger or workflow job, action
+type, worker ID when relevant, duration, and a reason/error when there is one.
+The complete machine-readable record remains in `events.jsonl`; use
+`relay logs --task NOT-123` for one ticket or `relay logs --level error` when
+diagnosing a failure. MCP proxy transport chatter is intentionally suppressed:
+Relay reports the resulting source connection/call failure with context instead.
+
 ### Telling Relay a job is done
 
 An interactive agent does not exit when it stops working, so `needs: implement`

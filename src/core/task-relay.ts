@@ -246,13 +246,19 @@ export class TaskRelay {
       }
     }
 
-    let run = await runs.openWorkflowRun({
+    const existingRun = await runs.findWorkflowRun(identity);
+    let run = existingRun ?? await runs.openWorkflowRun({
       identity,
       item,
       startedAt,
       ...(workflow.timeoutMs ? { timeoutAt: new Date(this.now().getTime() + workflow.timeoutMs).toISOString() } : {}),
       ...(group ? { concurrencyGroup: group } : {}),
     });
+    if (!existingRun && run.startedAt === startedAt) {
+      this.dependencies.logger.info("Workflow action triggered", {
+        event: "workflow.triggered", workflowId: workflow.id, sourceId: source.id, task: item.id, title: item.title,
+      });
+    }
     if (run.status !== "running") {
       // Say so rather than returning silently: an item that keeps matching but
       // never advances is otherwise indistinguishable from a broken workflow.
@@ -351,7 +357,7 @@ export class TaskRelay {
     const trigger = workflowAsTrigger(workflow, job.id);
     const executionId = JSON.stringify([identity.repository.id, identity.repository.root, workflow.id, identity.itemId, identity.occurrence, job.id]);
 
-    this.dependencies.logger.info("Workflow job started", { workflowId: workflow.id, jobId: job.id, actionType: job.use, itemId: item.id, title: item.title });
+    const startedAt = Date.now();
     try {
       // Workflow jobs share the action plugin contract with trigger actions.
       // In particular, worker-targeted plugins (such as `cleanup`) must run
@@ -427,6 +433,10 @@ export class TaskRelay {
       // a workflow job into the live `started` state.
       const status: WorkflowJobStatus = plugin.target === "worker" ? "succeeded" : runId ? "started" : "succeeded";
       if (job.use !== "launch") this.recordItemOutcome(result, trigger, item, "action", `${job.id}: ${status}.`, workerId);
+      this.dependencies.logger.info("Workflow node completed", {
+        event: "workflow.node.completed", workflowId: workflow.id, jobId: job.id, actionType: job.use, task: item.id, title: item.title,
+        workerId, duration: Date.now() - startedAt, status,
+      });
       return runs.updateWorkflowJob(identity, job.id, {
         status,
         runId,
@@ -437,7 +447,10 @@ export class TaskRelay {
       });
     } catch (error) {
       result.actionsFailed += 1;
-      this.dependencies.logger.error("Workflow job failed", { workflowId: workflow.id, jobId: job.id, itemId: item.id, title: item.title, error: messageFor(error) });
+      this.dependencies.logger.error("Workflow node failed", {
+        event: "workflow.node.failed", workflowId: workflow.id, jobId: job.id, actionType: job.use, task: item.id, title: item.title,
+        duration: Date.now() - startedAt, error: messageFor(error),
+      });
       this.recordItemOutcome(result, trigger, item, "failed", `${job.id}: ${messageFor(error)}`);
       return runs.updateWorkflowJob(identity, job.id, { status: "failed", error: messageFor(error), at: this.now().toISOString(), attempted: true });
     }
@@ -718,7 +731,10 @@ export class TaskRelay {
       await this.dependencies.runStore.update(run);
       await this.report(source, "launched", run);
       this.startObservingWorker(source, run);
-      this.dependencies.logger.info("Task relay launched work", {
+      // The owning trigger/workflow action emits its single node outcome once
+      // this launch returns. Keep this lower-level lifecycle detail out of
+      // the dashboard pane so one configured node means one console entry.
+      this.dependencies.logger.debug("Task relay launched work", {
         runId: run.id,
         triggerId: trigger.id,
         sourceId: source.id,
@@ -766,13 +782,23 @@ export class TaskRelay {
         const executionId = actionExecutionId(trigger, item, action.id, run?.worker?.id, run?.claimedAt);
         const actionClaimedAt = await this.claimActionExecution(executionId, trigger, item, action.id);
         if (!actionClaimedAt) {
-          this.dependencies.logger.debug("Trigger action deduplicated", { triggerId: trigger.id, actionId: action.id, itemId: item.id, title: item.title, workerId: run?.worker?.id });
+          this.dependencies.logger.debug("Action not run: already completed or active", {
+            event: "trigger.action.deduplicated", triggerId: trigger.id, actionId: action.id, actionType: action.use,
+            task: item.id, title: item.title, workerId: run?.worker?.id,
+          });
           result.skipped += 1;
           this.recordItemOutcome(result, trigger, item, "skipped", `${action.id}: action was already completed or is running.`, run?.worker?.id);
           continue;
         }
         try {
-          this.dependencies.logger.info("Trigger action started", { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, title: item.title, workerId: run?.worker?.id });
+          const startedAt = Date.now();
+          // A started/then-skipped pair appears on every poll for work that is
+          // already handled. Keep it in debug for diagnosis; the live feed is
+          // reserved for outcomes a person can act on.
+          this.dependencies.logger.debug("Action started", {
+            event: "trigger.action.started", executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use,
+            task: item.id, title: item.title, workerId: run?.worker?.id,
+          });
           const context: ActionContext = {
             executionId,
             actionId: action.id,
@@ -800,7 +826,16 @@ export class TaskRelay {
           outputs[action.id] = actionResult;
           result.actionsExecuted += 1;
           await this.finishActionExecution(executionId, actionClaimedAt, actionResult.status, actionResult.output);
-          this.dependencies.logger.info(`Trigger action ${actionResult.status}`, { executionId, triggerId: trigger.id, actionId: action.id, actionType: action.use, itemId: item.id, title: item.title, workerId: run?.worker?.id });
+          const fields = {
+            event: `trigger.action.${actionResult.status}`, executionId, triggerId: trigger.id, actionId: action.id,
+            actionType: action.use, task: item.id, title: item.title, workerId: run?.worker?.id,
+            duration: Date.now() - startedAt, ...(actionResult.message ? { reason: actionResult.message } : {}),
+          };
+          if (actionResult.status === "skipped") {
+            this.dependencies.logger.debug("Action skipped", fields);
+          } else {
+            this.dependencies.logger.info("Action completed", fields);
+          }
           if (actionResult.status === "skipped") {
             result.skipped += 1;
             if (action.use !== "launch") this.recordItemOutcome(result, trigger, item, "skipped", `${action.id}: ${actionResult.message ?? "Action skipped."}`, run?.worker?.id);
@@ -810,7 +845,10 @@ export class TaskRelay {
         } catch (error) {
           result.actionsFailed += 1;
           await this.finishActionExecution(executionId, actionClaimedAt, "failed", undefined, messageFor(error));
-          this.dependencies.logger.error("Trigger action failed", { triggerId: trigger.id, actionId: action.id, itemId: item.id, title: item.title, error: messageFor(error) });
+          this.dependencies.logger.error("Action failed", {
+            event: "trigger.action.failed", triggerId: trigger.id, actionId: action.id, actionType: action.use,
+            task: item.id, title: item.title, workerId: run?.worker?.id, error: messageFor(error),
+          });
           this.recordItemOutcome(result, trigger, item, "failed", `${action.id}: ${messageFor(error)}`, run?.worker?.id);
           if (!action.continueOnError) {
             haltPipeline = true;

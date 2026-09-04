@@ -993,11 +993,11 @@ export function renderDashboardHtml(projectName: string): string {
       <div class="text-base-content/30 py-4">Waiting for events…</div>
     </template>
     <template x-for="(e, i) in events" :key="i">
-      <div class="flex gap-2">
+      <div class="flex gap-2 py-0.5">
         <span class="text-base-content/30 shrink-0" x-text="fmtTime(e.time)"></span>
         <span class="shrink-0 w-14" :class="e.level >= 50 ? 'text-error' : e.level >= 40 ? 'text-warning' : 'text-base-content/40'" x-text="levelName(e.level)"></span>
-        <span class="text-primary shrink-0 w-20 truncate" x-text="e.task || ''"></span>
-        <span class="text-base-content/80 break-all" x-text="e.msg || e.event || ''"></span>
+        <span class="text-primary shrink-0 w-20 truncate" :title="e.title || e.itemId || e.task" x-text="e.task || e.itemId || 'system'"></span>
+        <span class="text-base-content/80 min-w-0 truncate" :title="eventDetail(e)" x-text="eventDetail(e)"></span>
       </div>
     </template>
   </div>
@@ -1063,6 +1063,12 @@ function relay() {
     },
     levelName(level) { return level >= 50 ? 'error' : level >= 40 ? 'warn' : level >= 30 ? 'info' : 'debug'; },
     fmtTime(iso) { if (!iso) return '--:--:--'; var d = new Date(iso), z = function(n){return String(n).padStart(2,'0');}; return z(d.getHours())+':'+z(d.getMinutes())+':'+z(d.getSeconds()); },
+    eventDetail(e) {
+      var action = e.actionId ? (e.actionId + (e.actionType ? ' (' + e.actionType + ')' : '')) : '';
+      var result = e.error || e.reason || e.msg || e.event || 'Event recorded';
+      var duration = typeof e.duration === 'number' ? ' · ' + (e.duration < 1000 ? e.duration + 'ms' : (e.duration / 1000).toFixed(1) + 's') : '';
+      return [action, result].filter(Boolean).join(' — ') + duration;
+    },
 
     // ── Workflows ──────────────────────────────────────────────────────────
     async switchToWorkflows() {
