@@ -60,9 +60,10 @@ describe("CodexAppServerHarness", () => {
       .resolves.toMatchObject({ threadId: "thread-1", turnId: "turn-1", delivery: "immediate" });
     expect(process.messages).toContainEqual(expect.objectContaining({ method: "turn/steer", params: expect.objectContaining({ expectedTurnId: "turn-1" }) }));
 
-    const idle = harness.sendPrompt(worker, { prompt: "Then test", delivery: "idle", timeoutMs: 1_000 });
+    const idle = harness.sendPrompt(worker, { prompt: "Then test", model: "gpt-5.6-sol", effort: "high", delivery: "idle", timeoutMs: 1_000 });
     process.notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
     await expect(idle).resolves.toMatchObject({ threadId: "thread-1", turnId: "turn-2", delivery: "idle" });
+    expect(process.messages).toContainEqual(expect.objectContaining({ method: "turn/start", params: expect.objectContaining({ model: "gpt-5.6-sol", effort: "high" }) }));
 
     await harness.stop(worker);
     expect(process.messages).toContainEqual(expect.objectContaining({ method: "turn/interrupt" }));

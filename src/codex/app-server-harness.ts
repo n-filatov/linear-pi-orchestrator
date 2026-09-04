@@ -21,6 +21,8 @@ export type CodexAppServerWorkerMetadata = {
 
 export type CodexAppServerPromptOptions = {
   prompt: string;
+  model?: string;
+  effort?: string;
   delivery: "idle" | "immediate";
   waitForCompletion?: boolean;
   timeoutMs: number;
@@ -119,6 +121,8 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
       }
       const started = await session.client.requestTurn({
         threadId: session.threadId,
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { effort: options.effort } : {}),
         input: [{ type: "text", text: options.prompt }],
       });
       turnId = started.turn.id;

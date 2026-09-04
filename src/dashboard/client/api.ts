@@ -27,9 +27,9 @@ export function applyCodexModelCatalog(catalog: Json, models: CodexModelSummary[
     if (values.length) schema.properties.model = { ...schema.properties.model, type: "string", title: "Codex model", enum: values, default: defaultModel?.model || defaultModel?.id };
     if (efforts.length) schema.properties.effort = { ...schema.properties.effort, type: "string", title: "Reasoning effort", enum: efforts, default: defaultModel?.defaultReasoningEffort };
   };
-  for (const key of ["action:codex.start-session", "codex.start-session"]) apply(catalog.schemas?.[key]?.schema);
+  for (const key of ["action:codex.send-prompt", "codex.send-prompt"]) apply(catalog.schemas?.[key]?.schema);
   for (const entry of Array.isArray(catalog.entries) ? catalog.entries : []) {
-    if (entry?.kind === "action" && entry?.use === "codex.start-session") apply(entry.configSchema ?? entry.schema);
+    if (entry?.kind === "action" && entry?.use === "codex.send-prompt") apply(entry.configSchema ?? entry.schema);
   }
   return catalog;
 }

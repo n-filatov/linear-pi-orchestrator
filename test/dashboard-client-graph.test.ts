@@ -31,8 +31,8 @@ describe("dashboard modular action references", () => {
     const configSchema = { type: "object", properties: { model: { type: "string" }, effort: { type: "string" } } };
     const mappedSchema = structuredClone(configSchema);
     const catalog = {
-      entries: [{ kind: "action", use: "codex.start-session", configSchema }],
-      schemas: { "action:codex.start-session": { schema: mappedSchema } },
+      entries: [{ kind: "action", use: "codex.send-prompt", configSchema }],
+      schemas: { "action:codex.send-prompt": { schema: mappedSchema } },
     };
     applyCodexModelCatalog(catalog, [
       { id: "terra", model: "gpt-5.6-terra", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
@@ -43,15 +43,15 @@ describe("dashboard modular action references", () => {
     expect(mappedSchema.properties.model).toMatchObject({ enum: ["gpt-5.6-terra"] });
   });
 
-  it("offers only preceding Codex sessions and round-trips the selected dependency", () => {
+  it("offers preceding Codex sessions and keeps task order on arrows", () => {
     const nodes = [
       { id: "trigger", type: "trigger", position: { x: 0, y: 0 }, data: { label: "On queue", use: "queue", kind: "trigger", config: {} } },
       action("session", "codex.start-session"),
-      action("later-session", "codex.start-session"),
+      action("first-prompt", "codex.send-prompt"),
       action("send", "codex.send-prompt"),
     ] as GraphNode[];
     const edges = [{ id: "trigger-send", source: "trigger", target: "send", label: "matched" }];
-    expect(upstreamReferenceNodes(nodes, edges, "send", "codex.start-session").map((node) => node.id)).toEqual(["session", "later-session"]);
+    expect(upstreamReferenceNodes(nodes, edges, "send", "codex.start-session").map((node) => node.id)).toEqual(["session"]);
 
     const config = setActionReference({ use: "codex.send-prompt", with: { text: "hello" } }, "codex", "session");
     const nextEdges = syncActionReferenceEdge(edges, "send", "codex", undefined, "session");
@@ -59,21 +59,22 @@ describe("dashboard modular action references", () => {
 
     expect(config.with).toEqual({ text: "hello", codex: { action: "session" } });
     expect(nextEdges.find((edge) => edge.source === "session" && edge.target === "send")?.data).toEqual({ relayReferencePath: "codex" });
-    expect(nextEdges.find((edge) => edge.source === "session" && edge.target === "send")?.label).toBe("started");
+    expect(nextEdges.find((edge) => edge.source === "session" && edge.target === "send")?.label).toBe("then");
     expect((workflow.jobs as Record<string, unknown>).send).toMatchObject({ with: { text: "hello", codex: { action: "session" } }, needs: "session.started" });
+
   });
 
-  it("upgrades an existing Codex reference edge to a started dependency", () => {
+  it("renders an existing Codex reference edge as task order", () => {
     const edges = [{ id: "session-send", source: "session", target: "send", label: "succeeded" }];
     expect(syncActionReferenceEdge(edges, "send", "codex", "session", "session")).toEqual([
-      expect.objectContaining({ source: "session", target: "send", label: "started", data: { relayReferencePath: "codex" } }),
+      expect.objectContaining({ source: "session", target: "send", label: "then", data: { relayReferencePath: "codex" } }),
     ]);
   });
 
   it("describes terminal and Codex action references", () => {
     expect(actionReferenceFor("worker-send")).toMatchObject({ path: "worker", upstreamUse: "tmux.create-window" });
     expect(actionReferenceFor("codex.start-session")).toMatchObject({ path: "tmux", upstreamUse: "tmux.create-window" });
-    expect(actionReferenceFor("codex.send-prompt")).toMatchObject({ path: "codex", upstreamUse: "codex.start-session" });
+    expect(actionReferenceFor("codex.send-prompt")).toMatchObject({ path: "codex", upstreamUse: "codex.start-session", label: "Codex session" });
   });
 
   it("binds Codex start-session to the selected tmux action and preserves workspace fields", () => {
@@ -89,7 +90,7 @@ describe("dashboard modular action references", () => {
       with: { tmux: { action: "tmux.create-window-2" }, workspace: { baseBranch: "main" } },
       needs: "tmux.create-window-2.started",
     });
-    expect(edges.find((edge) => edge.target === "codex.start-session-1")).toMatchObject({ source: "tmux.create-window-2", target: "codex.start-session-1", label: "started" });
+    expect(edges.find((edge) => edge.target === "codex.start-session-1")).toMatchObject({ source: "tmux.create-window-2", target: "codex.start-session-1", label: "then" });
   });
 
   it("resolves dots in job IDs before interpreting a status suffix", () => {
@@ -99,7 +100,7 @@ describe("dashboard modular action references", () => {
         "codex.start-session-1": { use: "codex.start-session", with: { tmux: { action: "tmux.create-window-2" }, prompt: "hello" } },
       },
     });
-    expect(graph.edges.find((edge) => edge.source === "tmux.create-window-2" && edge.target === "codex.start-session-1")).toMatchObject({ source: "tmux.create-window-2", label: "started", data: { relayReferencePath: "tmux" } });
+    expect(graph.edges.find((edge) => edge.source === "tmux.create-window-2" && edge.target === "codex.start-session-1")).toMatchObject({ source: "tmux.create-window-2", label: "then", data: { relayReferencePath: "tmux" } });
     expect(findDanglingEdges(graph.nodes, graph.edges)).toHaveLength(0);
   });
 

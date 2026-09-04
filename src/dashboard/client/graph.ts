@@ -13,9 +13,9 @@ export type GraphNode = Node<GraphNodeData>;
 export const ACTION_REFERENCES = {
   // Terminal commands, including Codex's remote TUI, target the existing pane
   // of a tmux window created earlier in the workflow.
-  "worker-send": { path: "worker", upstreamUse: "tmux.create-window", label: "terminal", value: "action" },
-  "codex.start-session": { path: "tmux", upstreamUse: "tmux.create-window", label: "tmux window", value: "action" },
-  "codex.send-prompt": { path: "codex", upstreamUse: "codex.start-session", label: "Codex session", value: "action" },
+  "worker-send": { path: "worker", upstreamUse: "tmux.create-window", alternateUpstreamUses: [], label: "terminal", value: "action" },
+  "codex.start-session": { path: "tmux", upstreamUse: "tmux.create-window", alternateUpstreamUses: [], label: "tmux window", value: "action" },
+  "codex.send-prompt": { path: "codex", upstreamUse: "codex.start-session", alternateUpstreamUses: [], label: "Codex session", value: "action" },
 } as const;
 
 export type ActionReferencePath = (typeof ACTION_REFERENCES)[keyof typeof ACTION_REFERENCES]["path"];
@@ -67,10 +67,11 @@ function parseNeed(need: unknown, knownJobIds: readonly string[]): { source: str
 }
 
 /** Candidates are earlier action nodes that can safely become an upstream dependency. */
-export function upstreamReferenceNodes(nodes: GraphNode[], edges: Edge[], targetId: string, use: string): GraphNode[] {
+export function upstreamReferenceNodes(nodes: GraphNode[], edges: Edge[], targetId: string, use: string | readonly string[]): GraphNode[] {
   const targetIndex = nodes.findIndex((node) => node.id === targetId);
+  const uses = new Set(typeof use === "string" ? [use] : use);
   return nodes.filter((node, index) => node.data.kind === "action"
-    && node.data.use === use
+    && uses.has(node.data.use)
     && node.id !== targetId
     && (targetIndex < 0 || index < targetIndex)
     && !wouldCycle(edges, node.id, targetId));
@@ -119,7 +120,7 @@ export function syncActionReferenceEdge(edges: Edge[], targetId: string, path: s
   if (existing) {
     return next.map((edge) => edge !== existing ? edge : {
       ...edge,
-      label: "started",
+      label: "then",
       data: { ...(edge.data ?? {}), relayReferencePath: path },
     });
   }
@@ -128,10 +129,7 @@ export function syncActionReferenceEdge(edges: Edge[], targetId: string, path: s
     source: nextActionId,
     target: targetId,
     type: "smoothstep",
-    // A prompt can either steer the active turn or wait until it is idle. The
-    // producer therefore only needs to have started; requiring success would
-    // make the `immediate` delivery mode impossible to use from the canvas.
-    label: "started",
+    label: "then",
     animated: false,
     data: { relayReferencePath: path },
   }];
@@ -164,13 +162,13 @@ export function workflowToGraph(workflow: WorkflowSummary, schemas: Record<strin
     });
     // A reference may have been authored without a matching `needs` entry
     // (for example by the raw editor). Materialize it as the canonical
-    // started edge so the graph and the serialized workflow agree.
+    // ordering edge so the graph and the serialized workflow agree.
     const reference = actionReferenceFor(use);
     const referenceActionId = reference ? actionReferenceValue(job, reference.path, reference.value) : undefined;
     if (referenceActionId) {
       const existing = edges.find((edge) => edge.source === referenceActionId && edge.target === id);
       if (existing) {
-        existing.label = "started";
+        existing.label = "then";
         existing.data = { ...(existing.data ?? {}), relayReferencePath: reference.path };
       } else {
         edges.push({
@@ -178,7 +176,7 @@ export function workflowToGraph(workflow: WorkflowSummary, schemas: Record<strin
           source: referenceActionId,
           target: id,
           type: "smoothstep",
-          label: "started",
+          label: "then",
           animated: false,
           ...(knownJobIds.includes(referenceActionId) ? { data: { relayReferencePath: reference.path } } : { data: { dangling: true, relayReferencePath: reference.path } }),
         });
@@ -208,7 +206,7 @@ export function findDanglingActionReferences(nodes: GraphNode[]): DanglingAction
     const actionId = reference ? actionReferenceValue(node.data.config, reference.path, reference.value) : undefined;
     if (!reference || !actionId) return [];
     const producer = nodes.find((candidate) => candidate.id === actionId);
-    return producer?.data.kind === "action" && producer.data.use === reference.upstreamUse
+    return producer?.data.kind === "action" && (producer.data.use === reference.upstreamUse || (reference.alternateUpstreamUses as readonly string[]).includes(producer.data.use))
       ? []
       : [{ nodeId: node.id, path: reference.path, actionId }];
   });
@@ -239,17 +237,17 @@ export function graphToWorkflow(graph: { nodes: GraphNode[]; edges: Edge[] }, or
     const old = node.data.config ?? {};
     const needs = [...new Set(incoming.map(({ edge, source }) => source === "trigger"
       ? undefined
-      : (edge.label ? `${source}.${edge.label}` : source)).filter(Boolean))];
+      : (edge.label === "then" ? `${source}.succeeded` : edge.label ? `${source}.${edge.label}` : source)).filter(Boolean))];
     const job = { ...old, use: node.data.use, with: old.with ?? {} } as Json;
     delete job.id;
     const reference = actionReferenceFor(node.data.use);
     const referenceActionId = reference ? actionReferenceValue(job, reference.path, reference.value) : undefined;
     if (referenceActionId) {
-      // A selected action reference always means "started". Remove any stale
-      // hand-drawn dependency to the same producer before adding the canonical
-      // edge, so a previous `succeeded` edge cannot override the selector.
+      // A Codex prompt chain always waits for the previous prompt to finish.
+      // Other references remain available as soon as their producer started.
       for (let index = needs.length - 1; index >= 0; index -= 1) if (needReferencesAction(needs[index], referenceActionId)) needs.splice(index, 1);
-      needs.push(`${referenceActionId}.started`);
+      const producer = graph.nodes.find((candidate) => candidate.id === referenceActionId);
+      needs.push(`${referenceActionId}.${producer?.data.use === "codex.send-prompt" ? "succeeded" : "started"}`);
     }
     if (needs.length) job.needs = needs.length === 1 ? needs[0] : needs;
     else delete job.needs;

@@ -89,9 +89,7 @@ workflows:
         with:
           model: gpt-5.6-luna
           effort: medium
-          prompt: >-
-            Review the Linear issue {{item.id}}: {{item.title}}.
-            Inspect the repository and prepare to work on it.
+          prompt: Which model are you using now
           tmux:
             action: tmux.create-window-1
         needs:
@@ -104,14 +102,25 @@ workflows:
         with:
           codex:
             action: codex.start-session-2
-          prompt: >-
-            Continue with {{item.id}}: {{item.title}}. Start the requested work
-            and report progress in this session.
-          delivery: idle
-          waitForCompletion: true
+          prompt: What the model you are now?
+          model: gpt-5.6-luna
         needs:
           job: codex.start-session-2
           status: started
+        continueOnError: false
+        enabled: true
+      codex.send-prompt-4:
+        use: codex.send-prompt
+        with:
+          codex:
+            action: codex.start-session-2
+          prompt: 2 + 44?
+          model: gpt-5.6-luna
+        needs:
+          - job: codex.send-prompt-3
+            status: succeeded
+          - job: codex.start-session-2
+            status: started
         continueOnError: false
         enabled: true
   linear-cleanup-on-done:

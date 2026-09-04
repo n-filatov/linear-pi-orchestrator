@@ -920,8 +920,10 @@ export class TaskRelay {
       const produced = outputs[ref.action];
       if (!produced) throw new Error(`Action '${ref.action}' has not run before this one in trigger '${trigger.id}'.`);
       const workerId = produced.output?.workerId;
-      if (typeof workerId !== "string") return [];
-      workerIds = [workerId];
+      const producedWorkerIds = produced.output?.workerIds;
+      if (typeof workerId === "string") workerIds = [workerId];
+      else if (Array.isArray(producedWorkerIds) && producedWorkerIds.every((id): id is string => typeof id === "string")) workerIds = producedWorkerIds;
+      else return [];
     } else if ("workerId" in ref) {
       workerIds = [ref.workerId];
     } else {

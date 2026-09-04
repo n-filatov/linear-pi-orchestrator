@@ -514,6 +514,16 @@ The canvas includes three independent built-in actions:
   waits for the active turn before starting another; `immediate` steers the
   active turn. By default the job remains running until that turn completes.
 
+The dashboard **Workers → Send** control also recognizes App Server workers.
+It starts a follow-up turn on the same durable Codex thread (waiting for the
+previous turn to become idle if necessary), so it can be used after the first
+prompt has completed without adding another workflow node.
+
+In the canvas, a `codex.send-prompt` node can continue either the initial
+`codex.start-session` or an earlier `codex.send-prompt`. Selecting an earlier
+prompt expresses task order: Relay waits for that prompt's turn to complete,
+then sends the next prompt to the same Codex thread.
+
 The dashboard obtains the model and reasoning-effort pickers from the installed
 Codex App Server. If that catalog is unavailable, the same fields remain
 editable as free text. Thread and turn ids are persisted with the worker, and a

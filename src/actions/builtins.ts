@@ -80,8 +80,6 @@ const workerSendConfigSchema = z.object({
 const tmuxCreateWindowConfigSchema = z.object({}).strict().default({});
 
 const codexStartSessionConfigSchema = z.object({
-  model: z.string().min(1).optional(),
-  effort: z.string().min(1).optional(),
   prompt: z.string().min(1),
   /** Attach a visible Codex TUI to the tmux worker produced by this action. */
   tmux: z.object({
@@ -92,12 +90,15 @@ const codexStartSessionConfigSchema = z.object({
     branchTemplate: z.string().min(1).optional(),
     baseBranch: z.string().min(1).optional(),
   }).strict().optional(),
-}).strict();
+}).strip();
 
 const codexSendPromptConfigSchema = z.object({
   /** This deliberately accepts only a producing action, never a loose worker selector. */
   codex: z.object({ action: z.string().min(1) }).strict(),
   prompt: z.string().min(1),
+  /** Model used for this new turn; the session retains its conversation context. */
+  model: z.string().min(1).optional(),
+  effort: z.string().min(1).optional(),
   delivery: z.enum(["idle", "immediate"]).default("idle"),
   /** Keep the workflow job running until Codex finishes the resulting turn. */
   waitForCompletion: z.boolean().default(true),
@@ -284,8 +285,6 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
       const tmux = config.tmux ? await resolveTmuxBinding(context, config.tmux.action) : undefined;
       const result = await context.workers.launch({
         harness: CODEX_APP_SERVER_HARNESS_ID,
-        model: config.model ? render(config.model) : undefined,
-        reasoningEffort: config.effort ? render(config.effort) : undefined,
         prompt: render(config.prompt),
         // The App Server is a background helper. When attached to tmux, it
         // must reuse that terminal worker's worktree and may coexist with it.
@@ -346,11 +345,18 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
     execute: async (context, config) => {
       if (!options.codexAppServer) throw new Error("Codex App Server actions were not composed into this Relay runtime.");
       const render = renderer(context);
+      const model = config.model ? render(config.model) : undefined;
+      const effort = config.effort ? render(config.effort) : undefined;
+      if (config.delivery === "immediate" && (model || effort)) {
+        throw new Error("A per-prompt model or effort requires delivery: idle, because an active Codex turn cannot change models.");
+      }
       const targets = await context.workers.resolve(config.codex);
       if (targets.length === 0) return { status: "skipped", message: `Action '${config.codex.action}' has no live worker.` };
       const prompts = await Promise.all(targets.map(async ({ worker }) => {
         const sent = await options.codexAppServer!.sendPrompt(worker, {
           prompt: render(config.prompt),
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
           delivery: config.delivery,
           waitForCompletion: config.waitForCompletion,
           timeoutMs: config.timeoutMs,

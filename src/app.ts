@@ -225,6 +225,22 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
 
       // Controlling a live worker needs only its execution adapter, not a whole
       // relay: composing one would connect every source for a single key press.
+      // A Codex App Server worker is different: its prompt transport is the
+      // durable thread, not the terminal pane. In particular, a completed
+      // first turn must remain usable for a later dashboard prompt.
+      if (action.type === "send" && isCodexAppServerWorker(run.worker)) {
+        if (action.submit === false) throw new Error("A Codex App Server prompt cannot be staged; submit it to start the next turn.");
+        const sent = await sharedCodexAppServer(context.projectRoot).sendPrompt(run.worker, {
+          prompt: action.text,
+          // Waiting for idle makes the dashboard safe both after completion
+          // and when the user sends the next instruction slightly early.
+          delivery: "idle",
+          waitForCompletion: false,
+          timeoutMs: 300_000,
+        });
+        return `Started Codex turn ${sent.turnId} from ${action.text.length} characters for ${run.worker.id}.`;
+      }
+
       const executor = context.config.execution.adapter === "tmux"
         ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${context.config.project.name || path.basename(context.projectRoot)}` })
         : new DirectProcessAdapter();
@@ -426,6 +442,14 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       } finally { await runtime.relay.stop(); }
     },
   };
+}
+
+/** A dashboard prompt to this worker must use App Server, never tmux paste. */
+function isCodexAppServerWorker(worker: WorkerHandle): boolean {
+  const metadata = worker.metadata?.codexAppServer;
+  return metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)
+    && (((metadata as Record<string, unknown>).transport === "stdio") || ((metadata as Record<string, unknown>).transport === "websocket"))
+    && typeof (metadata as Record<string, unknown>).threadId === "string";
 }
 
 async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string } = {}): Promise<RuntimeComposition> {
