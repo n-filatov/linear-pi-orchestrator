@@ -15,6 +15,8 @@ import { GlobalRuntimeSupervisor } from "./runtime-supervisor.js";
 import { closeCodexAppServers } from "../app.js";
 import { WorkflowAlreadyExistsError, WorkflowConfigRepository, WorkflowNotFoundError, WorkflowRevisionConflictError } from "./workflow-config-repository.js";
 import { listPromptFiles, PROMPTS_DIRECTORY } from "../prompts/library.js";
+import { LinearMcpSource } from "../sources/linear-mcp-source.js";
+import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-client.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 class RequestBodyTooLargeError extends Error {}
@@ -105,6 +107,12 @@ export class GlobalDashboardServer {
       if (method !== "GET") return this.methodNotAllowed(response);
       const folder = await this.requireProject(decodeURIComponent(codexModels[1]!));
       return this.json(response, { models: await this.modelsFor(folder.root) });
+    }
+
+    const linearOptions = /^\/api\/projects\/([^/]+)\/sources\/([^/]+)\/linear-options$/.exec(url.pathname);
+    if (linearOptions) {
+      if (method !== "GET") return this.methodNotAllowed(response);
+      return this.linearTriggerOptions(decodeURIComponent(linearOptions[1]!), decodeURIComponent(linearOptions[2]!), response);
     }
 
     const project = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
@@ -221,6 +229,21 @@ export class GlobalDashboardServer {
     const models = await listCodexModels(projectRoot);
     this.codexModelCache.set(projectRoot, { expiresAt: Date.now() + 5 * 60_000, models });
     return models;
+  }
+
+  private async linearTriggerOptions(projectId: string, sourceId: string, response: http.ServerResponse): Promise<void> {
+    const context = await this.projects.context(projectId);
+    const source = context.config.sources[sourceId];
+    if (!source || source.use !== "linear") return this.json(response, { error: `Source '${sourceId}' is not a configured Linear source.` }, 400);
+    const options = recordValue(source.with);
+    const mcp = recordValue(options.mcp);
+    const client = await SdkMcpToolClient.connect({ clientName: "task-relay-dashboard", clientVersion: "0.2.0", transport: dashboardMcpTransport(mcp, context.projectRoot) });
+    try {
+      const linear = new LinearMcpSource({ id: sourceId, client, tools: recordValue(options.tools) });
+      this.json(response, { sourceId, ...(await linear.triggerOptions()) });
+    } finally {
+      await client.close();
+    }
   }
 
   private async createWorkflow(projectId: string, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
@@ -494,8 +517,30 @@ async function optionalJsonBody(request: http.IncomingMessage): Promise<Record<s
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function recordValue(value: unknown): Record<string, unknown> { return isRecord(value) ? value : {}; }
 function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
 function booleanValue(value: unknown): boolean | undefined { return typeof value === "boolean" ? value : undefined; }
+function stringArray(value: unknown): string[] { return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : []; }
+function stringRecord(value: unknown): Record<string, string> { return Object.fromEntries(Object.entries(recordValue(value)).flatMap(([key, entry]) => typeof entry === "string" ? [[key, entry]] : [])); }
+function dashboardMcpTransport(value: Record<string, unknown>, projectRoot: string): McpTransportConfig {
+  if (value.transport === "stdio") {
+    const command = stringValue(value.command);
+    if (!command) throw new Error("Linear stdio MCP transport requires a command.");
+    return { transport: "stdio", command, args: stringArray(value.args), cwd: stringValue(value.cwd) ? resolve(projectRoot, stringValue(value.cwd)!) : projectRoot, env: stringRecord(value.environment ?? value.env) };
+  }
+  if (value.transport === "streamable-http") {
+    const url = stringValue(value.url);
+    if (!url) throw new Error("Linear HTTP MCP transport requires a URL.");
+    const headers: Record<string, string> = {};
+    for (const [header, environmentName] of Object.entries(stringRecord(value.headersFromEnvironment))) {
+      const resolved = process.env[environmentName];
+      if (!resolved) throw new Error(`Environment variable ${environmentName} is required for MCP header ${header}.`);
+      headers[header] = resolved;
+    }
+    return { transport: "streamable-http", url, headers };
+  }
+  throw new Error("Linear MCP transport must be 'stdio' or 'streamable-http'.");
+}
 function mimeType(file: string): string {
   return ({ ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/json" } as Record<string, string>)[extname(file)] ?? "application/octet-stream";
 }

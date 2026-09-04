@@ -17,6 +17,12 @@ export interface CodexModelSummary {
   supportedReasoningEfforts?: Array<{ reasoningEffort: string }>;
 }
 export interface PromptLibrary { directory: string; prompts: string[]; }
+export interface LinearTriggerOptions {
+  sourceId: string;
+  labels: string[];
+  statuses: Array<{ name: string; type?: string }>;
+  users: Array<{ id: string; name: string }>;
+}
 
 /** Add the live App Server catalog to both supported dashboard catalog shapes. */
 export function applyCodexModelCatalog(catalog: Json, models: CodexModelSummary[]): Json {
@@ -119,6 +125,10 @@ export async function getCatalog(project?: ProjectFolder): Promise<Json> {
 export async function getPrompts(project?: ProjectFolder): Promise<PromptLibrary> {
   try { return await request<PromptLibrary>(project ? `/api/projects/${idFor(project)}/prompts` : "/api/prompts"); }
   catch { return { directory: ".task-relay/prompts", prompts: [] }; }
+}
+export async function getLinearTriggerOptions(sourceId: string, project?: ProjectFolder): Promise<LinearTriggerOptions> {
+  if (!project) throw new Error("A project folder is required to load Linear options");
+  return request(`/api/projects/${idFor(project)}/sources/${encodeURIComponent(sourceId)}/linear-options`);
 }
 export async function getConfig(project?: ProjectFolder): Promise<{ config: Json; path?: string }> {
   try { return await request(project ? `/api/projects/${idFor(project)}/config/json` : "/api/config/json"); }

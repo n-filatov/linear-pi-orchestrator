@@ -38,6 +38,10 @@ export interface LinearMcpSourceConfig {
   /** Linear MCP tool names are owned by this adapter and can vary by server. */
   tools?: {
     listIssues?: string;
+    listLabels?: string;
+    listTeams?: string;
+    listStatuses?: string;
+    listUsers?: string;
     getIssue?: string;
     saveIssue?: string;
     saveComment?: string;
@@ -51,6 +55,13 @@ export interface LinearMcpSourceConfig {
     commentOnLaunch?: boolean;
     commentOnFailure?: boolean;
   };
+}
+
+/** Values that can be selected in the dashboard trigger editor. */
+export interface LinearTriggerOptions {
+  labels: string[];
+  statuses: Array<{ name: string; type?: string }>;
+  users: Array<{ id: string; name: string }>;
 }
 
 type LinearIssue = {
@@ -75,10 +86,50 @@ export class LinearMcpSource implements WorkSource {
     this.id = config.id;
     this.tools = {
       listIssues: config.tools?.listIssues ?? "list_issues",
+      listLabels: config.tools?.listLabels ?? "list_issue_labels",
+      listTeams: config.tools?.listTeams ?? "list_teams",
+      listStatuses: config.tools?.listStatuses ?? "list_issue_statuses",
+      listUsers: config.tools?.listUsers ?? "list_users",
       getIssue: config.tools?.getIssue ?? "get_issue",
       saveIssue: config.tools?.saveIssue ?? "save_issue",
       saveComment: config.tools?.saveComment ?? "save_comment",
     };
+  }
+
+  /**
+   * Fetches selector vocabulary from the configured Linear MCP server. These
+   * values are deliberately fetched on demand: Linear workspaces differ and
+   * names can change without a Relay deployment.
+   */
+  public async triggerOptions(): Promise<LinearTriggerOptions> {
+    const [labels, teams, users] = await Promise.all([
+      this.listAll(this.tools.listLabels, { limit: 250 }),
+      this.listAll(this.tools.listTeams),
+      this.listAll(this.tools.listUsers, { limit: 250 }),
+    ]);
+    const teamOptionsList = teams.flatMap((page) => teamOptions(page));
+    const [teamLabelPages, statusResults] = await Promise.all([
+      Promise.all(teamOptionsList.map((team) => this.listAll(this.tools.listLabels, { limit: 250, team: team.id }))),
+      Promise.all(teamOptionsList.map((team) => this.listAll(this.tools.listStatuses, { team: team.id }))),
+    ]);
+    return {
+      labels: mergeNames([...labels, ...teamLabelPages.flat()].map(optionNames)),
+      statuses: mergeStatuses(statusResults.flat().map(optionStatuses)),
+      users: mergeUsers(users.map(optionUsers)),
+    };
+  }
+
+  /** Follows Linear MCP's cursor pagination, with a defensive page cap. */
+  private async listAll(tool: string, args: Record<string, unknown> = {}): Promise<unknown[]> {
+    const pages: unknown[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 100; page += 1) {
+      const value = readMcpJson(await this.config.client.callTool(tool, { ...args, ...(cursor ? { cursor } : {}) }));
+      pages.push(value);
+      cursor = nextCursor(value);
+      if (!cursor) break;
+    }
+    return pages;
   }
 
   public async discover({ trigger }: DiscoverWorkOptions): Promise<readonly WorkItem[]> {
@@ -294,6 +345,78 @@ function readIssue(value: unknown): LinearIssue {
   if (isRecord(value) && isRecord(value.issue)) return value.issue;
   if (isRecord(value)) return value;
   throw new Error("Linear get_issue result must be an issue object or { issue: {...} }");
+}
+
+function optionRecords(value: unknown, keys: readonly string[]): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter(isRecord);
+  if (!isRecord(value)) return [];
+  for (const key of keys) if (Array.isArray(value[key])) return value[key].filter(isRecord);
+  // A few MCP servers return `{ data: { nodes: [...] } }` rather than a
+  // provider-specific collection name.
+  if (isRecord(value.data)) return optionRecords(value.data, [...keys, "nodes"]);
+  return [];
+}
+
+function optionNames(value: unknown): string[] {
+  return [...new Set(optionRecords(value, ["labels", "issueLabels", "data", "nodes"])
+    // IDs identify a label internally but are not a valid or useful selector
+    // for the dashboard. Some Linear payloads include id-only related records.
+    .flatMap((entry) => [readOptionalString(entry.name), readOptionalString(entry.label), readOptionalString(entry.displayName)].filter(Boolean) as string[]))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function mergeNames(values: readonly string[][]): string[] {
+  return [...new Set(values.flat())].sort((left, right) => left.localeCompare(right));
+}
+
+function nextCursor(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  return readOptionalString(value.nextCursor)
+    ?? readOptionalString(value.cursor)
+    ?? (isRecord(value.pageInfo) ? readOptionalString(value.pageInfo.nextCursor) ?? readOptionalString(value.pageInfo.endCursor) : undefined)
+    ?? (isRecord(value.pagination) ? readOptionalString(value.pagination.nextCursor) ?? readOptionalString(value.pagination.cursor) : undefined);
+}
+
+function optionStatuses(value: unknown): Array<{ name: string; type?: string }> {
+  const deduped = new Map<string, { name: string; type?: string }>();
+  for (const entry of optionRecords(value, ["statuses", "issueStatuses", "workflowStates", "data", "nodes"])) {
+    const name = readOptionalString(entry.name) ?? readOptionalString(entry.label);
+    if (!name) continue;
+    const type = readOptionalString(entry.type) ?? readOptionalString(entry.statusType);
+    deduped.set(`${name}\u0000${type ?? ""}`, { name, ...(type ? { type } : {}) });
+  }
+  return [...deduped.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function mergeStatuses(values: ReadonlyArray<Array<{ name: string; type?: string }>>): Array<{ name: string; type?: string }> {
+  const deduped = new Map<string, { name: string; type?: string }>();
+  for (const status of values.flat()) deduped.set(`${status.name}\u0000${status.type ?? ""}`, status);
+  return [...deduped.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function teamOptions(value: unknown): Array<{ id: string }> {
+  const deduped = new Map<string, { id: string }>();
+  for (const entry of optionRecords(value, ["teams", "data", "nodes"])) {
+    const id = readOptionalString(entry.id) ?? readOptionalString(entry.key) ?? readOptionalString(entry.name);
+    if (id) deduped.set(id, { id });
+  }
+  return [...deduped.values()];
+}
+
+function optionUsers(value: unknown): Array<{ id: string; name: string }> {
+  const deduped = new Map<string, { id: string; name: string }>();
+  for (const entry of optionRecords(value, ["users", "members", "data", "nodes"])) {
+    const id = readOptionalString(entry.id) ?? readOptionalString(entry.email) ?? readOptionalString(entry.name);
+    const name = readOptionalString(entry.name) ?? readOptionalString(entry.displayName) ?? readOptionalString(entry.email) ?? id;
+    if (id && name) deduped.set(id, { id, name });
+  }
+  return [...deduped.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function mergeUsers(values: ReadonlyArray<Array<{ id: string; name: string }>>): Array<{ id: string; name: string }> {
+  const deduped = new Map<string, { id: string; name: string }>();
+  for (const user of values.flat()) deduped.set(user.id, user);
+  return [...deduped.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function toWorkItem(sourceId: string, issue: LinearIssue): WorkItem {

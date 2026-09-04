@@ -13,6 +13,26 @@ describe("command source protocol", () => {
 });
 
 describe("Linear source identity and lifecycle reporting", () => {
+  it("loads labels, workflow statuses, and users for the trigger editor", async () => {
+    const client: McpToolClient = {
+      async callTool(name, args): Promise<McpToolResult> {
+        if (name === "list_issue_labels") return args.cursor === "labels-page-2"
+          ? { structuredContent: { labels: [{ name: "relay:test" }] } }
+          : { structuredContent: { labels: [{ name: "AI" }, { id: "id-only-related-record" }, { name: "team:platform" }], nextCursor: "labels-page-2" } };
+        if (name === "list_teams") return { structuredContent: { teams: [{ id: "team-eng" }, { id: "team-product" }] } };
+        if (name === "list_issue_statuses") return { structuredContent: { statuses: args.team === "team-eng" ? [{ name: "In Progress", type: "started" }, { name: "Done", type: "completed" }] : [{ name: "Done", type: "completed" }, { name: "Triage", type: "triage" }] } };
+        if (name === "list_users") return { structuredContent: { users: [{ id: "user-1", name: "Ada Lovelace" }] } };
+        throw new Error(`unexpected tool ${name}`);
+      },
+    };
+    const options = await new LinearMcpSource({ id: "linear", client }).triggerOptions();
+    expect(options).toEqual({
+      labels: ["AI", "relay:test", "team:platform"],
+      statuses: [{ name: "Done", type: "completed" }, { name: "In Progress", type: "started" }, { name: "Triage", type: "triage" }],
+      users: [{ id: "user-1", name: "Ada Lovelace" }],
+    });
+  });
+
   it("owns label, workflow-state, and state-type matching while using safe list filters", async () => {
     const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
     const client: McpToolClient = {
