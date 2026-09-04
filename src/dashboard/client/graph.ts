@@ -139,7 +139,8 @@ export function syncActionReferenceEdge(edges: Edge[], targetId: string, path: s
 
 export function workflowToGraph(workflow: WorkflowSummary, schemas: Record<string, any> = {}): { nodes: GraphNode[]; edges: Edge[] } {
   const sourceUse = workflow.source ?? workflow.on?.source ?? "";
-  const nodes: GraphNode[] = [{ id: "trigger", type: "trigger", deletable: false, position: { x: 50, y: 160 }, data: { label: "On " + (sourceUse || "source"), use: sourceUse, kind: "trigger", config: workflow.on?.match ?? {}, schema: (schemas[`source:${sourceUse}`] ?? schemas[sourceUse])?.schema } }];
+  const triggerLabel = sourceUse === "linear" ? "Linear action trigger" : "On " + (sourceUse || "source");
+  const nodes: GraphNode[] = [{ id: "trigger", type: "trigger", deletable: false, position: { x: 50, y: 160 }, data: { label: triggerLabel, use: sourceUse, kind: "trigger", config: workflow.on?.match ?? {}, schema: (schemas[`source:${sourceUse}`] ?? schemas[sourceUse])?.schema } }];
   const jobs = workflow.jobs ?? {};
   const entries = Array.isArray(jobs) ? jobs.map((job: any) => [job.id, job] as const) : Object.entries(jobs);
   const edges: Edge[] = [];

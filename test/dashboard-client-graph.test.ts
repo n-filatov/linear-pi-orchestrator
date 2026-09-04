@@ -22,6 +22,11 @@ function action(id: string, use: string, config: Record<string, unknown> = {}): 
 }
 
 describe("dashboard modular action references", () => {
+  it("labels Linear workflow triggers for the streamlined canvas", () => {
+    const graph = workflowToGraph({ id: "demo", on: { source: "linear" }, jobs: {} });
+    expect(graph.nodes[0]?.data.label).toBe("Linear action trigger");
+  });
+
   it("adds the App Server picker values to entry and schema-map catalog formats", () => {
     const configSchema = { type: "object", properties: { model: { type: "string" }, effort: { type: "string" } } };
     const mappedSchema = structuredClone(configSchema);

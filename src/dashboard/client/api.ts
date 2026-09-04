@@ -1,7 +1,8 @@
 export type Json = Record<string, any>;
 export class ApiError extends Error { constructor(public readonly status: number, message: string) { super(message); } }
 
-export interface ProjectFolder { id: string; repositoryId?: string; root: string; displayName?: string; enabled?: boolean; configStatus?: string; }
+export interface WatcherStatus { projectId: string; state: "stopped" | "running" | "blocked" | "failed"; lastTickAt?: string; nextTickAt?: string; error?: string; }
+export interface ProjectFolder { id: string; repositoryId?: string; root: string; displayName?: string; enabled?: boolean; configStatus?: string; watcher?: WatcherStatus; }
 export interface WorkflowSummary { id: string; enabled?: boolean; source?: string; fire?: string; timeoutMinutes?: number; jobs?: JobSummary[] | Record<string, JobSummary>; runs?: WorkflowRun[]; revision?: string | number; [key: string]: any; }
 export interface JobSummary { id?: string; use: string; needs?: string[]; enabled?: boolean; [key: string]: any; }
 export interface WorkflowRun { id: string; status: string; item?: { id?: string; title?: string }; jobs?: Record<string, any>; updatedAt?: string; [key: string]: any; }
@@ -60,6 +61,12 @@ export async function removeProject(project: ProjectFolder): Promise<void> {
 }
 export async function controlProject(project: ProjectFolder, action: "sync" | "start" | "stop"): Promise<Json> {
   return request(`/api/projects/${idFor(project)}/${action}`, { method: "POST" });
+}
+export async function getWatcherStatuses(): Promise<WatcherStatus[]> {
+  try {
+    const result = await request<{ projects?: WatcherStatus[] }>("/api/supervisor");
+    return result.projects ?? [];
+  } catch { return []; }
 }
 export async function getWorkflows(project?: ProjectFolder): Promise<WorkflowSummary[]> {
   try {

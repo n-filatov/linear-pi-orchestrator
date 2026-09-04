@@ -164,8 +164,8 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
     target: "worker",
     configSchema: cleanupConfigSchema,
     presentation: {
-      name: "Clean up worker",
-      description: "Stop and clean the selected worker workspace.",
+      name: "Cleanup",
+      description: "Stop and clean the Relay-owned workspace and tmux window.",
       category: "Workers",
       icon: "trash-2",
       color: "#dc2626",
@@ -257,7 +257,7 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
     use: "tmux.create-window",
     configSchema: tmuxCreateWindowConfigSchema,
     presentation: {
-      name: "Create tmux window",
+      name: "Start tmux window",
       description: "Create an owned detached login-shell window in the item workspace.",
       category: "Automation",
       icon: "panel-top",
@@ -272,7 +272,7 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
     use: "codex.start-session",
     configSchema: codexStartSessionConfigSchema,
     presentation: {
-      name: "Start Codex session",
+      name: "Start Codex in tmux window",
       description: "Start a Codex App Server session and open its TUI in the selected terminal.",
       category: "Workers",
       icon: "bot",
@@ -337,7 +337,7 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
     use: "codex.send-prompt",
     configSchema: codexSendPromptConfigSchema,
     presentation: {
-      name: "Send Codex prompt",
+      name: "Send prompt to started Codex",
       description: "Start an idle Codex turn or steer the current one immediately.",
       category: "Workers",
       icon: "send",

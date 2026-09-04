@@ -59,3 +59,9 @@
 .action-test-reasons { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; border-top: 1px solid #293646; padding-top: 8px; }
 .action-test-reasons small { color: #8191a4; }
 .action-test-reasons span { color: #c0ccd9; font-size: 10px; }
+
+.repo-card-statuses { display: flex; align-items: center; gap: 6px; }
+.watcher-detail { margin-top: 10px; color: #8da0b5; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.repository-card .repo-meta { margin-top: 12px; }
+.watcher-detail { display: flex; align-items: center; gap: 6px; }
+.button-spinner { width: 10px; height: 10px; border: 2px solid #7568e533; border-top-color: #8f82fd; border-radius: 50%; animation: spin .8s linear infinite; }

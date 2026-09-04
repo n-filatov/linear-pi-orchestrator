@@ -3,7 +3,7 @@ import { ReactFlow, Background, Controls, MiniMap, ReactFlowProvider, Handle, Po
 import "@xyflow/react/dist/style.css";
 import "./canvas-overrides.css";
 import * as api from "./api";
-import type { ActionTestResult, Json, ProjectFolder, WorkflowSummary, Worker } from "./api";
+import type { ActionTestResult, Json, ProjectFolder, WatcherStatus, WorkflowSummary, Worker } from "./api";
 import { actionReferenceFor, actionReferenceValue, autoLayout, findDanglingActionReferences, findDanglingEdges, graphToWorkflow, setActionReference, syncActionReferenceEdge, upstreamReferenceNodes, wouldCycle, workflowToGraph, type GraphNode, type GraphNodeData } from "./graph";
 
 type Page = "home" | "repositories" | "workflows" | "executions" | "workers" | "plugins";
@@ -13,6 +13,10 @@ const nav: { id: Page; label: string; icon: string }[] = [
 ];
 const statusClass = (status?: string) => `status status-${String(status ?? "unknown").toLowerCase().replace(/[^a-z]/g, "-")}`;
 const time = (value?: string) => value ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+
+/** The intentionally small workflow vocabulary exposed by the canvas. */
+const CANVAS_ACTION_USES = ["tmux.create-window", "codex.start-session", "codex.send-prompt", "cleanup"] as const;
+const canvasActionUses = new Set<string>(CANVAS_ACTION_USES);
 
 type CatalogEntry = { kind?: string; use?: string; schema?: Json; configSchema?: Json; matchSchema?: Json; presentation?: { name?: string; description?: string; category?: string }; health?: string; };
 
@@ -27,10 +31,10 @@ function entrySchema(entry?: CatalogEntry, kind?: string): Json | undefined { re
 
 function friendlyUseLabel(use: string): string {
   const known: Record<string, string> = {
-    "tmux.create-window": "Create terminal window",
-    "codex.start-session": "Start Codex session",
-    "codex.send-prompt": "Send Codex prompt",
-    "worker-send": "Run command in terminal",
+    "tmux.create-window": "Start tmux window",
+    "codex.start-session": "Start Codex in tmux window",
+    "codex.send-prompt": "Send prompt to started Codex",
+    "cleanup": "Cleanup",
   };
   if (known[use]) return known[use];
   return use.split(/[.:/_-]+/).filter(Boolean).map((part, index) => `${index === 0 ? part.charAt(0).toUpperCase() : part.charAt(0).toLowerCase()}${part.slice(1)}`).join(" ") || use;
@@ -60,8 +64,10 @@ function App() {
   const refresh = useCallback(async (next = project) => {
     setLoading(true); setError("");
     try {
-      const [folders, wfs, runs, ws, ps, cat] = await Promise.all([api.getProjects(), api.getWorkflows(next), api.getExecutions(next), api.getWorkers(next), api.getPlugins(next), api.getCatalog(next)]);
-      setProjects(folders); if (!next && folders[0]) { setProject(folders[0]); } setWorkflows(wfs); setExecutions(runs); setWorkers(ws); setPlugins(ps); setCatalog(cat);
+      const [folders, wfs, runs, ws, ps, cat, watcherStatuses] = await Promise.all([api.getProjects(), api.getWorkflows(next), api.getExecutions(next), api.getWorkers(next), api.getPlugins(next), api.getCatalog(next), api.getWatcherStatuses()]);
+      const watchers = new Map<string, WatcherStatus>(watcherStatuses.map((status) => [status.projectId, status]));
+      const projectsWithWatchers = folders.map((folder) => ({ ...folder, watcher: watchers.get(folder.id) ?? { projectId: folder.id, state: "stopped" as const } }));
+      setProjects(projectsWithWatchers); if (!next && projectsWithWatchers[0]) { setProject(projectsWithWatchers[0]); } setWorkflows(wfs); setExecutions(runs); setWorkers(ws); setPlugins(ps); setCatalog(cat);
       try { setConfig((await api.getConfig(next)).config); } catch { /* the global API may not expose config yet */ }
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setLoading(false); }
@@ -78,7 +84,7 @@ function App() {
     </aside>
     <main className="main"><header><div><div className="breadcrumb">TASK RELAY / {project?.displayName || project?.root || "CURRENT REPOSITORY"}</div><h1>{nav.find((entry) => entry.id === page)?.label}</h1></div><div className="header-actions"><button className="button ghost" onClick={() => void refresh()}>↻ Refresh</button><button className="button primary" onClick={() => setRegisterOpen(true)}>+ Add repository</button></div></header>
       {error && <div className="alert error">{error}<button onClick={() => setError("")}>×</button></div>}
-      {loading && !workflows.length && !executions.length ? <div className="loading"><span className="spinner" /> Loading control plane…</div> : <>{page === "home" && <HomePage workflows={workflows} executions={executions} workers={workers} projects={projects} onNavigate={setPage} />}{page === "repositories" && <Repositories projects={projects} selected={project} onSelect={(p) => { setProject(p); setPage("home"); }} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} onRemoved={(id) => { setProjects((old) => old.filter((entry) => entry.id !== id)); if (project?.id === id) setProject(undefined); }} />}{page === "workflows" && <Workflows workflows={workflows} config={config} catalog={catalog} project={project} onSaved={(next) => { setConfig(next); void refresh(project); }} />}{page === "executions" && <Executions executions={executions} workflows={workflows} onRefresh={() => void refresh(project)} />}{page === "workers" && <Workers workers={workers} project={project} />}{page === "plugins" && <Plugins plugins={plugins} catalog={catalog} />} </>}
+      {loading && !workflows.length && !executions.length ? <div className="loading"><span className="spinner" /> Loading control plane…</div> : <>{page === "home" && <HomePage workflows={workflows} executions={executions} workers={workers} projects={projects} onNavigate={setPage} />}{page === "repositories" && <Repositories projects={projects} selected={project} onSelect={(p) => { setProject(p); setPage("home"); }} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} onRemoved={(id) => { setProjects((old) => old.filter((entry) => entry.id !== id)); if (project?.id === id) setProject(undefined); }} onChanged={() => refresh(project)} />}{page === "workflows" && <Workflows workflows={workflows} config={config} catalog={catalog} project={project} onSaved={(next) => { setConfig(next); void refresh(project); }} />}{page === "executions" && <Executions executions={executions} workflows={workflows} onRefresh={() => void refresh(project)} />}{page === "workers" && <Workers workers={workers} project={project} />}{page === "plugins" && <Plugins plugins={plugins} catalog={catalog} />} </>}
     </main>{registerOpen && <RegisterDialog onClose={() => setRegisterOpen(false)} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} />}
   </div>;
 }
@@ -92,7 +98,30 @@ function PanelTitle({ title, action, onClick }: { title: string; action?: string
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }
 function ExecutionRow({ run }: { run: any }) { return <div className="list-row"><div className={`list-icon ${run.status === "failed" ? "failed-icon" : "run-icon"}`}>{run.status === "failed" ? "!" : "↗"}</div><div className="row-main"><b>{run.item?.id || run.id || "Execution"}</b><small>{run.item?.title || run.workflowId || run.identity?.workflowId || "Workflow execution"}</small></div><span className={statusClass(run.status)}>{run.status || "unknown"}</span><time>{time(run.updatedAt || run.startedAt || run.claimedAt)}</time></div>; }
 
-function Repositories({ projects, selected, onSelect, onAdded, onRemoved }: { projects: ProjectFolder[]; selected?: ProjectFolder; onSelect: (p: ProjectFolder) => void; onAdded: (p: ProjectFolder) => void; onRemoved: (id: string) => void }) { const control = async (event: React.MouseEvent, project: ProjectFolder, action: "sync" | "start" | "stop") => { event.stopPropagation(); try { const result = await api.controlProject(project, action); window.alert(result.status?.error || result.status?.state || `${action} complete`); } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); } }; const remove = async (event: React.MouseEvent, entry: ProjectFolder) => { event.stopPropagation(); if (!window.confirm(`Unregister '${entry.displayName || entry.root || entry.id}'? Files will not be deleted.`)) return; try { await api.removeProject(entry); onRemoved(entry.id); } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); } }; return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">PROJECT FOLDERS</span><p>Each folder keeps its YAML authoritative while the registry provides the global index.</p></div><button className="button primary" onClick={() => { const root = window.prompt("Repository folder path"); if (root) api.registerProject(root).then(onAdded).catch((e) => window.alert(e.message)); }}>+ Register folder</button></div><div className="repository-grid">{projects.map((entry) => <div role="button" tabIndex={0} className={`repository-card ${selected?.id === entry.id ? "selected" : ""}`} key={entry.id} onClick={() => onSelect(entry)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(entry); }}><div className="repo-card-head"><span className="repo-icon">▣</span><span className="status status-succeeded">{entry.enabled === false ? "disabled" : "connected"}</span></div><h3>{entry.displayName || entry.id}</h3><code>{entry.root || "Current working directory"}</code><div className="repo-meta"><span>{entry.configStatus || "configuration loaded"}</span><span className="repo-controls"><button onClick={(event) => void control(event, entry, "sync")}>Sync</button><button onClick={(event) => void control(event, entry, "start")}>Start</button><button onClick={(event) => void control(event, entry, "stop")}>Stop</button><button className="danger-link" onClick={(event) => void remove(event, entry)}>Remove</button></span></div></div>)}</div>{!projects.length && <Empty text="Register a repository folder to get started." />}<RegisterInline onAdded={onAdded} /></div>; }
+function Repositories({ projects, selected, onSelect, onAdded, onRemoved, onChanged }: { projects: ProjectFolder[]; selected?: ProjectFolder; onSelect: (p: ProjectFolder) => void; onAdded: (p: ProjectFolder) => void; onRemoved: (id: string) => void; onChanged: () => Promise<void> }) {
+  const [pending, setPending] = useState<Record<string, "sync" | "start" | "stop">>({});
+  const control = async (event: React.MouseEvent, project: ProjectFolder, action: "sync" | "start" | "stop") => {
+    event.stopPropagation();
+    setPending((current) => ({ ...current, [project.id]: action }));
+    try {
+      const result = await api.controlProject(project, action);
+      await onChanged();
+      window.alert(result.status?.error || result.status?.state || `${action} complete`);
+    } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+    finally { setPending((current) => { const next = { ...current }; delete next[project.id]; return next; }); }
+  };
+  const remove = async (event: React.MouseEvent, entry: ProjectFolder) => {
+    event.stopPropagation();
+    if (!window.confirm(`Unregister '${entry.displayName || entry.root || entry.id}'? Files will not be deleted.`)) return;
+    try { await api.removeProject(entry); onRemoved(entry.id); } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+  };
+  return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">PROJECT FOLDERS</span><p>Each folder keeps its YAML authoritative while the registry provides the global index.</p></div><button className="button primary" onClick={() => { const root = window.prompt("Repository folder path"); if (root) api.registerProject(root).then(onAdded).catch((e) => window.alert(e.message)); }}>+ Register folder</button></div><div className="repository-grid">{projects.map((entry) => {
+    const watcher = entry.watcher ?? { projectId: entry.id, state: "stopped" as const };
+    const pendingAction = pending[entry.id];
+    const watcherLabel = watcher.state === "running" ? "watching" : watcher.state;
+    return <div role="button" tabIndex={0} aria-busy={Boolean(pendingAction)} className={`repository-card ${selected?.id === entry.id ? "selected" : ""}`} key={entry.id} onClick={() => onSelect(entry)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(entry); }}><div className="repo-card-head"><span className="repo-icon">▣</span><span className="repo-card-statuses"><span className="status status-succeeded">{entry.enabled === false ? "disabled" : "connected"}</span><span className={`status status-${pendingAction ? "pending" : watcher.state}`} title={watcher.error}>{pendingAction ? `${pendingAction}…` : watcherLabel}</span></span></div><h3>{entry.displayName || entry.id}</h3><code>{entry.root || "Current working directory"}</code><div className="watcher-detail">{pendingAction ? <><span className="button-spinner" />{pendingAction === "start" ? "Starting watcher…" : pendingAction === "stop" ? "Stopping watcher…" : "Syncing project…"}</> : <>Watcher: {watcherLabel}{watcher.lastTickAt ? ` · last tick ${time(watcher.lastTickAt)}` : ""}{watcher.error ? ` · ${watcher.error}` : ""}</>}</div><div className="repo-meta"><span>{entry.configStatus || "configuration loaded"}</span><span className="repo-controls"><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "sync")}>{pendingAction === "sync" ? "Syncing…" : "Sync"}</button><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "start")}>{pendingAction === "start" ? "Starting…" : "Start"}</button><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "stop")}>{pendingAction === "stop" ? "Stopping…" : "Stop"}</button><button disabled={Boolean(pendingAction)} className="danger-link" onClick={(event) => void remove(event, entry)}>Remove</button></span></div></div>;
+  })}</div>{!projects.length && <Empty text="Register a repository folder to get started." />}<RegisterInline onAdded={onAdded} /></div>;
+}
 function RegisterInline({ onAdded }: { onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="register-inline"><input placeholder="/path/to/repository" value={value} onChange={(e) => setValue(e.target.value)} /><button className="button ghost" disabled={!value} onClick={() => api.registerProject(value).then((p) => { setValue(""); onAdded(p); }).catch((e) => window.alert(e.message))}>Register path</button></div>; }
 function RegisterDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><h2>Add repository</h2><button className="icon-button" onClick={onClose}>×</button></div><p>Register a local Git folder with the global control plane.</p><input autoFocus placeholder="/Users/me/Development/project" value={value} onChange={(e) => setValue(e.target.value)} /><div className="modal-actions"><button className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" disabled={!value.trim()} onClick={() => api.registerProject(value.trim()).then(onAdded).catch((e) => window.alert(e.message))}>Register folder</button></div></div></div>; }
 
@@ -133,7 +162,7 @@ function WorkflowEditor({ workflow, config, catalog, project, onSaved }: { workf
     }
     // Keep the editor usable while an older server is still warming its
     // catalog endpoint; these built-ins are valid Relay action identifiers.
-    for (const use of ["launch", "cleanup", "command", "worker-exec", "worker-send"]) {
+    for (const use of CANVAS_ACTION_USES) {
       if (!values[`action:${use}`] && !values[use]) values[`action:${use}`] = { use, kind: "action", schema: { type: "object", properties: {} }, presentation: { name: friendlyUseLabel(use) } };
     }
     for (const [sourceId, source] of Object.entries(config.sources ?? {}) as Array<[string, any]>) {
@@ -205,7 +234,10 @@ function WorkflowEditor({ workflow, config, catalog, project, onSaved }: { workf
 }
 
 function NodePalette({ schemas, onAdd }: { schemas: Record<string, any>; onAdd: (use: string) => void }) {
-  const entries = Object.values(schemas).filter((entry: CatalogEntry, index, all) => entry.kind === "action" && Boolean(entry.use) && all.findIndex((candidate: CatalogEntry) => candidate.kind === "action" && candidate.use === entry.use) === index);
+  const entries = CANVAS_ACTION_USES.flatMap((use) => {
+    const entry = schemas[`action:${use}`] ?? schemas[use];
+    return entry?.kind === "action" ? [entry as CatalogEntry] : [];
+  });
   return <div className="node-palette"><span className="eyebrow">NODE CATALOG</span>{entries.length ? entries.map((entry) => <button key={entry.use} title={entry.presentation?.description} onClick={() => onAdd(entry.use!)}><span className="palette-dot" />{entryLabel(entry)}<small>{entry.health || entry.presentation?.category || "action"}</small></button>) : <small className="palette-empty">No actions available in the catalog.</small>}</div>;
 }
 
@@ -215,7 +247,11 @@ function PropertyPanel({ node, nodes, edges, schemas, onChange, onActionReferenc
   const properties = schema?.properties ?? {};
   const config = node.data.config ?? {};
   const kind = node.data.kind === "trigger" ? "source" : "action";
-  const entries = Object.values(schemas).filter((entry: CatalogEntry, index, all) => entry.kind === kind && (kind !== "source" || (entry as CatalogEntry & { configured?: boolean }).configured) && Boolean(entry.use) && all.findIndex((candidate: CatalogEntry) => candidate.kind === kind && (kind !== "source" || (candidate as CatalogEntry & { configured?: boolean }).configured) && candidate.use === entry.use) === index);
+  const entries = Object.values(schemas).filter((entry: CatalogEntry, index, all) => entry.kind === kind
+    && (kind !== "action" || canvasActionUses.has(entry.use ?? "") || entry.use === node.data.use)
+    && (kind !== "source" || (entry as CatalogEntry & { configured?: boolean }).configured)
+    && Boolean(entry.use)
+    && all.findIndex((candidate: CatalogEntry) => candidate.kind === kind && (kind !== "source" || (candidate as CatalogEntry & { configured?: boolean }).configured) && candidate.use === entry.use) === index);
   const fieldValue = (name: string) => node.data.kind === "trigger" ? config[name] : (config.with ?? config)[name];
   const setField = (name: string, value: any) => onChange({ config: node.data.kind === "trigger" ? { ...config, [name]: value } : { ...config, with: { ...(config.with ?? {}), [name]: value } } });
   const setActionField = (name: string, value: any) => onChange({ config: { ...config, [name]: value } });

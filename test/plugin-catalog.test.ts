@@ -10,11 +10,11 @@ describe("plugin catalog", () => {
       harnesses: { main: { use: "codex" } },
     });
     const catalog = await buildPluginCatalog({ config, projectRoot: process.cwd(), includeInstalled: false });
-    const launch = catalog.entries.find((entry) => entry.id === "action:launch");
+    const tmuxWindow = catalog.entries.find((entry) => entry.id === "action:tmux.create-window");
     const commandSource = catalog.entries.find((entry) => entry.id === "source:command");
     const codex = catalog.entries.find((entry) => entry.id === "harness:codex");
-    expect(launch).toMatchObject({ health: "built-in", presentation: { name: "Launch worker", category: "Workers" } });
-    expect(launch?.configSchema).toBeTypeOf("object");
+    expect(tmuxWindow).toMatchObject({ health: "built-in", presentation: { name: "Start tmux window", category: "Automation" } });
+    expect(tmuxWindow?.configSchema).toBeTypeOf("object");
     expect(commandSource).toMatchObject({ kind: "source", health: "built-in" });
     expect(commandSource?.matchSchema).toBeTypeOf("object");
     expect(codex).toMatchObject({ kind: "harness", health: "built-in" });
