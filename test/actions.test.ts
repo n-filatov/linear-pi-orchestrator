@@ -89,6 +89,16 @@ class MemoryRunStore implements RunStore {
     return [...this.runs.values()].filter((run) => sameRepository(run.identity.repository, scope) && isActiveRun(run.status));
   }
 
+  async findRunsForItem(query: {
+    repository: RepositoryScope;
+    sourceId: string;
+    itemId: string;
+    selection?: "latest" | "active" | "all";
+    includeCleaned?: boolean;
+  }): Promise<readonly RunRecord[]> {
+    return this.findWorkerTargets(query);
+  }
+
   async findWorkerTargets(query: {
     repository: RepositoryScope;
     sourceId?: string;
@@ -143,6 +153,7 @@ function relay(input: {
   actionLedger?: MemoryActionLedger;
   agent?: AgentLauncher;
   workspace?: WorkspaceProvider;
+  oneWorkerPerItem?: boolean;
 }): TaskRelay {
   return new TaskRelay({
     triggers: { list: async () => [input.trigger] },
@@ -153,6 +164,7 @@ function relay(input: {
     actionPlugins: input.registry,
     actionExecutions: input.actionLedger,
     logger,
+    oneWorkerPerItem: input.oneWorkerPerItem,
     now: () => new Date("2026-08-15T12:00:00.000Z"),
   });
 }
@@ -612,6 +624,7 @@ describe("worker-scoped actions", () => {
           return { path: "/workspace/ENG-900", branch: "relay/ENG-900-add-a-dev-server" };
         },
       },
+      oneWorkerPerItem: false,
     });
 
     const result = await activeRelay.tick();
@@ -619,5 +632,47 @@ describe("worker-scoped actions", () => {
     // The trigger's own template is overridden by the earlier worker's branch,
     // so the review agent lands in the same worktree instead of a new one.
     expect(provisioned).toEqual(["relay/ENG-900-add-a-dev-server"]);
+  });
+
+  it("binds a Codex App Server to exactly the tmux worker selected in with.tmux.action", async () => {
+    const store = new MemoryRunStore();
+    const tmuxRun = seededRun(store, { workerId: "tmux-worker" });
+    const { runtime, opened, sent } = recordingRuntime();
+    const registry = new RelayPluginRegistry();
+    for (const plugin of builtInActionPlugins({ codexAppServer: {} as never })) registry.registerAction(plugin);
+    registry.registerAction({
+      kind: "action", use: "tmux-stub", configSchema: z.object({}),
+      async execute() { return { status: "succeeded", output: { workerId: "tmux-worker", runId: tmuxRun.id } }; },
+    });
+    const recordCalls: Array<Record<string, unknown>> = [];
+    const activeRelay = relay({
+      trigger: {
+        id: "codex-in-tmux", sourceId: "linear", repository, enabled: true,
+        actions: [
+          { id: "tmux-window", use: "tmux-stub", config: {} },
+          { id: "codex", use: "codex.start-session", config: { prompt: "Implement this", tmux: { action: "tmux-window" } } },
+        ],
+      },
+      items: [item], runStore: store, registry, actionLedger: new MemoryActionLedger(),
+      agent: {
+        resolve: async (profile) => ({ agentId: profile?.id ?? "codex" }),
+        launch: async () => ({ id: "codex-worker", startedAt: "now", metadata: {
+          codexAppServer: { transport: "websocket", threadId: "thread-1", turnId: "turn-1", endpoint: "ws://127.0.0.1:43123" },
+        } }),
+        runtime,
+      },
+    });
+    const original = store.update.bind(store);
+    store.update = async (run) => {
+      const values = run.worker?.metadata?.outputs;
+      if (values && typeof values === "object") recordCalls.push(values as Record<string, unknown>);
+      await original(run);
+    };
+
+    const result = await activeRelay.tick();
+    expect(result.actionsFailed).toBe(0);
+    expect(opened).toEqual([]);
+    expect(sent).toEqual([{ worker: "tmux-worker", spec: { text: "codex resume 'thread-1' --remote 'ws://127.0.0.1:43123'", submit: true } }]);
+    expect(recordCalls).toEqual([expect.objectContaining({ codexAppServer: expect.objectContaining({ endpoint: "ws://127.0.0.1:43123", tmux: expect.objectContaining({ action: "tmux-window", target: "@1" }) }) })]);
   });
 });

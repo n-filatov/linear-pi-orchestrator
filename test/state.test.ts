@@ -22,20 +22,47 @@ describe("RepositoryStateStore", () => {
       const store = new RepositoryStateStore(repository.root);
       const claimed = await store.claim({
         id: "unused", identity: { repository, sourceId: "queue", itemId: item.id, triggerId: implementation.id },
-        item, trigger: implementation, agent: { agentId: "codex" }, claimedAt: "claimed", maxConcurrent: 1,
+        item, trigger: implementation, agent: { agentId: "codex" }, claimedAt: "claimed", maxConcurrent: 4,
       });
-      await store.update({ ...claimed!, status: "running", workspace: { path: "/work/DONE-1" }, worker: { id: "worker-DONE-1", startedAt: "started" } });
+      await store.update({
+        ...claimed!, status: "running", workspace: { path: "/work/DONE-1/implementation" },
+        worker: { id: "worker-DONE-1", startedAt: "started", metadata: { tmux: { session: "relay", target: "@10", workerId: "worker-DONE-1" } } },
+      });
       const migratedImplementation = { ...implementation, id: "implementation:job" };
       const migrated = await store.claim({
         id: "unused", identity: { repository, sourceId: "queue", itemId: item.id, triggerId: migratedImplementation.id },
-        item, trigger: migratedImplementation, agent: { agentId: "codex" }, claimedAt: "migrated", maxConcurrent: 1,
+        item, trigger: migratedImplementation, agent: { agentId: "codex" }, claimedAt: "migrated", maxConcurrent: 4,
       });
-      await store.update({ ...migrated!, status: "running", workspace: { path: "/work/DONE-1" }, worker: { id: "worker-DONE-1-migrated", startedAt: "started" } });
+      await store.update({
+        ...migrated!, status: "running", workspace: { path: "/work/DONE-1/migrated" },
+        worker: { id: "worker-DONE-1-migrated", startedAt: "started", metadata: { tmux: { session: "relay", target: "@11", workerId: "worker-DONE-1-migrated" } } },
+      });
+      // The same Done ticket may have an old record with a recycled window id.
+      // It is deliberately not a cleanup target until Relay can prove ownership.
+      const unverified = await store.claim({
+        id: "unused", identity: { repository, sourceId: "queue", itemId: item.id, triggerId: "legacy-window" },
+        item, trigger: { ...implementation, id: "legacy-window" }, agent: { agentId: "codex" }, claimedAt: "unverified", maxConcurrent: 4,
+      });
+      await store.update({
+        ...unverified!, status: "running", workspace: { path: "/work/DONE-1/unverified" },
+        worker: { id: "worker-DONE-1-unverified", startedAt: "started", metadata: { tmux: { session: "relay", target: "@12", workerId: "some-other-worker" } } },
+      });
+      // A different Linear ticket can have a valid worker in the same Relay
+      // repository. Item scoping must prevent terminal cleanup from touching it.
+      const otherItem: WorkItem = { sourceId: "queue", id: "DONE-2", title: "Other Done", terminal: true };
+      const other = await store.claim({
+        id: "unused", identity: { repository, sourceId: "queue", itemId: otherItem.id, triggerId: "implementation" },
+        item: otherItem, trigger: implementation, agent: { agentId: "codex" }, claimedAt: "other", maxConcurrent: 4,
+      });
+      await store.update({
+        ...other!, status: "running", workspace: { path: "/work/DONE-2" },
+        worker: { id: "worker-DONE-2", startedAt: "started", metadata: { tmux: { session: "relay", target: "@13", workerId: "worker-DONE-2" } } },
+      });
 
       const workflow: WorkflowDefinition = {
         id: "cleanup-terminal", sourceId: "queue", repository, enabled: true,
         targets: { workers: { sourceItem: "current", runs: "all" } },
-        jobs: [{ id: "cleanup", use: "cleanup", config: { activeWorker: "stop" } }],
+        jobs: [{ id: "cleanup", use: "cleanup", config: { activeWorker: "stop", ownedTmuxOnly: true } }],
       };
       const plugins = new RelayPluginRegistry();
       for (const plugin of builtInActionPlugins()) plugins.registerAction(plugin);
@@ -49,11 +76,17 @@ describe("RepositoryStateStore", () => {
         actionPlugins: plugins, logger,
       });
 
-      await relay.tick();
-      expect(stopped).toEqual(["worker-DONE-1-migrated", "worker-DONE-1"]);
-      expect(cleaned).toEqual(["/work/DONE-1"]);
+      const result = await relay.tick();
+      expect(stopped).toEqual(expect.arrayContaining(["worker-DONE-1-migrated", "worker-DONE-1"]));
+      expect(stopped).not.toContain("worker-DONE-1-unverified");
+      expect(stopped).not.toContain("worker-DONE-2");
+      expect(cleaned).toEqual(expect.arrayContaining(["/work/DONE-1/implementation", "/work/DONE-1/migrated"]));
+      expect(cleaned).not.toContain("/work/DONE-1/unverified");
+      expect(cleaned).not.toContain("/work/DONE-2");
       expect((await store.getRun(claimed!.id))?.workspaceCleanedAt).toBeTruthy();
       expect((await store.getRun(migrated!.id))?.workspaceCleanedAt).toBeTruthy();
+      expect((await store.getRun(unverified!.id))?.workspaceCleanedAt).toBeUndefined();
+      expect((await store.getRun(other!.id))?.workspaceCleanedAt).toBeUndefined();
       const workflowRun = (await store.listWorkflowRuns(repository))[0];
       expect(workflowRun?.jobs.cleanup.status).toBe("succeeded");
     } finally {

@@ -126,14 +126,16 @@ describe("Task Relay configuration", () => {
       expect(config.actions.implement).toMatchObject({ use: "launch", with: { harness, model: "gpt-5.6-terra", mode: "interactive" } });
       expect(config.triggers[0].actions).toEqual(["implement"]);
       expect(config.triggers[0].fire).toEqual({ policy: "every-poll" });
-      expect(config.actions["cleanup-completed-worker"]).toMatchObject({ use: "cleanup", with: { activeWorker: "stop" } });
-      expect(config.triggers[1]).toMatchObject({
-        id: "linear-cleanup-terminal",
-        source: "linear",
-        match: { statusTypes: ["completed", "canceled"] },
+      expect(config.actions["cleanup-completed-worker"]).toMatchObject({ use: "cleanup", with: { activeWorker: "stop", ownedTmuxOnly: true } });
+      expect(config.workflows["linear-cleanup-on-done"]).toMatchObject({
+        enabled: true,
+        on: {
+          source: "linear",
+          match: { statusTypes: ["completed"] },
+          fire: { policy: "once-per-item" },
+        },
         targets: { workers: { sourceItem: "current", runs: "all" } },
-        actions: ["cleanup-completed-worker"],
-        fire: { policy: "once-per-item" },
+        jobs: { "cleanup-workers": { use: "cleanup-completed-worker" } },
       });
     }
   });

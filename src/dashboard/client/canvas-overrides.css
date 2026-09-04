@@ -1,0 +1,61 @@
+.react-flow__controls {
+  overflow: hidden;
+  border: 1px solid #334255;
+  border-radius: 6px;
+  box-shadow: 0 8px 22px #0005;
+}
+
+.react-flow__controls-button {
+  color: #aebdcd;
+  background: #18232f;
+  border-bottom-color: #334255;
+}
+
+.react-flow__controls-button:hover {
+  color: #fff;
+  background: #263548;
+}
+
+.react-flow__controls-button svg {
+  fill: currentColor;
+}
+
+.react-flow__minimap {
+  overflow: hidden;
+  background: #131d28 !important;
+  border: 1px solid #334255;
+  border-radius: 6px;
+  box-shadow: 0 8px 22px #0005;
+}
+
+.react-flow__minimap-mask {
+  fill: #0b1119aa;
+}
+
+.react-flow__attribution {
+  background: transparent;
+}
+
+.action-test-result {
+  margin-top: 16px;
+  border: 1px solid #2f4052;
+  border-radius: 6px;
+  background: #101923;
+  padding: 11px;
+  font-size: 11px;
+}
+.action-test-heading { display: flex; flex-direction: column; gap: 4px; }
+.action-test-heading b { color: #e5ecf5; font-size: 12px; }
+.action-test-matches { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.action-test-match { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; padding: 7px 8px; border-radius: 4px; border-left: 2px solid #32b997; background: #172a2d; }
+.action-test-match.ineligible { border-left-color: #d27a83; background: #2b2027; }
+.action-test-match b, .action-test-match small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.action-test-match b { color: #dbe5ef; font-size: 11px; }
+.action-test-match small { color: #8191a4; font-size: 10px; }
+.action-test-match > span { align-self: start; font-size: 9px; color: #53d0ad; text-transform: uppercase; }
+.action-test-match.ineligible > span { color: #e98c99; }
+.action-test-reason { grid-column: 1 / -1; color: #dc8b96 !important; white-space: normal !important; }
+.action-test-empty { color: #8b9aac; margin: 10px 0 2px; }
+.action-test-reasons { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; border-top: 1px solid #293646; padding-top: 8px; }
+.action-test-reasons small { color: #8191a4; }
+.action-test-reasons span { color: #c0ccd9; font-size: 10px; }

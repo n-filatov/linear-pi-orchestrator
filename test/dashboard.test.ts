@@ -119,6 +119,40 @@ describe("dashboard API", () => {
     } finally { await app.server.stop(); }
   });
 
+  it("previews one action's current eligibility without starting a worker", async () => {
+    const app = await dashboard(workflowProject);
+    try {
+      // The selected action has an explicit dependency, so a newly discovered
+      // ticket matches the trigger but cannot reach `two` yet.
+      const waiting = await app.post("/api/workflows/feature/actions/two/test");
+      expect(waiting.status).toBe(200);
+      expect(waiting.body).toMatchObject({ ok: true, dryRun: true });
+      expect(waiting.body.result).toMatchObject({ workflowId: "feature", actionId: "two", triggerMatchCount: 1, eligibleCount: 0 });
+      expect((waiting.body.result as any).items[0]).toMatchObject({
+        id: "ENG-4", eligible: false, decision: "hold", reason: "blocked on one.started", run: null,
+      });
+
+      // The action test reads only persisted workflow state. Once an upstream
+      // job has started, `two` is eligible because its `always()` condition is
+      // true; this request still does not execute either job.
+      const repository = { id: "dashboard-test", root: app.context.projectRoot };
+      const identity = { repository, workflowId: "feature", sourceId: "queue", itemId: "ENG-4", occurrence: "item" };
+      await app.context.store.openWorkflowRun({ identity, item, startedAt: "2026-08-19T10:00:00.000Z" });
+      await app.context.store.updateWorkflowJob(identity, "one", { status: "started", at: "2026-08-19T10:00:01.000Z" });
+
+      const eligible = await app.post("/api/workflows/feature/actions/two/test");
+      expect(eligible.body.result).toMatchObject({ triggerMatchCount: 1, eligibleCount: 1 });
+      expect((eligible.body.result as any).items[0]).toMatchObject({
+        id: "ENG-4", eligible: true, decision: "run", reason: "would start now",
+        run: { occurrence: "item", status: "running" },
+      });
+
+      const missing = await app.post("/api/workflows/feature/actions/nope/test");
+      expect(missing.status).toBe(400);
+      expect(missing.body.error).toMatch(/Unknown action 'nope'/);
+    } finally { await app.server.stop(); }
+  });
+
   it("dry-runs a workflow even when an unrelated action needs an uninstalled plugin", async () => {
     const app = await dashboard({
       ...workflowProject,

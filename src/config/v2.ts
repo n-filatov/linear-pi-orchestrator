@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { relayConfigSchema, type RelayConfig as LegacyRelayConfig } from "./schema.js";
+import { resolveStringWorkflowNeed } from "../workflows/needs.js";
 
 const identifier = z.string().min(1).regex(/^[a-zA-Z0-9._:-]+$/, "must contain only letters, numbers, '.', '_', ':' or '-'");
 const pluginUse = z.string().min(1).max(512);
@@ -150,7 +151,15 @@ export function validateJobGraph(jobs: Record<string, z.infer<typeof workflowJob
   if (names.size === 0) context.addIssue({ code: z.ZodIssueCode.custom, path, message: "a workflow needs at least one job" });
   for (const [name, job] of Object.entries(jobs)) {
     for (const [index, need] of needList(job.needs).entries()) {
-      const target = typeof need === "string" ? need.split(".")[0] : need.job;
+      const resolved = typeof need === "string" ? resolveStringWorkflowNeed(need, names) : { ok: true as const, need: { job: need.job } };
+      if (!resolved.ok) {
+        const message = resolved.kind === "unknown-job"
+          ? `unknown job '${resolved.job}'`
+          : `Unknown job status '${resolved.status}' in needs '${need}'. Use Started, Succeeded, Failed, or Skipped.`;
+        context.addIssue({ code: z.ZodIssueCode.custom, path: [...path, name, "needs", index], message });
+        continue;
+      }
+      const target = resolved.need.job;
       if (target === name) context.addIssue({ code: z.ZodIssueCode.custom, path: [...path, name, "needs", index], message: `job '${name}' cannot need itself` });
       else if (!names.has(target)) context.addIssue({ code: z.ZodIssueCode.custom, path: [...path, name, "needs", index], message: `unknown job '${target}'` });
     }
@@ -167,9 +176,14 @@ function needList(needs: z.infer<typeof workflowJobSchema>["needs"]): readonly z
 
 /** A cycle can never be satisfied, so it is a configuration error, not a stall. */
 function dependencyCycles(jobs: Record<string, z.infer<typeof workflowJobSchema>>): string[][] {
+  const names = new Set(Object.keys(jobs));
   const edges = new Map<string, string[]>();
   for (const [name, job] of Object.entries(jobs)) {
-    edges.set(name, needList(job.needs).map((need) => typeof need === "string" ? need.split(".")[0] : need.job));
+    edges.set(name, needList(job.needs).flatMap((need) => {
+      if (typeof need !== "string") return [need.job];
+      const resolved = resolveStringWorkflowNeed(need, names);
+      return resolved.ok ? [resolved.need.job] : [];
+    }));
   }
   const cycles: string[][] = [];
   const state = new Map<string, "visiting" | "done">();

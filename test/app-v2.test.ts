@@ -215,7 +215,9 @@ describe("v2 app/config integration", () => {
     expect(tick.output).toContain("1 workers launched");
 
     const launched = JSON.parse(await readFile(marker, "utf8")) as Record<string, unknown>;
-    expect(launched.workerId).toBe("ENG-8:custom");
+    // Worker ids identify one launch generation globally; plugins must treat
+    // the value as opaque instead of deriving it from an item/harness name.
+    expect(launched.workerId).toMatch(/^wrk_[a-f0-9]{24}$/);
     expect(launched.model).toBe("some-model");
     expect(launched.config).toEqual({ flavour: "configured" });
     expect(launched.prompt).toContain("Do ENG-8 in ");

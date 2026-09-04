@@ -392,6 +392,7 @@ export class TaskRelay {
             send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
             capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
             stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
+            recordOutputs: (ref, values) => this.recordWorkerOutputs(trigger, item, outputs, ref, values),
           },
           signal: this.stopController.signal,
         };
@@ -405,14 +406,16 @@ export class TaskRelay {
       outputs[job.id] = actionResult;
       result.actionsExecuted += 1;
 
-      // A plugin that reports `skipped` has nothing to do *yet* — no worker has
-      // appeared, for instance — so the job stays pending and is retried on a
-      // later tick. Only `if:` and an unsatisfiable dependency settle a job as
-      // skipped or omitted.
+      // A plugin that reports `skipped` normally has nothing to do *yet* — no
+      // worker has appeared, for instance — so the job stays pending and is
+      // retried on a later tick. Cleanup is terminal housekeeping, however:
+      // no worker (or an unverified tmux window) is a safe final no-op, not a
+      // reason to keep rediscovering a Done ticket indefinitely.
       if (actionResult.status === "skipped") {
         result.skipped += 1;
         this.recordItemOutcome(result, trigger, item, "skipped", `${job.id}: ${actionResult.message ?? "Nothing to do yet."}`);
-        return runs.updateWorkflowJob(identity, job.id, { status: "pending", message: actionResult.message, at: this.now().toISOString(), attempted: true });
+        const status: WorkflowJobStatus = job.use === "cleanup" ? "skipped" : "pending";
+        return runs.updateWorkflowJob(identity, job.id, { status, message: actionResult.message, at: this.now().toISOString(), attempted: true });
       }
 
       const runId = stringOutput(actionResult, "runId");
@@ -619,6 +622,7 @@ export class TaskRelay {
     source: WorkSource,
     trigger: TriggerDefinition,
     item: WorkItem,
+    options: { sidecar?: boolean } = {},
   ): Promise<{ claimed: boolean; launched: boolean; skipped: boolean; failed?: boolean; reason?: string; run?: RunRecord }> {
     if (this.stopController.signal.aborted || isTerminalWorkItem(item)) {
       return { claimed: false, launched: false, skipped: true, reason: this.stopController.signal.aborted ? "Relay is stopping." : "Ticket is terminal." };
@@ -649,7 +653,10 @@ export class TaskRelay {
     // ticket therefore hold different keys, and neither sees the other's live
     // worker. This guard is the one that keeps a ticket to a single worktree,
     // tmux window, and branch.
-    const sibling = await this.activeWorkerForItem(trigger, source.id, item.id);
+    // A sidecar is a bounded exception: it is a background helper for an
+    // existing worker, not another terminal/worktree owner. The same derived
+    // action identity above still prevents two copies of that sidecar.
+    const sibling = options.sidecar ? undefined : await this.activeWorkerForItem(trigger, source.id, item.id);
     if (sibling) {
       return { claimed: false, launched: false, skipped: true, reason: `Worker ${sibling.worker?.id ?? sibling.id} is already active for ${item.id}.` };
     }
@@ -785,6 +792,7 @@ export class TaskRelay {
               send: (ref, spec) => this.sendToWorker(trigger, item, outputs, ref, spec),
               capture: (ref, options) => this.captureWorker(trigger, item, outputs, ref, options),
               stop: (ref) => this.stopWorker(trigger, item, outputs, ref),
+              recordOutputs: (ref, values) => this.recordWorkerOutputs(trigger, item, outputs, ref, values),
             },
             signal: this.stopController.signal,
           };
@@ -830,16 +838,32 @@ export class TaskRelay {
       ...trigger,
       id: `${trigger.id}:${actionId}`,
       actions: undefined,
-      agent: { id: request.harness, model: request.model, promptTemplate: request.prompt, metadata: { modelProfile: request.modelProfile } },
+      agent: {
+        id: request.harness,
+        model: request.model,
+        promptTemplate: request.prompt,
+        metadata: { modelProfile: request.modelProfile, reasoningEffort: request.reasoningEffort, harnessInput: request.harnessInput },
+      },
       promptDelivery: request.mode === "interactive" ? "interactive" : undefined,
       metadata: { ...trigger.metadata, ...workspace },
     };
-    const outcome = await this.dispatchItem(source, derived, item);
+    const outcome = await this.dispatchItem(source, derived, item, { sidecar: request.sidecar === true });
     result.runsClaimed += outcome.claimed ? 1 : 0;
     result.runsLaunched += outcome.launched ? 1 : 0;
     this.recordItemOutcome(result, derived, item, outcome.launched ? "launched" : outcome.failed ? "failed" : "skipped", outcome.reason, outcome.run?.worker?.id);
     if (!outcome.launched) return { status: "skipped", message: outcome.reason ?? outcome.run?.error ?? "Worker was not launched." };
-    return { status: "succeeded", output: { runId: outcome.run?.id, workerId: outcome.run?.worker?.id } };
+    const codex = outcome.run?.worker?.metadata?.codexAppServer;
+    const codexSession = codex !== null && typeof codex === "object" && !Array.isArray(codex) ? codex as Record<string, unknown> : undefined;
+    return {
+      status: "succeeded",
+      output: {
+        runId: outcome.run?.id,
+        workerId: outcome.run?.worker?.id,
+        ...(typeof codexSession?.threadId === "string" ? { threadId: codexSession.threadId } : {}),
+        ...(typeof codexSession?.turnId === "string" ? { turnId: codexSession.turnId } : {}),
+        ...(typeof codexSession?.endpoint === "string" ? { endpoint: codexSession.endpoint } : {}),
+      },
+    };
   }
 
   private async cleanupFromAction(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, workerId: string): Promise<ActionResult> {
@@ -1013,6 +1037,32 @@ export class TaskRelay {
     return stopped.length === 0
       ? { status: "skipped", message: "No matching worker was still active." }
       : { status: "succeeded", output: { workerIds: stopped } };
+  }
+
+  private async recordWorkerOutputs(
+    trigger: TriggerDefinition,
+    item: WorkItem,
+    outputs: Readonly<Record<string, ActionResult>>,
+    ref: WorkerRef,
+    values: Record<string, unknown>,
+  ): Promise<ActionResult> {
+    const targets = await this.resolveWorkers(trigger, item, outputs, ref);
+    if (targets.length === 0) return { status: "skipped", message: "No matching worker is running." };
+    for (const { run } of targets) {
+      const at = this.now().toISOString();
+      const recorded = await this.dependencies.runStore.recordWorkerOutputs?.(run.identity, run.claimedAt, values, at);
+      if (recorded === undefined && !this.dependencies.runStore.recordWorkerOutputs) {
+        if (!run.worker) continue;
+        const previous = run.worker.metadata?.outputs;
+        const oldOutputs = previous !== null && typeof previous === "object" && !Array.isArray(previous) ? previous as Record<string, unknown> : {};
+        run.worker = { ...run.worker, metadata: { ...run.worker.metadata, outputs: { ...oldOutputs, ...values } } };
+        run.updatedAt = at;
+        await this.dependencies.runStore.update(run);
+      } else if (!recorded) {
+        return { status: "skipped", message: `Worker ${run.worker?.id ?? run.id} changed before its outputs could be recorded.` };
+      }
+    }
+    return { status: "succeeded", output: { workerIds: targets.map(({ worker }) => worker.id), outputs: values } };
   }
 
   private async workerTargets(trigger: TriggerDefinition, item: WorkItem, explicitWorkerIds?: readonly string[], selection?: "latest" | "active" | "all"): Promise<readonly RunRecord[]> {

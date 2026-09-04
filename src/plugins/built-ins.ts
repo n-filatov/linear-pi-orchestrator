@@ -7,7 +7,7 @@
  */
 export const BUILT_IN_SOURCES = new Set(["linear", "command"]);
 
-export const BUILT_IN_ACTIONS = new Set(["launch", "cleanup", "command", "worker-exec", "worker-send"]);
+export const BUILT_IN_ACTIONS = new Set(["launch", "cleanup", "command", "worker-exec", "worker-send", "tmux.create-window", "codex.start-session", "codex.send-prompt"]);
 
 /** Harness plugin names Relay can execute through its command launcher. */
 export const BUILT_IN_HARNESSES = new Set(["codex", "claude", "pi", "opencode", "command"]);

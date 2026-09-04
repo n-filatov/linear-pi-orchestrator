@@ -2,6 +2,7 @@ export * from "./domain/index.js";
 export * from "./core/index.js";
 export * from "./sources/index.js";
 export * from "./agents/index.js";
+export * from "./codex/index.js";
 export * from "./actions/index.js";
 export * from "./plugins/index.js";
 export * from "./runtime/index.js";

@@ -31,21 +31,29 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-declarations.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-declarations.mjs && npm run dashboard:build",
     "prepare": "npm run build",
     "test": "vitest run",
     "start": "tsx src/cli/main.ts",
-    "dev:cli": "node bin/relay-dev.js"
+    "dev:cli": "node bin/relay-dev.js",
+    "dashboard:dev": "vite --config src/dashboard/client/vite.config.ts",
+    "dashboard:build": "vite build --config src/dashboard/client/vite.config.ts",
+    "dashboard:check": "tsc --noEmit -p tsconfig.dashboard.json"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^5.0.4",
     "typescript": "^5.8.3",
+    "vite": "^7.3.6",
     "vitest": "^3.1.2"
   },
   "dependencies": {
     "@actions/expressions": "^0.3.61",
     "@inquirer/prompts": "^7.5.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@xyflow/react": "^12.11.5",
     "cli-table3": "^0.6.5",
     "commander": "^13.1.0",
     "cosmiconfig": "^9.0.0",
@@ -56,6 +64,8 @@
     "pino": "^9.7.0",
     "pino-pretty": "^13.0.0",
     "proper-lockfile": "^4.1.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "tsx": "^4.19.3",
     "write-file-atomic": "^6.0.0",
     "yaml": "^2.7.1",

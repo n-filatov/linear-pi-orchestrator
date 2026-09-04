@@ -20,6 +20,24 @@ export type PluginUse = string;
 
 export type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * Safe, data-only information a client may use to present a plugin.
+ *
+ * Plugin code is never sent to the dashboard. A UI combines this metadata with
+ * the plugin's JSON Schema to render a generic node and configuration form.
+ */
+export interface PluginPresentation {
+  /** Human-friendly label. Defaults to the plugin's `use` identifier. */
+  name: string;
+  description?: string;
+  /** A broad grouping such as "Workers", "Automation", or "Sources". */
+  category: string;
+  /** An optional icon identifier understood by the host application. */
+  icon?: string;
+  /** An optional CSS-compatible accent colour. */
+  color?: string;
+}
+
 export interface SourcePluginContext<Config = unknown, Match = unknown> {
   sourceId: string;
   config: Config;
@@ -38,6 +56,7 @@ export interface SourcePlugin<Config = unknown, Match = unknown> {
   readonly use: PluginUse;
   readonly configSchema: ZodTypeAny;
   readonly matchSchema: ZodTypeAny;
+  readonly presentation?: PluginPresentation;
   discover(context: SourcePluginContext<Config, Match>): MaybePromise<readonly WorkItem[]>;
   matches?(item: WorkItem, match: Match, context: Omit<SourcePluginContext<Config, Match>, "match">): MaybePromise<boolean>;
   report?(event: SourceEvent, config: Config): MaybePromise<void>;
@@ -85,6 +104,8 @@ export interface WorkerActions {
   capture(ref: WorkerRef, options?: { child?: string; lines?: number }): Promise<ActionResult>;
   /** Stop a worker and its children without removing its workspace. */
   stop(ref: WorkerRef): Promise<ActionResult>;
+  /** Persist data produced by an action against the selected worker generation. */
+  recordOutputs(ref: WorkerRef, outputs: Record<string, unknown>): Promise<ActionResult>;
 }
 
 export interface ActionContext {
@@ -109,8 +130,21 @@ export interface LaunchWorkerActionRequest {
   mode?: "oneshot" | "interactive";
   model?: string;
   modelProfile?: string;
+  reasoningEffort?: string;
   prompt?: string;
   workspace?: Record<string, unknown>;
+  /**
+   * Start a background helper for a worker that another action already owns.
+   * The normal one-worker-per-item guard still applies to all ordinary
+   * launches, and the derived action identity still prevents duplicates.
+   *
+   * This is for helpers such as a Codex App Server: the helper has no terminal
+   * of its own and a later action sends its UI/command into the parent worker's
+   * existing terminal.
+   */
+  sidecar?: boolean;
+  /** Harness-specific launch data that is not part of the generic worker contract. */
+  harnessInput?: Record<string, unknown>;
 }
 
 /** JSON-compatible output persisted by the generic action engine. */
@@ -125,6 +159,7 @@ export interface ActionPlugin<Config = unknown> {
   readonly kind: "action";
   readonly use: PluginUse;
   readonly configSchema: ZodTypeAny;
+  readonly presentation?: PluginPresentation;
   /** Worker actions run once for each worker selected by the trigger. */
   readonly target?: "item" | "worker";
   execute(context: ActionContext, config: Config): MaybePromise<ActionResult>;
@@ -137,6 +172,9 @@ export interface HarnessLaunchRequest<Config = unknown> {
   workspace: Workspace;
   prompt: string;
   model?: string;
+  reasoningEffort?: string;
+  /** Per-launch data supplied by the action that selected this harness. */
+  harnessInput?: Record<string, unknown>;
   config: Config;
   signal?: AbortSignal;
 }
@@ -149,6 +187,7 @@ export interface HarnessPlugin<Config = unknown> {
   readonly kind: "harness";
   readonly use: PluginUse;
   readonly configSchema: ZodTypeAny;
+  readonly presentation?: PluginPresentation;
   launch(request: HarnessLaunchRequest<Config>): MaybePromise<WorkerHandle>;
   wait?(worker: WorkerHandle): MaybePromise<WorkerCompletion | undefined>;
   reconcile?(worker: WorkerHandle): MaybePromise<WorkerCompletion | undefined>;

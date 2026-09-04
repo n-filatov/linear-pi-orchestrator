@@ -475,22 +475,79 @@ beside a running one.
 relay workflow test feature    # matched items, each job, and what would start now
 relay workflow runs            # every run, with each job's state and why it is blocked
 relay workflow runs --json
-relay dashboard                # the same, in a browser, updating as it happens
+relay dashboard                # global workflow canvas and live control plane
+relay dashboard --repo /path/to/another/repository
 ```
 
-`relay dashboard` shows every workflow with its declared jobs, each run's job
-states, and the edge each waiting job is blocked on. A **Test** button runs the
-same dry run without changing anything. Its Plugins tab reports what this
-project references and whether it is installed, and its Workers tab can send a
-prompt into a live worker or open a pane beside it. A live event feed streams
-the structured log at the bottom of every tab.
+`relay dashboard` is machine-global and can be opened from outside a repository.
+Register local repository folders in the UI or with `--repo`; the selection is
+remembered in SQLite. Each folder keeps its own `.task-relay.yaml` as the
+authoritative workflow definition while the dashboard aggregates executions and
+workers across every registered folder.
 
-Workflows are editable there too, under **Configuration → Workflows**. A job's
-configuration form is generated from the selected plugin's own schema, so an
-installed plugin's fields — with their types, enums, defaults, and which are
-required — appear without a line of dashboard code written for it. Anything the
-schema cannot describe falls back to a JSON editor, and a toggle switches to raw
-JSON at any time.
+The Workflows tab is an n8n-style React Flow canvas. It supports create,
+duplicate, rename, delete, trigger/source selection, action nodes, conditional
+dependency edges, reconnect/delete, undo/redo, auto-layout, dry-run tests, and
+schema-driven property forms with a raw JSON fallback. Workflow saves are
+revision checked and update only that workflow's YAML subtree, so comments and
+unknown configuration survive. Visual positions, groups, notes, and viewport
+state live separately in repository-owned `.task-relay.ui.json` and never affect
+execution.
+
+The Executions tab is backed by the global SQLite read model and shows job state
+across repositories; failed runs can be inspected and retried. The Workers tab
+can send input into a live worker or open a pane beside it. The Plugins tab is
+generated from the same modular source/action/harness catalog used by the
+canvas, so an installed plugin becomes editable without dashboard-specific code.
+
+### Codex App Server actions
+
+The canvas includes three independent built-in actions:
+
+- `tmux.create-window` opens an owned shell window in the repository workspace
+  and returns the Relay worker id plus verified tmux metadata. Cleanup owns that
+  window just like any other Relay worker.
+- `codex.start-session` starts the installed Codex CLI through its JSONL stdio
+  App Server, creates a durable thread, and sends the first prompt. It uses the
+  current Codex login; it does not need a configured tmux harness or API key.
+- `codex.send-prompt` selects a preceding `codex.start-session` node. `idle`
+  waits for the active turn before starting another; `immediate` steers the
+  active turn. By default the job remains running until that turn completes.
+
+The dashboard obtains the model and reasoning-effort pickers from the installed
+Codex App Server. If that catalog is unavailable, the same fields remain
+editable as free text. Thread and turn ids are persisted with the worker, and a
+new dashboard process resumes the thread by id before sending another prompt.
+
+```yaml
+workflows:
+  implement-with-codex:
+    on:
+      source: linear
+      match: { labels: { all: [relay:implement] } }
+    jobs:
+      codex:
+        use: codex.start-session
+        with:
+          model: gpt-5.6-terra
+          effort: high
+          prompt: "Implement {{item.id}}: {{item.title}}"
+      follow-up:
+        # Started allows immediate steering. The delivery option below decides
+        # whether to steer now or wait until the current turn is idle.
+        needs: codex.Started
+        use: codex.send-prompt
+        with:
+          codex: { action: codex }
+          delivery: idle
+          waitForCompletion: true
+          timeoutMs: 300000
+          prompt: "Run the relevant tests and fix any failures."
+```
+
+The tmux window is intentionally not the transport for Codex: App Server owns
+the Codex process and thread lifecycle, while tmux remains available for an
+independent interactive shell or other worker actions.
 
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
@@ -684,17 +741,27 @@ relay attach ENG-123              # enter the latest matching tmux worker
 relay update [version] [--check]
 relay cleanup '<worker-id>'
 relay daemon start|stop|status
+relay dashboard [--repo <paths...>] [--port 3001] [--no-open]
 ```
 
 `trigger test` should preview the source items, matching result, selected workers, planned actions, and rendered prompt without changing state. Events are structured JSONL under `${XDG_STATE_HOME:-~/.local/state}/task-relay/<repo>-<hash>/events.jsonl`; human tables are rendered from those records.
 
-Worker discovery is machine-global. Relay stores an SQLite registry at
+Worker and workflow discovery are machine-global. Relay stores an SQLite registry at
 `${XDG_STATE_HOME:-~/.local/state}/task-relay/registry.sqlite`, while keeping the
-repository JSON state as the dispatch ledger. A normalized Git origin identifies
+repository JSON state as the dispatch ledger. The SQLite schema includes project
+folders, workflow runs, job runs, append-only workflow events, worker records,
+and lifecycle events. It is a rebuildable query index, not a second execution
+authority. A normalized Git origin identifies
 the same repository across clones and linked worktrees; repositories without an
 origin use their canonical Git common-directory path. Existing JSON runs are
 indexed automatically when that repository is next opened; the repository JSON
 ledger remains backward-compatible and is not replaced.
+
+The optional global runtime supervisor polls every enabled registered folder.
+It takes a per-repository lease and refuses to start when that repository's
+standalone daemon already owns polling, preventing duplicate execution. The
+localhost dashboard itself uses a random bearer/cookie token, validates Host and
+Origin, and never binds beyond `127.0.0.1`.
 
 Interactive tmux windows carry `@task_relay_worker_id` and
 `@task_relay_issue` options. Persisted tmux window indexes are only cached
@@ -711,6 +778,8 @@ Version 1 configuration remains accepted and is normalized in memory to version 
 ```bash
 npm install
 npm run check
+npm run dashboard:check
+npm run dashboard:dev
 npm test
 npm start -- doctor
 ```

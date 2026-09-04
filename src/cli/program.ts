@@ -8,10 +8,12 @@ import { relayConfigV2Schema, type RelayConfigV2, type RelayTriggerV2 } from "..
 import { createEventLogger, eventLogPath, logEvent, readEvents, stateDirectory } from "../logging/events.js";
 import { errorTable, eventsTable, statusTable } from "../logging/tables.js";
 import { RepositoryStateStore } from "../state/store.js";
-import { GlobalWorkerRegistry, type GlobalWorkerRecord } from "../state/global-worker-registry.js";
+import { GlobalWorkerRegistry, type GlobalWorkerRecord, type GlobalWorkflowRegistry } from "../state/global-worker-registry.js";
 import { getRepositoryIdentity, type RepositoryIdentity } from "../state/repository-identity.js";
 import { writeFile } from "node:fs/promises";
 import { addPluginCommands } from "./plugin-commands.js";
+import type { WorkflowJobStatus } from "../domain/index.js";
+import type { RelayWorkflowV2 } from "../config/v2.js";
 
 export type RelayCommandContext = {
   projectRoot: string;
@@ -21,9 +23,37 @@ export type RelayCommandContext = {
   write: (value: string) => void;
   /** Machine-global worker index, shared by every checkout and Relay process. */
   registry?: GlobalWorkerRegistry;
+  /** Global SQLite read model for workflow executions. */
+  workflowRegistry?: GlobalWorkflowRegistry;
   /** Stable across clones when a repository has an origin remote. */
   repositoryIdentity?: RepositoryIdentity;
 };
+
+/**
+ * Read-only preview for one canvas action. It deliberately reports the
+ * action's current eligibility rather than predicting outcomes of upstream
+ * jobs: dependency outputs only exist once Relay has persisted them.
+ */
+export type WorkflowActionTestResult = {
+  workflowId: string;
+  actionId: string;
+  sourceId: string;
+  triggerMatchCount: number;
+  eligibleCount: number;
+  items: Array<{
+    id: string;
+    title: string;
+    url?: string;
+    state?: string;
+    /** True exactly when Relay would start this action on its next tick. */
+    eligible: boolean;
+    decision: "run" | "hold" | "settle";
+    reason: string;
+    /** The latest durable workflow state used to make this decision. */
+    run: { occurrence: string; status: string; jobStatus?: WorkflowJobStatus } | null;
+  }>;
+};
+
 export type RelayCommandHandlers = {
   once?: (context: RelayCommandContext, options: { trigger?: string; task?: string }) => Promise<void>;
   watch?: (context: RelayCommandContext, options: { trigger?: string }) => Promise<void>;
@@ -33,6 +63,13 @@ export type RelayCommandHandlers = {
   attach?: (context: RelayCommandContext, target: string) => Promise<void>;
   signal?: (context: RelayCommandContext, target: string, outcome: "done" | "failed", options: { outputs: Record<string, string>; message?: string }) => Promise<void>;
   workflowTest?: (context: RelayCommandContext, id: string) => Promise<void>;
+  /** Read-only eligibility preview for one workflow action/job. */
+  workflowActionTest?: (
+    context: RelayCommandContext,
+    workflowId: string,
+    actionId: string,
+    options?: { workflow?: RelayWorkflowV2 },
+  ) => Promise<WorkflowActionTestResult>;
   /** Ad-hoc control of one live worker, used by the dashboard. */
   workerControl?: (context: RelayCommandContext, target: string, action:
     | { type: "send"; text: string; submit?: boolean }
@@ -82,7 +119,9 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
       },
       [cleanupActionId]: {
         use: "cleanup",
-        with: { activeWorker: "stop" },
+        // Terminal automation is deliberately stricter than an ad-hoc cleanup:
+        // it only touches a tmux window carrying Relay's durable worker tag.
+        with: { activeWorker: "stop", ownedTmuxOnly: true },
       },
     },
     triggers: [
@@ -97,15 +136,24 @@ export function defaultConfig(options: Required<Pick<InitOptions, "source" | "ha
         fire: { policy: "every-poll" },
         maxConcurrent: options.maxConcurrent,
       },
-      {
-        id: `${options.source}-cleanup-terminal`,
-        source: options.source,
-        match: { statusTypes: ["completed", "canceled"] },
-        targets: { workers: { sourceItem: "current", runs: "all" } },
-        actions: [cleanupActionId],
-        fire: { policy: "once-per-item" },
-      },
     ],
+    // Terminal cleanup is a durable workflow, rather than a second trigger:
+    // one job handles every Relay-owned tmux worker/worktree for this exact
+    // Linear item and retains an auditable result for the Done transition.
+    workflows: {
+      [`${options.source}-cleanup-on-done`]: {
+        enabled: true,
+        on: {
+          source: options.source,
+          match: { statusTypes: ["completed"] },
+          fire: { policy: "once-per-item" },
+        },
+        targets: { workers: { sourceItem: "current", runs: "all" } },
+        jobs: {
+          "cleanup-workers": { use: cleanupActionId },
+        },
+      },
+    },
     workspace: { adapter: "wt", directory: ".task-relay/workspaces", baseBranch: branch, branchPrefix: "relay" },
     execution: { maxConcurrent: options.maxConcurrent, retries: 2, adapter: "tmux", tmuxSession: `task-relay-${projectName.replace(/[^a-zA-Z0-9_.-]+/g, "-")}` },
     logging: { level: "info", pretty: true },
@@ -399,13 +447,21 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   const daemon = program.command("daemon").description("Control the registered background runtime.");
   for (const action of ["start", "stop", "status"] as const) daemon.command(action).action(async () => { const context = await resolveContext(cwd, print); if (!options.handlers?.daemon) noHandler(`daemon ${action}`); await options.handlers.daemon(context, action); });
 
-  program.command("dashboard").description("Open a local web dashboard for workers and configuration.")
+  program.command("dashboard").description("Open the global workflow canvas and local runtime control plane.")
     .option("--port <port>", "port to listen on", "3001")
+    .option("--repo <paths...>", "register one or more repository folders before opening")
     .option("--no-open", "do not open the browser automatically")
-    .action(async (flags: { port?: string; open?: boolean }) => {
-      const { DashboardServer } = await import("../dashboard/server.js");
-      const context = await resolveContext(cwd, print);
-      const server = new DashboardServer(context, options.handlers ?? {});
+    .action(async (flags: { port?: string; open?: boolean; repo?: string[] }) => {
+      const [{ GlobalDashboardServer }, { ProjectManager }] = await Promise.all([
+        import("../dashboard/global-server.js"),
+        import("../dashboard/project-manager.js"),
+      ]);
+      const projects = new ProjectManager();
+      for (const root of flags.repo ?? []) await projects.register(root);
+      // Opening from a configured repository makes it visible immediately;
+      // opening from any other folder still shows the persisted global list.
+      try { await projects.register(cwd()); } catch { /* global dashboard works outside a repository */ }
+      const server = new GlobalDashboardServer(projects, options.handlers ?? {});
       const port = flags.port ? Number(flags.port) : 3001;
       const url = await server.start(port);
       print(`Dashboard running at ${url}  (Ctrl-C to stop)`);
@@ -419,6 +475,7 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
         process.once("SIGTERM", resolve);
       });
       await server.stop();
+      projects.close();
     });
 
   addPluginCommands(program, print);

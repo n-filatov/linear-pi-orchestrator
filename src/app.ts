@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import pRetry from "p-retry";
-import type { RelayCommandContext, RelayCommandHandlers } from "./cli/program.js";
+import type { RelayCommandContext, RelayCommandHandlers, WorkflowActionTestResult } from "./cli/program.js";
 import { loadRelayConfig, type RelayActionReference, type RelayConfigV2, type RelayTriggerV2, type RelayWorkflowJobV2, type RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
@@ -11,17 +11,20 @@ import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, ty
 import { builtInActionPlugins } from "./actions/index.js";
 import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findInstalledPlugin, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
 import { loadReusableWorkflow } from "./config/reusable.js";
-import { DirectProcessAdapter, TmuxExecutionAdapter } from "./runtime/index.js";
+import { DirectProcessAdapter, TmuxExecutionAdapter, TmuxWindowHarness, TMUX_WINDOW_HARNESS_ID } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
 import { tickTable, type TickTableRow } from "./logging/tables.js";
 import { createEventLogger } from "./logging/events.js";
-import { decideJob } from "./workflows/reconciler.js";
-import { GlobalWorkerRegistry, type GlobalWorkerRecord } from "./state/global-worker-registry.js";
+import { decideJob, jobInstances } from "./workflows/reconciler.js";
+import { resolveStringWorkflowNeed } from "./workflows/needs.js";
+import { GlobalWorkerRegistry, GlobalWorkflowRegistry, type GlobalWorkerRecord } from "./state/global-worker-registry.js";
 import { getRepositoryIdentity } from "./state/repository-identity.js";
 import { RepositoryStateStore } from "./state/store.js";
+import { IndexedWorkflowRunStore } from "./state/indexed-workflow-run-store.js";
+import { CODEX_APP_SERVER_HARNESS_ID, CodexAppServerHarness } from "./codex/index.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
@@ -34,6 +37,33 @@ type RuntimeComposition = {
   runStore: EventingRunStore;
   plugins: RelayPluginRegistry;
 };
+
+// Global supervision composes a short-lived Relay for each poll. App Server
+// stdio clients must survive that boundary so a later `codex.send-prompt` can
+// address the thread an earlier `codex.start-session` created.
+const codexAppServerHarnesses = new Map<string, CodexAppServerHarness>();
+
+function sharedCodexAppServer(projectRoot: string): CodexAppServerHarness {
+  const key = path.resolve(projectRoot);
+  let harness = codexAppServerHarnesses.get(key);
+  if (!harness) {
+    harness = new CodexAppServerHarness();
+    codexAppServerHarnesses.set(key, harness);
+  }
+  return harness;
+}
+
+/** Stop all cached App Server children during an owning host's shutdown. */
+export async function closeCodexAppServers(projectRoot?: string): Promise<void> {
+  const entries = projectRoot
+    ? [[path.resolve(projectRoot), codexAppServerHarnesses.get(path.resolve(projectRoot))] as const]
+    : [...codexAppServerHarnesses.entries()];
+  await Promise.all(entries.map(async ([key, harness]) => {
+    if (!harness) return;
+    codexAppServerHarnesses.delete(key);
+    await harness.closeAll();
+  }));
+}
 
 async function ensureRegistryContext(context: RelayCommandContext): Promise<{ registry: GlobalWorkerRegistry; repository: RepositoryScope; registryRepository: RepositoryScope }> {
   const identity = context.repositoryIdentity ?? await getRepositoryIdentity(context.projectRoot);
@@ -242,6 +272,86 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         context.write("Dry run only; no action, source, workspace, or worker changes were made.");
       } finally { await runtime.relay.stop(); }
     },
+    workflowActionTest: async (context, workflowId, actionId, options): Promise<WorkflowActionTestResult> => {
+      // Canvas edits are tested before save. The draft replaces only this
+      // workflow in an otherwise unchanged repository context, so sources,
+      // actions, credentials, and persisted run state stay authoritative.
+      const previewContext = options?.workflow
+        ? {
+          ...context,
+          config: {
+            ...context.config,
+            workflows: { ...context.config.workflows, [workflowId]: options.workflow },
+          },
+        }
+        : context;
+      // Keep this validation before runtime composition so a typo never opens a
+      // source connection or initializes unrelated action plugins.
+      if (!previewContext.config.workflows[workflowId]) {
+        const known = Object.keys(previewContext.config.workflows);
+        throw new Error(`Unknown workflow '${workflowId}'.${known.length ? ` Configured workflows: ${known.join(", ")}.` : " None are configured."}`);
+      }
+
+      const runtime = await composeRuntime(previewContext, { trigger: workflowId });
+      try {
+        const workflow = runtime.workflows[0];
+        const source = workflow && runtime.sources.get(workflow.sourceId);
+        if (!workflow || !source) throw new Error(`Workflow ${workflowId} could not be composed.`);
+
+        // A canvas node represents the declared job id. Matrix jobs expand to
+        // several runtime instances, which share that id as their group.
+        const actions = workflow.jobs.filter((job) => job.id === actionId || job.group === actionId);
+        if (actions.length === 0) {
+          const configured = previewContext.config.workflows[workflowId]?.jobs?.[actionId];
+          if (configured && !configured.enabled) throw new Error(`Action '${actionId}' in workflow '${workflowId}' is disabled.`);
+          throw new Error(`Unknown action '${actionId}' in workflow '${workflowId}'.`);
+        }
+        if (actions.length > 1) {
+          throw new Error(`Action '${actionId}' in workflow '${workflowId}' expands to ${actions.length} matrix jobs. Test one matrix instance instead.`);
+        }
+        const action = actions[0]!;
+        const known = new Set(workflow.jobs.flatMap((job) => [job.id, job.group ?? job.id]));
+        const instances = jobInstances(workflow.jobs);
+        const discovered = await source.discover({
+          trigger: { id: workflow.id, sourceId: workflow.sourceId, repository: workflow.repository, enabled: true, selector: workflow.selector },
+        });
+
+        const items = await Promise.all(discovered.map(async (item) => {
+          const existing = await previewContext.store.latestWorkflowRun({
+            repository: workflow.repository,
+            workflowId: workflow.id,
+            sourceId: item.sourceId,
+            itemId: item.id,
+          });
+          const states = existing?.jobs ?? {};
+          const decision = decideJob({ job: action, states, item, known, instances });
+          return {
+            id: item.id,
+            title: item.title,
+            ...(item.url ? { url: item.url } : {}),
+            ...(item.state ? { state: item.state } : {}),
+            eligible: decision.action === "run",
+            decision: decision.action,
+            reason: decision.action === "run" ? "would start now" : decision.reason,
+            run: existing
+              ? {
+                occurrence: existing.identity.occurrence,
+                status: existing.status,
+                ...(existing.jobs[action.id] ? { jobStatus: existing.jobs[action.id]!.status } : {}),
+              }
+              : null,
+          };
+        }));
+        return {
+          workflowId: workflow.id,
+          actionId,
+          sourceId: workflow.sourceId,
+          triggerMatchCount: items.length,
+          eligibleCount: items.filter((item) => item.eligible).length,
+          items,
+        };
+      } finally { await runtime.relay.stop(); }
+    },
     daemon: async (context, action) => {
       const daemon = new RepositoryDaemon(context.projectRoot);
       context.write(action === "start" ? await daemon.start() : action === "stop" ? await daemon.stop() : await daemon.status());
@@ -320,7 +430,8 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
 
 async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string } = {}): Promise<RuntimeComposition> {
   const { registry, repository, registryRepository } = await ensureRegistryContext(context);
-  const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger);
+  const codexAppServer = sharedCodexAppServer(context.projectRoot);
+  const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger, codexAppServer);
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
     .map((trigger) => domainTrigger(context.config, trigger, repository));
@@ -358,8 +469,15 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const executor = context.config.execution.adapter === "tmux"
     ? new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${repository.id}` })
     : new DirectProcessAdapter();
+  const tmuxWindowExecutor = executor instanceof TmuxExecutionAdapter
+    ? executor
+    : new TmuxExecutionAdapter({ session: context.config.execution.tmuxSession || `task-relay-${repository.id}` });
   const commandLauncher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName, repositoryIdentity: registryRepository.id });
-  const harnessPlugins = pluginHarnesses(context.config, plugins);
+  const harnessPlugins = [
+    { id: CODEX_APP_SERVER_HARNESS_ID, plugin: codexAppServer, config: plugins.parseHarnessConfig(CODEX_APP_SERVER_HARNESS_ID, {}) },
+    { id: TMUX_WINDOW_HARNESS_ID, plugin: new TmuxWindowHarness(tmuxWindowExecutor), config: plugins.parseHarnessConfig(TMUX_WINDOW_HARNESS_ID, {}) },
+    ...pluginHarnesses(context.config, plugins),
+  ];
   const configuredLauncher = harnessPlugins.length > 0 ? new CompositeAgentLauncher(commandLauncher, harnessPlugins) : commandLauncher;
   const launcher = new RegistryAgentLauncher(configuredLauncher, registry, registryRepository);
   const configuredWorkspace = context.config.workspace.adapter === "git-worktree"
@@ -368,10 +486,13 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const workspace = new RegistryWorkspaceProvider(configuredWorkspace, registry, registryRepository);
   const eventStore = new EventingRunStore(context.store, context.logger, repository.id, registry, registryRepository);
   const triggerProvider: TriggerProvider = { list: async () => triggers };
+  const workflowRegistry = context.workflowRegistry ?? new GlobalWorkflowRegistry();
+  context.workflowRegistry = workflowRegistry;
+  const workflowRuns = new IndexedWorkflowRunStore(context.store, workflowRegistry, registryRepository);
   const relay = new TaskRelay({
     triggers: triggerProvider,
     workflows: { list: async () => workflows },
-    workflowRuns: context.store,
+    workflowRuns,
     sources: sources.values(),
     runStore: eventStore,
     workspaceProvider: workspace,
@@ -447,7 +568,7 @@ export function domainWorkflow(config: RelayConfigV2, id: string, workflow: Rela
           group: jobId,
           use,
           config: resolved,
-          needs: parseNeeds(job.needs),
+          needs: parseNeeds(job.needs, Object.keys(declaredJobs)),
           ...(job.if ? { if: job.if } : {}),
           ...(values ? { matrix: values } : {}),
           ...(job.timeoutMinutes ? { timeoutMs: job.timeoutMinutes * 60_000 } : {}),
@@ -508,17 +629,14 @@ function bindMatrix(value: unknown, values: Record<string, unknown>): unknown {
 }
 
 /** Accepts `implement`, `implement.Started`, and the explicit object form. */
-function parseNeeds(needs: RelayWorkflowJobV2["needs"]): WorkflowNeed[] {
+function parseNeeds(needs: RelayWorkflowJobV2["needs"], knownJobIds: Iterable<string>): WorkflowNeed[] {
   const list = needs === undefined ? [] : Array.isArray(needs) ? needs : [needs];
   return list.map((need) => {
     if (typeof need !== "string") return need.status ? { job: need.job, status: need.status } : { job: need.job };
-    const [job, suffix] = need.split(".", 2);
-    if (!suffix) return { job };
-    const status = suffix.toLowerCase();
-    if (status !== "started" && status !== "succeeded" && status !== "failed" && status !== "skipped") {
-      throw new Error(`Unknown job status '${suffix}' in needs '${need}'. Use Started, Succeeded, Failed, or Skipped.`);
-    }
-    return { job, status };
+    const resolved = resolveStringWorkflowNeed(need, knownJobIds);
+    if (resolved.ok) return resolved.need;
+    if (resolved.kind === "unknown-job") return { job: resolved.job };
+    throw new Error(`Unknown job status '${resolved.status}' in needs '${need}'. Use Started, Succeeded, Failed, or Skipped.`);
   });
 }
 
@@ -551,6 +669,7 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
  * `workers.launch` gets exactly the same errors as the built-in `launch`.
  */
 export function validateLaunchRequest(config: RelayConfigV2, request: Pick<LaunchWorkerActionRequest, "harness" | "mode">, subject: string): void {
+  if (request.harness === CODEX_APP_SERVER_HARNESS_ID || request.harness === TMUX_WINDOW_HARNESS_ID) return;
   if (!request.harness) throw new Error(`${subject} requires 'with.harness'.`);
   const harness = config.harnesses[request.harness];
   if (!harness) {
@@ -583,7 +702,7 @@ export function harnessProfiles(config: RelayConfigV2): CommandAgentProfile[] {
 /** Harness plugins bound to their validated configuration, in declaration order. */
 function pluginHarnesses(config: RelayConfigV2, plugins: RelayPluginRegistry): ConfiguredHarnessPlugin[] {
   return Object.entries(config.harnesses)
-    .filter(([, definition]) => !isCommandHarness(definition))
+    .filter(([id, definition]) => id !== CODEX_APP_SERVER_HARNESS_ID && id !== TMUX_WINDOW_HARNESS_ID && !isCommandHarness(definition))
     .map(([id, definition]) => {
       const plugin = plugins.harness(definition.use);
       if (!plugin) throw new Error(`Harness '${id}' uses unknown harness plugin '${definition.use}'.`);
@@ -620,9 +739,11 @@ export function agentProfiles(config: RelayConfigV2 | LegacyRelayConfig): Comman
  * names a plugin that is not installed. Harnesses stay unscoped, because any
  * action may launch any of them.
  */
-async function pluginRegistry(config: RelayConfigV2, projectRoot: string, selected?: string): Promise<RelayPluginRegistry> {
+async function pluginRegistry(config: RelayConfigV2, projectRoot: string, selected?: string, codexAppServer?: CodexAppServerHarness): Promise<RelayPluginRegistry> {
   const registry = new RelayPluginRegistry();
-  for (const plugin of builtInActionPlugins()) registry.register(plugin);
+  if (codexAppServer) registry.registerHarness(codexAppServer);
+  registry.registerHarness(new TmuxWindowHarness(new TmuxExecutionAdapter({ session: "task-relay" })));
+  for (const plugin of builtInActionPlugins({ codexAppServer })) registry.register(plugin);
   const externalUses = new Set<string>();
 
   const triggers = config.triggers.filter((trigger) => !selected || trigger.id === selected);

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
 import { CONFIG_FILE, renderRelayConfig } from "../config/load.js";
 import { eventLogPath } from "../logging/events.js";
@@ -10,6 +10,7 @@ import { normalizeRelayConfig } from "../config/v2.js";
 import { RepositoryDaemon } from "../daemon.js";
 import type { RelayCommandContext, RelayCommandHandlers } from "../cli/program.js";
 import { renderDashboardHtml } from "./ui.js";
+import { normalizeDashboardWorkflowConfig } from "./workflow-config-normalizer.js";
 
 export class DashboardServer {
   private readonly server: http.Server;
@@ -61,6 +62,11 @@ export class DashboardServer {
       if (method === "GET" && url.pathname === "/api/events") { this.apiEvents(req, res); return; }
       const cleanupMatch = /^\/api\/runs\/(.+)\/cleanup$/.exec(url.pathname);
       if (cleanupMatch && method === "POST") { await this.apiCleanup(decodeURIComponent(cleanupMatch[1]), res); return; }
+      const workflowActionTest = /^\/api\/workflows\/([^/]+)\/actions\/([^/]+)\/test$/.exec(url.pathname);
+      if (workflowActionTest && method === "POST") {
+        await this.apiWorkflowActionTest(decodeURIComponent(workflowActionTest[1]!), decodeURIComponent(workflowActionTest[2]!), res);
+        return;
+      }
       const workflowTest = /^\/api\/workflows\/(.+)\/test$/.exec(url.pathname);
       if (workflowTest && method === "POST") { await this.apiWorkflowTest(decodeURIComponent(workflowTest[1]), res); return; }
       const workerControl = /^\/api\/workers\/(.+)\/(send|exec)$/.exec(url.pathname);
@@ -116,7 +122,10 @@ export class DashboardServer {
     const errors = validateYaml(yaml);
     if (errors) { this.json(res, { ok: false, errors }, 422); return; }
 
-    await writeFileAtomic(this.configPath, yaml);
+    // Persist the compatibility repair as well as validating it, otherwise a
+    // subsequent load would reject the same legacy `needs: tmux` reference.
+    const raw = parse(yaml) as unknown;
+    await writeFileAtomic(this.configPath, stringify(normalizeDashboardWorkflowConfig(raw)));
     this.json(res, { ok: true });
   }
 
@@ -138,7 +147,7 @@ export class DashboardServer {
 
     let normalized;
     try {
-      normalized = normalizeRelayConfig(parsed.config);
+      normalized = normalizeRelayConfig(normalizeDashboardWorkflowConfig(parsed.config));
     } catch (error) {
       const errors = error instanceof ZodError
         ? error.issues.map((i) => `${i.path.join(".") || "config"}: ${i.message}`)
@@ -205,6 +214,16 @@ export class DashboardServer {
     try {
       await this.handlers.workflowTest({ ...this.context, write: (value: string) => lines.push(value) }, id);
       this.json(res, { ok: true, output: lines.join("\n") });
+    } catch (error) {
+      this.json(res, { ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  }
+
+  private async apiWorkflowActionTest(workflowId: string, actionId: string, res: http.ServerResponse): Promise<void> {
+    if (!this.handlers.workflowActionTest) { this.json(res, { error: "Workflow action test not available" }, 501); return; }
+    try {
+      const result = await this.handlers.workflowActionTest(this.context, workflowId, actionId);
+      this.json(res, { ok: true, dryRun: true, result });
     } catch (error) {
       this.json(res, { ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
     }
@@ -324,7 +343,7 @@ export class DashboardServer {
 function validateYaml(yaml: string): string[] | null {
   try {
     const raw = parse(yaml) as unknown;
-    normalizeRelayConfig(raw);
+    normalizeRelayConfig(normalizeDashboardWorkflowConfig(raw));
     return null;
   } catch (error) {
     return error instanceof ZodError

@@ -18,6 +18,7 @@ export type {
   HarnessPlugin,
   LaunchWorkerActionRequest,
   MaybePromise,
+  PluginPresentation,
   PluginUse,
   RelayPlugin,
   ResolvedWorker,

@@ -12,6 +12,7 @@ import type {
 } from "../domain/index.js";
 import type { HarnessPlugin } from "../plugins/contracts.js";
 import { renderTemplate, templateValues } from "./templates.js";
+import { workerGenerationId } from "../state/global-worker-registry.js";
 
 /** A harness plugin bound to the configuration for one `harnesses:` entry. */
 export interface ConfiguredHarnessPlugin {
@@ -70,7 +71,9 @@ export class CompositeAgentLauncher implements AgentLauncher {
       requestedModel: model,
       agentId: harness.id,
       model,
-      metadata: { harnessPlugin: harness.plugin.use },
+      // Action-specific metadata carries plugin input such as the tmux binding
+      // for a Codex App Server. Preserve it while adding the routing marker.
+      metadata: { ...profile?.metadata, harnessPlugin: harness.plugin.use },
     };
   }
 
@@ -88,12 +91,14 @@ export class CompositeAgentLauncher implements AgentLauncher {
       }),
     );
     const worker = await harness.plugin.launch({
-      workerId: `${spec.item.id}:${harness.id}`,
+      workerId: workerGenerationId(spec.run),
       repository: spec.run.identity.repository,
       item: spec.item,
       workspace: spec.workspace,
       prompt,
       model: spec.agent.model,
+      reasoningEffort: typeof spec.agent.metadata?.reasoningEffort === "string" ? spec.agent.metadata.reasoningEffort : undefined,
+      harnessInput: record(spec.agent.metadata?.harnessInput),
       config: harness.config,
       signal: spec.signal,
     });
@@ -139,4 +144,8 @@ export class CompositeAgentLauncher implements AgentLauncher {
     const recorded = typeof worker.metadata?.harness === "string" ? worker.metadata.harness : undefined;
     return this.harnesses.get(recorded ?? run?.agent.agentId ?? "");
   }
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }

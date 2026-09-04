@@ -182,6 +182,80 @@ describe("workflow configuration", () => {
     });
     expect(config.workflows.feature.jobs!.dev.needs).toBe("implement.Started");
   });
+
+  it("resolves a status suffix after a dotted job id and validates it", () => {
+    const config = normalizeRelayConfig({
+      ...base,
+      workflows: {
+        feature: {
+          on: { source: "queue" },
+          jobs: {
+            "tmux.create-window-1": { use: "command", with: { command: "/bin/echo" } },
+            cleanup: { use: "command", with: { command: "/bin/echo" }, needs: "tmux.create-window-1.succeeded" },
+          },
+        },
+      },
+    });
+    const compiled = domainWorkflow(config, "feature", config.workflows.feature, { id: "repo", root: "/repo" });
+    expect(compiled.jobs.find((job) => job.id === "cleanup")!.needs).toEqual([{ job: "tmux.create-window-1", status: "succeeded" }]);
+
+    expect(() => normalizeRelayConfig({
+      ...base,
+      workflows: {
+        feature: {
+          on: { source: "queue" },
+          jobs: {
+            "tmux.create-window-1": { use: "command", with: { command: "/bin/echo" } },
+            cleanup: { use: "command", with: { command: "/bin/echo" }, needs: "tmux.create-window-1.finished" },
+          },
+        },
+      },
+    })).toThrow(/Unknown job status 'finished'/);
+
+    expect(() => normalizeRelayConfig({
+      ...base,
+      workflows: {
+        feature: {
+          on: { source: "queue" },
+          jobs: {
+            "tmux.create-window-1": { use: "command", with: { command: "/bin/echo" } },
+            cleanup: { use: "command", with: { command: "/bin/echo" }, needs: "missing.started" },
+          },
+        },
+      },
+    })).toThrow(/unknown job 'missing'/);
+
+    expect(() => normalizeRelayConfig({
+      ...base,
+      workflows: {
+        feature: {
+          on: { source: "queue" },
+          jobs: {
+            "tmux.create-window-1": { use: "command", with: { command: "/bin/echo" }, needs: "cleanup" },
+            cleanup: { use: "command", with: { command: "/bin/echo" }, needs: "tmux.create-window-1.succeeded" },
+          },
+        },
+      },
+    })).toThrow(/cycle/);
+  });
+
+  it("prefers an exact dotted job id over a matching status suffix", () => {
+    const config = normalizeRelayConfig({
+      ...base,
+      workflows: {
+        feature: {
+          on: { source: "queue" },
+          jobs: {
+            "tmux.create-window-1": { use: "command", with: { command: "/bin/echo" } },
+            "tmux.create-window-1.succeeded": { use: "command", with: { command: "/bin/echo" } },
+            cleanup: { use: "command", with: { command: "/bin/echo" }, needs: "tmux.create-window-1.succeeded" },
+          },
+        },
+      },
+    });
+    const compiled = domainWorkflow(config, "feature", config.workflows.feature, { id: "repo", root: "/repo" });
+    expect(compiled.jobs.find((job) => job.id === "cleanup")!.needs).toEqual([{ job: "tmux.create-window-1.succeeded" }]);
+  });
 });
 
 describe("matrix jobs", () => {

@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { RepositoryScope, RunRecord, RunStatus } from "../domain/types.js";
+import type {
+  RepositoryScope,
+  RunRecord,
+  RunStatus,
+  WorkflowJobState,
+  WorkflowRunRecord,
+} from "../domain/types.js";
 
 type SqliteRunResult = { lastInsertRowid: number | bigint };
 type SqliteStatement = {
@@ -30,7 +36,7 @@ const RuntimeDatabase = (sqliteModule.DatabaseSync ?? sqliteModule.Database) as 
  * RepositoryStateStore is the dispatch ledger for one checkout; this database
  * is the durable index that lets a user find a worker from another checkout.
  */
-export const GLOBAL_WORKER_REGISTRY_VERSION = 2;
+export const GLOBAL_WORKER_REGISTRY_VERSION = 4;
 
 export type WorkerLifecycleStatus = RunStatus
   | "stopping"
@@ -82,6 +88,98 @@ export interface GlobalWorkerEvent {
   type: string;
   occurredAt: string;
   data?: Record<string, unknown>;
+}
+
+/** One local checkout known to the global control plane. */
+export interface GlobalProjectFolder {
+  id: string;
+  repository: RepositoryScope;
+  displayName?: string;
+  enabled: boolean;
+  configHash?: string;
+  configStatus?: string;
+  lastSyncedAt?: string;
+  removedAt?: string;
+  firstSeenAt: string;
+  updatedAt: string;
+}
+
+export interface RegisterProjectFolderOptions {
+  displayName?: string;
+  enabled?: boolean;
+  configHash?: string;
+  configStatus?: string;
+  lastSyncedAt?: string;
+  /** Explicit registration restores a folder that was previously removed. */
+  restore?: boolean;
+  at?: string;
+}
+
+export interface UpdateProjectFolderOptions {
+  displayName?: string | null;
+  enabled?: boolean;
+  configHash?: string | null;
+  configStatus?: string | null;
+  lastSyncedAt?: string | null;
+  at?: string;
+}
+
+export interface WorkflowRunSyncOptions {
+  /** Canonical local checkout to index, even for records written before repository identity migration. */
+  repository?: RepositoryScope;
+  /** When the global index observed this snapshot. */
+  at?: string;
+}
+
+/** A denormalised workflow run suitable for global dashboard queries. */
+export interface GlobalWorkflowRunRecord {
+  id: string;
+  projectFolderId: string;
+  identity: WorkflowRunRecord["identity"];
+  status: WorkflowRunRecord["status"];
+  concurrencyGroup?: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  timeoutAt?: string;
+  snapshot: WorkflowRunRecord;
+}
+
+export interface GlobalWorkflowJobRun {
+  workflowRunId: string;
+  jobId: string;
+  status: WorkflowJobState["status"];
+  runId?: string;
+  workerId?: string;
+  attempts: number;
+  startedAt?: string;
+  completedAt?: string;
+  outputs?: Record<string, unknown>;
+  message?: string;
+  error?: string;
+}
+
+export interface GlobalWorkflowEvent {
+  id: number;
+  workflowRunId: string;
+  jobId?: string;
+  type: string;
+  occurredAt: string;
+  data?: Record<string, unknown>;
+}
+
+export interface WorkflowRunListFilter {
+  projectFolderId?: string;
+  repository?: Pick<RepositoryScope, "id"> | string;
+  repositoryId?: string;
+  workflowId?: string;
+  sourceId?: string;
+  itemId?: string;
+  statuses?: readonly WorkflowRunRecord["status"][];
+  from?: string;
+  to?: string;
+  /** Removed folders retain history, but are hidden from normal dashboard lists. */
+  includeRemoved?: boolean;
 }
 
 export interface UpsertRunOptions {
@@ -342,7 +440,7 @@ export class GlobalWorkerRegistry {
   }
 
   private migrate(): void {
-    const current = Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    let current = Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
     if (current > GLOBAL_WORKER_REGISTRY_VERSION) throw new Error(`Registry schema ${current} is newer than supported schema ${GLOBAL_WORKER_REGISTRY_VERSION}.`);
     if (current === 0) {
       this.transaction(() => {
@@ -395,17 +493,316 @@ export class GlobalWorkerRegistry {
           CREATE INDEX workers_run_id_lookup ON workers(run_id, updated_at DESC);
           CREATE INDEX worker_events_worker_lookup ON worker_events(worker_id, id);
         `);
-        this.db.exec(`PRAGMA user_version = ${GLOBAL_WORKER_REGISTRY_VERSION}`);
+        this.db.exec("PRAGMA user_version = 2");
       });
-      return;
+      current = 2;
     }
     if (current === 1) {
       this.transaction(() => {
-        this.db.exec("ALTER TABLE workers ADD COLUMN repository_root TEXT");
+        if (!tableHasColumn(this.db, "workers", "repository_root")) this.db.exec("ALTER TABLE workers ADD COLUMN repository_root TEXT");
         this.db.exec("UPDATE workers SET repository_root = (SELECT current_root FROM repositories WHERE repositories.id = workers.repository_id)");
+        this.db.exec("PRAGMA user_version = 2");
+      });
+      current = 2;
+    }
+    if (current === 2) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS project_folders (
+            id TEXT PRIMARY KEY,
+            repository_id TEXT NOT NULL REFERENCES repositories(id),
+            root TEXT NOT NULL,
+            display_name TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            config_hash TEXT,
+            config_status TEXT,
+            first_seen_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(repository_id, root)
+          );
+          CREATE TABLE IF NOT EXISTS workflow_runs (
+            id TEXT PRIMARY KEY,
+            project_folder_id TEXT NOT NULL REFERENCES project_folders(id) ON DELETE CASCADE,
+            workflow_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            occurrence TEXT NOT NULL,
+            status TEXT NOT NULL,
+            concurrency_group TEXT,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            timeout_at TEXT,
+            snapshot_json TEXT NOT NULL,
+            UNIQUE(project_folder_id, workflow_id, source_id, item_id, occurrence)
+          );
+          CREATE TABLE IF NOT EXISTS workflow_job_runs (
+            workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            run_id TEXT,
+            worker_id TEXT,
+            attempts INTEGER NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            outputs_json TEXT,
+            message TEXT,
+            error TEXT,
+            PRIMARY KEY(workflow_run_id, job_id)
+          );
+          CREATE TABLE IF NOT EXISTS workflow_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+            job_id TEXT,
+            type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            data_json TEXT
+          );
+          CREATE INDEX IF NOT EXISTS project_folders_repository_lookup ON project_folders(repository_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS workflow_runs_folder_lookup ON workflow_runs(project_folder_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS workflow_runs_global_lookup ON workflow_runs(status, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS workflow_runs_identity_lookup ON workflow_runs(workflow_id, source_id, item_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS workflow_job_runs_worker_lookup ON workflow_job_runs(worker_id, workflow_run_id);
+          CREATE INDEX IF NOT EXISTS workflow_events_run_lookup ON workflow_events(workflow_run_id, id);
+        `);
+        this.db.exec("PRAGMA user_version = 3");
+      });
+      current = 3;
+    }
+    if (current === 3) {
+      this.transaction(() => {
+        if (!tableHasColumn(this.db, "project_folders", "last_synced_at")) this.db.exec("ALTER TABLE project_folders ADD COLUMN last_synced_at TEXT");
+        if (!tableHasColumn(this.db, "project_folders", "removed_at")) this.db.exec("ALTER TABLE project_folders ADD COLUMN removed_at TEXT");
         this.db.exec(`PRAGMA user_version = ${GLOBAL_WORKER_REGISTRY_VERSION}`);
       });
     }
+  }
+}
+
+/**
+ * SQLite index of repository-owned workflow executions.  This intentionally
+ * does not implement WorkflowRunStore: state.json remains the dispatch ledger
+ * while this registry is an independently rebuildable global read model.
+ */
+export class GlobalWorkflowRegistry {
+  readonly file: string;
+  private readonly db: SqliteDatabase;
+
+  constructor(options: { file?: string; stateHome?: string } = {}) {
+    // Keep schema ownership in one place. This also makes a workflow-only
+    // dashboard bootstrap a registry created by an older Relay release.
+    const bootstrap = new GlobalWorkerRegistry(options);
+    this.file = bootstrap.file;
+    bootstrap.close();
+    this.db = new RuntimeDatabase(this.file);
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA busy_timeout = 5000");
+  }
+
+  close(): void { this.db.close(); }
+
+  registerProjectFolder(repository: RepositoryScope, options: RegisterProjectFolderOptions = {}): GlobalProjectFolder {
+    const at = options.at ?? new Date().toISOString();
+    return this.transaction(() => this.upsertProjectFolder(repository, { ...options, restore: true }, at));
+  }
+
+  /** Updates dashboard-managed metadata without touching repository-owned files. */
+  updateProjectFolder(id: string, patch: UpdateProjectFolderOptions): GlobalProjectFolder | undefined {
+    const at = patch.at ?? new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.getProjectFolder(id);
+      if (!existing) return undefined;
+      const displayName = patch.displayName === undefined ? existing.displayName ?? null : patch.displayName;
+      const enabled = patch.enabled ?? existing.enabled;
+      const configHash = patch.configHash === undefined ? existing.configHash ?? null : patch.configHash;
+      const configStatus = patch.configStatus === undefined ? existing.configStatus ?? null : patch.configStatus;
+      const lastSyncedAt = patch.lastSyncedAt === undefined ? existing.lastSyncedAt ?? null : patch.lastSyncedAt;
+      this.db.prepare(`
+        UPDATE project_folders
+        SET display_name = ?, enabled = ?, config_hash = ?, config_status = ?, last_synced_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(displayName, enabled ? 1 : 0, configHash, configStatus, lastSyncedAt, at, id);
+      return this.getProjectFolder(id);
+    });
+  }
+
+  /** Unregisters a folder from normal discovery while retaining its execution history. */
+  removeProjectFolder(id: string, at = new Date().toISOString()): GlobalProjectFolder | undefined {
+    return this.transaction(() => {
+      const existing = this.getProjectFolder(id);
+      if (!existing) return undefined;
+      this.db.prepare("UPDATE project_folders SET removed_at = ?, updated_at = ? WHERE id = ?").run(at, at, id);
+      return this.getProjectFolder(id);
+    });
+  }
+
+  getProjectFolder(id: string): GlobalProjectFolder | undefined {
+    const row = this.db.prepare("SELECT * FROM project_folders WHERE id = ?").get(id) as ProjectFolderRow | undefined;
+    return row ? projectFolderFromRow(row) : undefined;
+  }
+
+  findProjectFolder(repository: RepositoryScope): GlobalProjectFolder | undefined {
+    const row = this.db.prepare("SELECT * FROM project_folders WHERE repository_id = ? AND root = ?").get(repository.id, repository.root) as ProjectFolderRow | undefined;
+    return row ? projectFolderFromRow(row) : undefined;
+  }
+
+  listProjectFolders(options: { includeRemoved?: boolean } = {}): GlobalProjectFolder[] {
+    const sql = `SELECT * FROM project_folders${options.includeRemoved ? "" : " WHERE removed_at IS NULL"} ORDER BY updated_at DESC, root ASC`;
+    return (this.db.prepare(sql).all() as ProjectFolderRow[]).map(projectFolderFromRow);
+  }
+
+  /** Upserts one snapshot; an older state.json snapshot cannot regress the index. */
+  syncRun(run: WorkflowRunRecord, options: WorkflowRunSyncOptions = {}): GlobalWorkflowRunRecord {
+    return this.transaction(() => {
+      const repository = options.repository ?? run.identity.repository;
+      const observedAt = options.at ?? new Date().toISOString();
+      const folder = this.upsertProjectFolder(repository, { lastSyncedAt: observedAt }, observedAt);
+      const existing = this.get(run.id);
+      // State.json is authoritative, but an older import must never regress a
+      // more recent indexed transition. A canonical repository override is
+      // still allowed to repair which checkout owns that immutable snapshot.
+      if (existing && existing.updatedAt >= run.updatedAt) {
+        if (existing.projectFolderId !== folder.id) {
+          const snapshot = { ...existing.snapshot, identity: { ...existing.snapshot.identity, repository } };
+          this.db.prepare("UPDATE workflow_runs SET project_folder_id = ?, snapshot_json = ? WHERE id = ?")
+            .run(folder.id, JSON.stringify(snapshot), run.id);
+          return this.require(run.id);
+        }
+        return existing;
+      }
+      this.db.prepare(`
+        INSERT INTO workflow_runs (
+          id, project_folder_id, workflow_id, source_id, item_id, occurrence, status,
+          concurrency_group, started_at, updated_at, completed_at, timeout_at, snapshot_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          project_folder_id = excluded.project_folder_id,
+          workflow_id = excluded.workflow_id,
+          source_id = excluded.source_id,
+          item_id = excluded.item_id,
+          occurrence = excluded.occurrence,
+          status = excluded.status,
+          concurrency_group = excluded.concurrency_group,
+          started_at = excluded.started_at,
+          updated_at = excluded.updated_at,
+          completed_at = excluded.completed_at,
+          timeout_at = excluded.timeout_at,
+          snapshot_json = excluded.snapshot_json
+      `).run(
+        run.id, folder.id, run.identity.workflowId, run.identity.sourceId, run.identity.itemId,
+        run.identity.occurrence, run.status, run.concurrencyGroup ?? null, run.startedAt,
+        run.updatedAt, run.completedAt ?? null, run.timeoutAt ?? null, JSON.stringify({ ...run, identity: { ...run.identity, repository } }),
+      );
+      this.db.prepare("DELETE FROM workflow_job_runs WHERE workflow_run_id = ?").run(run.id);
+      const insertJob = this.db.prepare(`
+        INSERT INTO workflow_job_runs (
+          workflow_run_id, job_id, status, run_id, worker_id, attempts, started_at, completed_at,
+          outputs_json, message, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const [jobId, job] of Object.entries(run.jobs)) {
+        insertJob.run(
+          run.id, jobId, job.status, job.runId ?? null, job.workerId ?? null, job.attempts,
+          job.startedAt ?? null, job.completedAt ?? null,
+          job.outputs === undefined ? null : JSON.stringify(job.outputs), job.message ?? null, job.error ?? null,
+        );
+      }
+      return this.require(run.id);
+    });
+  }
+
+  /** Alias for callers importing all workflow records from state.json. */
+  importRuns(runs: readonly WorkflowRunRecord[], options: WorkflowRunSyncOptions = {}): GlobalWorkflowRunRecord[] {
+    return runs.map((run) => this.syncRun(run, options));
+  }
+
+  get(id: string): GlobalWorkflowRunRecord | undefined {
+    const row = this.db.prepare(`${workflowRunSelect()} WHERE workflow_runs.id = ?`).get(id) as WorkflowRunRow | undefined;
+    return row ? workflowRunFromRow(row) : undefined;
+  }
+
+  list(filter: WorkflowRunListFilter = {}): GlobalWorkflowRunRecord[] {
+    const clauses: string[] = [];
+    const values: Array<string | null> = [];
+    if (!filter.includeRemoved) clauses.push("project_folders.removed_at IS NULL");
+    if (filter.projectFolderId) { clauses.push("workflow_runs.project_folder_id = ?"); values.push(filter.projectFolderId); }
+    const repositoryId = filter.repositoryId ?? (typeof filter.repository === "string" ? filter.repository : filter.repository?.id);
+    if (repositoryId) { clauses.push("project_folders.repository_id = ?"); values.push(repositoryId); }
+    if (filter.workflowId) { clauses.push("workflow_runs.workflow_id = ?"); values.push(filter.workflowId); }
+    if (filter.sourceId) { clauses.push("workflow_runs.source_id = ?"); values.push(filter.sourceId); }
+    if (filter.itemId) { clauses.push("workflow_runs.item_id = ?"); values.push(filter.itemId); }
+    if (filter.from) { clauses.push("workflow_runs.updated_at >= ?"); values.push(filter.from); }
+    if (filter.to) { clauses.push("workflow_runs.updated_at <= ?"); values.push(filter.to); }
+    if (filter.statuses?.length) {
+      clauses.push(`workflow_runs.status IN (${filter.statuses.map(() => "?").join(", ")})`);
+      values.push(...filter.statuses);
+    }
+    const sql = `${workflowRunSelect()}${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY workflow_runs.updated_at DESC, workflow_runs.id DESC`;
+    return (this.db.prepare(sql).all(...values) as WorkflowRunRow[]).map(workflowRunFromRow);
+  }
+
+  listJobs(workflowRunId: string): GlobalWorkflowJobRun[] {
+    const rows = this.db.prepare("SELECT * FROM workflow_job_runs WHERE workflow_run_id = ? ORDER BY job_id ASC").all(workflowRunId) as WorkflowJobRunRow[];
+    return rows.map(workflowJobRunFromRow);
+  }
+
+  appendEvent(workflowRunId: string, type: string, occurredAt = new Date().toISOString(), data?: Record<string, unknown>, jobId?: string): GlobalWorkflowEvent {
+    return this.transaction(() => {
+      this.require(workflowRunId);
+      const result = this.db.prepare(`
+        INSERT INTO workflow_events (workflow_run_id, job_id, type, occurred_at, data_json)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(workflowRunId, jobId ?? null, type, occurredAt, data === undefined ? null : JSON.stringify(data));
+      return { id: Number(result.lastInsertRowid), workflowRunId, ...(jobId ? { jobId } : {}), type, occurredAt, ...(data === undefined ? {} : { data }) };
+    });
+  }
+
+  listEvents(workflowRunId: string): GlobalWorkflowEvent[] {
+    const rows = this.db.prepare("SELECT * FROM workflow_events WHERE workflow_run_id = ? ORDER BY id ASC").all(workflowRunId) as WorkflowEventRow[];
+    return rows.map((row) => ({
+      id: Number(row.id), workflowRunId: row.workflow_run_id, ...(row.job_id ? { jobId: row.job_id } : {}),
+      type: row.type, occurredAt: row.occurred_at,
+      ...(row.data_json ? { data: parseJson<Record<string, unknown>>(row.data_json, {}) } : {}),
+    }));
+  }
+
+  private require(id: string): GlobalWorkflowRunRecord {
+    const record = this.get(id);
+    if (!record) throw new Error(`Registry workflow run '${id}' disappeared during its transaction.`);
+    return record;
+  }
+
+  private upsertProjectFolder(repository: RepositoryScope, options: RegisterProjectFolderOptions, at: string): GlobalProjectFolder {
+    const id = projectFolderId(repository);
+    const existing = this.getProjectFolder(id);
+    const displayName = options.displayName ?? existing?.displayName ?? null;
+    const enabled = options.enabled ?? existing?.enabled ?? true;
+    const configHash = options.configHash ?? existing?.configHash ?? null;
+    const configStatus = options.configStatus ?? existing?.configStatus ?? null;
+    const lastSyncedAt = options.lastSyncedAt ?? existing?.lastSyncedAt ?? null;
+    this.db.prepare(`
+      INSERT INTO repositories (id, current_root, first_seen_at, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET current_root = excluded.current_root, updated_at = excluded.updated_at
+    `).run(repository.id, repository.root, at, at);
+    this.db.prepare(`
+      INSERT INTO project_folders (
+        id, repository_id, root, display_name, enabled, config_hash, config_status, last_synced_at, removed_at, first_seen_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        repository_id = excluded.repository_id, root = excluded.root, display_name = excluded.display_name,
+        enabled = excluded.enabled, config_hash = excluded.config_hash, config_status = excluded.config_status,
+        last_synced_at = excluded.last_synced_at,
+        removed_at = CASE WHEN ? THEN NULL ELSE project_folders.removed_at END,
+        updated_at = excluded.updated_at
+    `).run(id, repository.id, repository.root, displayName, enabled ? 1 : 0, configHash, configStatus, lastSyncedAt, existing?.firstSeenAt ?? at, at, options.restore ? 1 : 0);
+    return this.getProjectFolder(id)!;
+  }
+
+  private transaction<T>(operation: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try { const result = operation(); this.db.exec("COMMIT"); return result; }
+    catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 }
 
@@ -416,6 +813,21 @@ type WorkerRow = {
   completed_at: string | null; cleaned_at: string | null; repository_root: string | null;
 };
 type EventRow = { id: number | bigint; worker_id: string; type: string; occurred_at: string; data_json: string | null };
+type ProjectFolderRow = {
+  id: string; repository_id: string; root: string; display_name: string | null; enabled: number;
+  config_hash: string | null; config_status: string | null; last_synced_at: string | null; removed_at: string | null;
+  first_seen_at: string; updated_at: string;
+};
+type WorkflowRunRow = {
+  id: string; project_folder_id: string; workflow_id: string; source_id: string; item_id: string; occurrence: string;
+  status: WorkflowRunRecord["status"]; concurrency_group: string | null; started_at: string; updated_at: string;
+  completed_at: string | null; timeout_at: string | null; snapshot_json: string;
+};
+type WorkflowJobRunRow = {
+  workflow_run_id: string; job_id: string; status: WorkflowJobState["status"]; run_id: string | null; worker_id: string | null;
+  attempts: number; started_at: string | null; completed_at: string | null; outputs_json: string | null; message: string | null; error: string | null;
+};
+type WorkflowEventRow = { id: number | bigint; workflow_run_id: string; job_id: string | null; type: string; occurred_at: string; data_json: string | null };
 
 function recordFromRow(row: WorkerRow): GlobalWorkerRecord {
   const snapshot = parseJson<RunRecord>(row.snapshot_json, undefined as never);
@@ -432,6 +844,39 @@ function recordFromRow(row: WorkerRow): GlobalWorkerRecord {
     createdAt: row.created_at, updatedAt: row.updated_at,
     ...(row.completed_at ? { completedAt: row.completed_at } : {}),
     ...(row.cleaned_at ? { cleanedAt: row.cleaned_at } : {}),
+  };
+}
+
+function projectFolderFromRow(row: ProjectFolderRow): GlobalProjectFolder {
+  return {
+    id: row.id, repository: { id: row.repository_id, root: row.root }, enabled: row.enabled !== 0,
+    ...(row.display_name ? { displayName: row.display_name } : {}),
+    ...(row.config_hash ? { configHash: row.config_hash } : {}),
+    ...(row.config_status ? { configStatus: row.config_status } : {}),
+    ...(row.last_synced_at ? { lastSyncedAt: row.last_synced_at } : {}),
+    ...(row.removed_at ? { removedAt: row.removed_at } : {}),
+    firstSeenAt: row.first_seen_at, updatedAt: row.updated_at,
+  };
+}
+
+function workflowRunFromRow(row: WorkflowRunRow): GlobalWorkflowRunRecord {
+  const snapshot = parseJson<WorkflowRunRecord>(row.snapshot_json, undefined as never);
+  return {
+    id: row.id, projectFolderId: row.project_folder_id, identity: snapshot.identity,
+    status: row.status, ...(row.concurrency_group ? { concurrencyGroup: row.concurrency_group } : {}),
+    startedAt: row.started_at, updatedAt: row.updated_at,
+    ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    ...(row.timeout_at ? { timeoutAt: row.timeout_at } : {}), snapshot,
+  };
+}
+
+function workflowJobRunFromRow(row: WorkflowJobRunRow): GlobalWorkflowJobRun {
+  return {
+    workflowRunId: row.workflow_run_id, jobId: row.job_id, status: row.status, attempts: row.attempts,
+    ...(row.run_id ? { runId: row.run_id } : {}), ...(row.worker_id ? { workerId: row.worker_id } : {}),
+    ...(row.started_at ? { startedAt: row.started_at } : {}), ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    ...(row.outputs_json ? { outputs: parseJson<Record<string, unknown>>(row.outputs_json, {}) } : {}),
+    ...(row.message ? { message: row.message } : {}), ...(row.error ? { error: row.error } : {}),
   };
 }
 
@@ -477,6 +922,10 @@ function runtimeFromRun(run: RunRecord): WorkerRuntimeHandle {
 
 function defaultStateHome(): string { return process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"); }
 function workerSelect(): string { return "SELECT workers.* FROM workers"; }
+function workflowRunSelect(): string { return "SELECT workflow_runs.* FROM workflow_runs INNER JOIN project_folders ON project_folders.id = workflow_runs.project_folder_id"; }
+function projectFolderId(repository: RepositoryScope): string {
+  return `fld_${createHash("sha256").update(`${repository.id}\u0000${repository.root}`).digest("hex").slice(0, 24)}`;
+}
 function repositoryIdFrom(filter: Pick<WorkerListFilter, "repository" | "repositoryId">): string | undefined {
   return filter.repositoryId ?? (typeof filter.repository === "string" ? filter.repository : filter.repository?.id);
 }
@@ -484,3 +933,6 @@ function stringValue(value: unknown): string | undefined { return typeof value =
 function numberValue(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
 function objectValue(value: unknown): Record<string, unknown> | undefined { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 function parseJson<T>(value: string, fallback: T): T { try { return JSON.parse(value) as T; } catch { return fallback; } }
+function tableHasColumn(db: SqliteDatabase, table: string, column: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((entry) => entry.name === column);
+}
