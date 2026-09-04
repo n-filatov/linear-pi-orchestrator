@@ -14,6 +14,7 @@ import { ProjectManager, ProjectNotFoundError } from "./project-manager.js";
 import { GlobalRuntimeSupervisor } from "./runtime-supervisor.js";
 import { closeCodexAppServers } from "../app.js";
 import { WorkflowAlreadyExistsError, WorkflowConfigRepository, WorkflowNotFoundError, WorkflowRevisionConflictError } from "./workflow-config-repository.js";
+import { listPromptFiles, PROMPTS_DIRECTORY } from "../prompts/library.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 class RequestBodyTooLargeError extends Error {}
@@ -134,7 +135,7 @@ export class GlobalDashboardServer {
     }
     if (projectAction) return this.methodNotAllowed(response);
 
-    const projectCollection = /^\/api\/projects\/([^/]+)\/(workflows|executions|workers|catalog|plugins)$/.exec(url.pathname);
+    const projectCollection = /^\/api\/projects\/([^/]+)\/(workflows|executions|workers|catalog|plugins|prompts)$/.exec(url.pathname);
     if (projectCollection) {
       const projectId = decodeURIComponent(projectCollection[1]!);
       const resource = projectCollection[2];
@@ -144,6 +145,10 @@ export class GlobalDashboardServer {
       if (resource === "workers" && method === "GET") {
         const folder = await this.requireProject(projectId);
         return this.json(response, { workers: this.projects.workers.list({ repository: folder.repository, includeCleaned: true }) });
+      }
+      if (resource === "prompts" && method === "GET") {
+        const folder = await this.requireProject(projectId);
+        return this.json(response, { directory: PROMPTS_DIRECTORY, prompts: await listPromptFiles(folder.root) });
       }
       if ((resource === "catalog" || resource === "plugins") && method === "GET") {
         const context = await this.projects.context(projectId);

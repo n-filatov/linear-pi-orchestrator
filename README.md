@@ -385,6 +385,28 @@ Two template languages, split by **when** they are evaluated:
 - `${{ }}` is evaluated by the scheduler, before a job starts — `if`, `needs`, `outputs`.
 - `{{ }}` is Handlebars, evaluated by the launcher when a prompt is rendered.
 
+### Saved prompt library
+
+Put reusable Markdown or text prompts in `.task-relay/prompts/` (subfolders are
+fine). The dashboard lists these files in the **Saved prompt** dropdown for
+`launch`, `codex.start-session`, and `codex.send-prompt`; selecting one writes
+its repository-relative path as `promptFile` in the workflow YAML.
+
+```yaml
+jobs:
+  start:
+    use: codex.start-session
+    with:
+      promptFile: .task-relay/prompts/implementation.md
+```
+
+Prompt files are rendered separately for the ticket that started the workflow.
+For a Linear ticket use `{{item.id}}`, `{{item.title}}`,
+`{{item.description}}`, and any source-provided `{{item.metadata.*}}` field.
+Later actions can also read earlier action results, for example
+`{{actions.plan.output.summary}}`. A prompt uses either `promptFile` or inline
+`prompt`, never both.
+
 ### Telling Relay a job is done
 
 An interactive agent does not exit when it stops working, so `needs: implement`

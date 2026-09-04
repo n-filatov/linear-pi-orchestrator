@@ -16,6 +16,7 @@ export interface CodexModelSummary {
   defaultReasoningEffort?: string;
   supportedReasoningEfforts?: Array<{ reasoningEffort: string }>;
 }
+export interface PromptLibrary { directory: string; prompts: string[]; }
 
 /** Add the live App Server catalog to both supported dashboard catalog shapes. */
 export function applyCodexModelCatalog(catalog: Json, models: CodexModelSummary[]): Json {
@@ -114,6 +115,10 @@ export async function getCatalog(project?: ProjectFolder): Promise<Json> {
     return catalog;
   }
   catch { try { return await request<Json>("/api/plugins/schemas"); } catch { return { schemas: {} }; } }
+}
+export async function getPrompts(project?: ProjectFolder): Promise<PromptLibrary> {
+  try { return await request<PromptLibrary>(project ? `/api/projects/${idFor(project)}/prompts` : "/api/prompts"); }
+  catch { return { directory: ".task-relay/prompts", prompts: [] }; }
 }
 export async function getConfig(project?: ProjectFolder): Promise<{ config: Json; path?: string }> {
   try { return await request(project ? `/api/projects/${idFor(project)}/config/json` : "/api/config/json"); }

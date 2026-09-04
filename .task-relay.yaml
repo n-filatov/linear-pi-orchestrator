@@ -89,9 +89,9 @@ workflows:
         with:
           model: gpt-5.6-luna
           effort: medium
-          prompt: Which model are you using now
           tmux:
             action: tmux.create-window-1
+          promptFile: .task-relay/prompts/implement.md
         needs:
           job: tmux.create-window-1
           status: started
@@ -102,8 +102,8 @@ workflows:
         with:
           codex:
             action: codex.start-session-2
-          prompt: What the model you are now?
           model: gpt-5.6-luna
+          prompt: What model are you now
         needs:
           job: codex.start-session-2
           status: started

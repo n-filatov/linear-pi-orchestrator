@@ -11,6 +11,7 @@ import { RepositoryDaemon } from "../daemon.js";
 import type { RelayCommandContext, RelayCommandHandlers } from "../cli/program.js";
 import { renderDashboardHtml } from "./ui.js";
 import { normalizeDashboardWorkflowConfig } from "./workflow-config-normalizer.js";
+import { listPromptFiles } from "../prompts/library.js";
 
 export class DashboardServer {
   private readonly server: http.Server;
@@ -57,6 +58,7 @@ export class DashboardServer {
       if (method === "GET" && url.pathname === "/api/config/mtime") { this.apiConfigMtime(res); return; }
       if (method === "GET" && url.pathname === "/api/config/schema") { await this.apiSchema(res); return; }
       if (method === "GET" && url.pathname === "/api/plugins/schemas") { await this.apiPluginSchemas(res); return; }
+      if (method === "GET" && url.pathname === "/api/prompts") { await this.apiPrompts(res); return; }
       if (method === "GET" && url.pathname === "/api/workflows") { await this.apiWorkflows(res); return; }
       if (method === "GET" && url.pathname === "/api/plugins") { await this.apiPlugins(res); return; }
       if (method === "GET" && url.pathname === "/api/events") { this.apiEvents(req, res); return; }
@@ -178,6 +180,10 @@ export class DashboardServer {
   private async apiPluginSchemas(res: http.ServerResponse): Promise<void> {
     const { pluginConfigSchemas } = await import("../config/json-schema.js");
     this.json(res, await pluginConfigSchemas(this.context.config, this.context.projectRoot));
+  }
+
+  private async apiPrompts(res: http.ServerResponse): Promise<void> {
+    this.json(res, { directory: ".task-relay/prompts", prompts: await listPromptFiles(this.context.projectRoot) });
   }
 
   /**

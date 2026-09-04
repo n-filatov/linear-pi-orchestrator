@@ -1,12 +1,12 @@
-import path from "node:path";
-import { readFile } from "node:fs/promises";
 import { execa } from "execa";
+import path from "node:path";
 import Handlebars from "handlebars";
 import { z } from "zod";
 import { isActiveRun } from "../domain/index.js";
 import type { ActionContext, ActionPlugin } from "../plugins/index.js";
 import { CODEX_APP_SERVER_HARNESS_ID, type CodexAppServerHarness } from "../codex/index.js";
 import { TMUX_WINDOW_HARNESS_ID } from "../runtime/index.js";
+import { readPromptFile } from "../prompts/library.js";
 
 const launchConfigSchema = z.object({
   harness: z.string().min(1),
@@ -80,7 +80,8 @@ const workerSendConfigSchema = z.object({
 const tmuxCreateWindowConfigSchema = z.object({}).strict().default({});
 
 const codexStartSessionConfigSchema = z.object({
-  prompt: z.string().min(1),
+  prompt: z.string().min(1).optional().describe("Inline prompt. Use promptFile for a saved prompt."),
+  promptFile: z.string().min(1).optional().describe("Saved prompt under .task-relay/prompts/ (alternative to inline prompt)."),
   /** Attach a visible Codex TUI to the tmux worker produced by this action. */
   tmux: z.object({
     action: z.string().min(1),
@@ -90,12 +91,13 @@ const codexStartSessionConfigSchema = z.object({
     branchTemplate: z.string().min(1).optional(),
     baseBranch: z.string().min(1).optional(),
   }).strict().optional(),
-}).strip();
+}).strip().refine((data) => Boolean(data.prompt) !== Boolean(data.promptFile), { message: "Specify exactly one of 'prompt' or 'promptFile'." });
 
 const codexSendPromptConfigSchema = z.object({
   /** This deliberately accepts only a producing action, never a loose worker selector. */
   codex: z.object({ action: z.string().min(1) }).strict(),
-  prompt: z.string().min(1),
+  prompt: z.string().min(1).optional().describe("Inline prompt. Use promptFile for a saved prompt."),
+  promptFile: z.string().min(1).optional().describe("Saved prompt under .task-relay/prompts/ (alternative to inline prompt)."),
   /** Model used for this new turn; the session retains its conversation context. */
   model: z.string().min(1).optional(),
   effort: z.string().min(1).optional(),
@@ -103,7 +105,7 @@ const codexSendPromptConfigSchema = z.object({
   /** Keep the workflow job running until Codex finishes the resulting turn. */
   waitForCompletion: z.boolean().default(true),
   timeoutMs: z.number().int().positive().max(86_400_000).default(300_000),
-}).strict();
+}).strict().refine((data) => Boolean(data.prompt) !== Boolean(data.promptFile), { message: "Specify exactly one of 'prompt' or 'promptFile'." });
 
 export type LaunchActionConfig = z.infer<typeof launchConfigSchema>;
 export type CleanupActionConfig = z.infer<typeof cleanupConfigSchema>;
@@ -129,6 +131,10 @@ function renderer(context: ActionContext): (value: string) => string {
   return (value: string) => Handlebars.compile(value, { noEscape: true })(values);
 }
 
+async function configuredPrompt(context: ActionContext, config: { prompt?: string; promptFile?: string }): Promise<string> {
+  return config.prompt ?? readPromptFile(context.repository.root, config.promptFile!);
+}
+
 export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerHarness } = {}): readonly ActionPlugin[] {
   const launch: ActionPlugin<LaunchActionConfig> = {
     kind: "action",
@@ -142,13 +148,10 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
       color: "#2563eb",
     },
     execute: async (context, config) => {
-      let prompt = config.prompt;
-      if (config.promptFile) {
-        const filePath = path.isAbsolute(config.promptFile)
-          ? config.promptFile
-          : path.resolve(context.repository.root, config.promptFile);
-        prompt = await readFile(filePath, "utf8");
-      }
+      // A generic launch may deliberately rely on its harness default prompt.
+      const prompt = config.promptFile
+        ? await readPromptFile(context.repository.root, config.promptFile)
+        : config.prompt;
       return context.workers.launch({
         harness: config.harness,
         mode: config.mode,
@@ -285,7 +288,7 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
       const tmux = config.tmux ? await resolveTmuxBinding(context, config.tmux.action) : undefined;
       const result = await context.workers.launch({
         harness: CODEX_APP_SERVER_HARNESS_ID,
-        prompt: render(config.prompt),
+        prompt: render(await configuredPrompt(context, config)),
         // The App Server is a background helper. When attached to tmux, it
         // must reuse that terminal worker's worktree and may coexist with it.
         workspace: tmux
@@ -354,7 +357,7 @@ export function builtInActionPlugins(options: { codexAppServer?: CodexAppServerH
       if (targets.length === 0) return { status: "skipped", message: `Action '${config.codex.action}' has no live worker.` };
       const prompts = await Promise.all(targets.map(async ({ worker }) => {
         const sent = await options.codexAppServer!.sendPrompt(worker, {
-          prompt: render(config.prompt),
+          prompt: render(await configuredPrompt(context, config)),
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
           delivery: config.delivery,
