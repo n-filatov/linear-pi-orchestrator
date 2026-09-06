@@ -64,7 +64,10 @@ export class GlobalDashboardServer {
         if (!this.authorized(request, url)) return this.json(response, { error: "Open the authenticated dashboard URL printed by Relay." }, 401);
         if (url.searchParams.get("token")) {
           response.setHeader("Set-Cookie", `relay_token=${this.token}; HttpOnly; SameSite=Strict; Path=/`);
-          response.setHeader("Location", url.pathname || "/");
+          const preserved = new URLSearchParams(url.searchParams);
+          preserved.delete("token");
+          const suffix = preserved.toString();
+          response.setHeader("Location", `${url.pathname || "/"}${suffix ? `?${suffix}` : ""}`);
           response.writeHead(302);
           response.end();
           return;
@@ -446,7 +449,12 @@ export class GlobalDashboardServer {
     const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
     const candidate = resolve(this.staticRoot, relative);
     if (!candidate.startsWith(`${this.staticRoot}/`) && candidate !== resolve(this.staticRoot, "index.html")) return this.json(response, { error: "Not found" }, 404);
-    const file = existsSync(candidate) ? candidate : resolve(this.staticRoot, "index.html");
+    const file = existsSync(candidate)
+      ? candidate
+      : pathLooksLikeAsset(relative)
+        ? undefined
+        : resolve(this.staticRoot, "index.html");
+    if (!file) return this.json(response, { error: "Not found" }, 404);
     if (!existsSync(file)) return this.json(response, { error: "Dashboard assets are missing. Run 'npm run build:dashboard'." }, 503);
     response.writeHead(200, { "Content-Type": mimeType(file), "Cache-Control": file.endsWith("index.html") ? "no-store" : "public, max-age=31536000, immutable", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" });
     response.end(await readFile(file));
@@ -570,4 +578,8 @@ function dashboardMcpTransport(value: Record<string, unknown>, projectRoot: stri
 }
 function mimeType(file: string): string {
   return ({ ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/json" } as Record<string, string>)[extname(file)] ?? "application/octet-stream";
+}
+
+function pathLooksLikeAsset(pathname: string): boolean {
+  return pathname.startsWith("assets/");
 }

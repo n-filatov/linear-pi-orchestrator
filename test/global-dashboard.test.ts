@@ -14,6 +14,29 @@ afterEach(() => {
 });
 
 describe("GlobalDashboardServer", () => {
+  it("keeps dotted client-route IDs on the SPA fallback while missing assets return 404", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-global-dashboard-static-state-"));
+    process.env.XDG_STATE_HOME = stateHome;
+    const projects = new ProjectManager({ stateHome });
+    const server = new GlobalDashboardServer(projects, {});
+    const authenticated = new URL(await server.start(0));
+    const token = authenticated.searchParams.get("token")!;
+    try {
+      const redirect = await fetch(new URL(`/projects/repo/workflows/release.1?token=${token}&tab=canvas`, authenticated), { redirect: "manual" });
+      expect(redirect.status).toBe(302);
+      expect(redirect.headers.get("location")).toBe("/projects/repo/workflows/release.1?tab=canvas");
+      const cookie = redirect.headers.get("set-cookie")!.split(";", 1)[0];
+
+      const deepLink = await fetch(new URL("/projects/repo/workflows/release.1", authenticated), { headers: { cookie } });
+      expect(deepLink.status).not.toBe(404);
+      const missingAsset = await fetch(new URL("/assets/not-found.js", authenticated), { headers: { cookie } });
+      expect(missingAsset.status).toBe(404);
+    } finally {
+      await server.stop();
+      projects.close();
+    }
+  });
+
   it("tests an unsaved workflow draft without changing the repository YAML", async () => {
     const root = await mkdtemp(join(tmpdir(), "relay-global-dashboard-draft-"));
     const stateHome = await mkdtemp(join(tmpdir(), "relay-global-dashboard-draft-state-"));

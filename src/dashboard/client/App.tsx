@@ -6,9 +6,10 @@ import "@mantine/core/styles.css";
 import "./canvas-overrides.css";
 import * as api from "./api";
 import type { ActionTestResult, ExecutionDetail, ExecutionInspection, Json, ProjectFolder, WatcherStatus, WorkflowSummary, Worker } from "./api";
+import { dashboardRoutePath, parseDashboardRoute, routeForPage, type DashboardPage, type DashboardRoute } from "./router";
 import { actionReferenceFor, actionReferenceValue, autoLayout, findDanglingActionReferences, findDanglingEdges, graphToWorkflow, setActionReference, syncActionReferenceEdge, upstreamReferenceNodes, wouldCycle, workflowToGraph, type GraphNode, type GraphNodeData } from "./graph";
 
-type Page = "home" | "repositories" | "workflows" | "executions" | "workers" | "plugins";
+type Page = DashboardPage;
 const nav: { id: Page; label: string; icon: string }[] = [
   { id: "home", label: "Home", icon: "⌂" }, { id: "repositories", label: "Repositories", icon: "▣" }, { id: "workflows", label: "Workflows", icon: "◇" },
   { id: "executions", label: "Executions", icon: "≡" }, { id: "workers", label: "Workers", icon: "⚙" }, { id: "plugins", label: "Plugins", icon: "⬡" },
@@ -51,7 +52,8 @@ function ActionNode({ data, selected }: NodeProps<GraphNode>) { const title = da
 const nodeTypes = { trigger: TriggerNode, action: ActionNode };
 
 function App() {
-  const [page, setPage] = useState<Page>("home");
+  const [route, setRoute] = useState<DashboardRoute>(() => parseDashboardRoute(window.location.pathname, window.location.search));
+  const page = route.page;
   const [projects, setProjects] = useState<ProjectFolder[]>([]);
   const [project, setProject] = useState<ProjectFolder>();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
@@ -63,30 +65,65 @@ function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [registerOpen, setRegisterOpen] = useState(false);
+  const navigate = useCallback((next: DashboardRoute, replace = false) => {
+    const path = dashboardRoutePath(next);
+    if (window.location.pathname !== path || window.location.search) {
+      window.history[replace ? "replaceState" : "pushState"]({}, "", path);
+    }
+    setRoute(next);
+  }, []);
+  const navigatePage = useCallback((next: Page, detail?: string) => navigate(routeForPage(next, project?.id, detail)), [navigate, project?.id]);
+  useEffect(() => {
+    const onPopState = () => setRoute(parseDashboardRoute(window.location.pathname, window.location.search));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
   const refresh = useCallback(async (next = project) => {
     setLoading(true); setError("");
     try {
       const [folders, wfs, runs, ws, ps, cat, watcherStatuses] = await Promise.all([api.getProjects(), api.getWorkflows(next), api.getExecutions(next), api.getWorkers(next), api.getPlugins(next), api.getCatalog(next), api.getWatcherStatuses()]);
       const watchers = new Map<string, WatcherStatus>(watcherStatuses.map((status) => [status.projectId, status]));
       const projectsWithWatchers = folders.map((folder) => ({ ...folder, watcher: watchers.get(folder.id) ?? { projectId: folder.id, state: "stopped" as const } }));
-      setProjects(projectsWithWatchers); if (!next && projectsWithWatchers[0]) { setProject(projectsWithWatchers[0]); } setWorkflows(wfs); setExecutions(runs); setWorkers(ws); setPlugins(ps); setCatalog(cat);
+      setProjects(projectsWithWatchers);
+      if (!next) {
+        const routedProject = route.projectId ? projectsWithWatchers.find((entry) => entry.id === route.projectId) : undefined;
+        if (route.projectId && !routedProject) setError(`Repository '${route.projectId}' was not found.`);
+        else setProject(routedProject);
+      }
+      setWorkflows(wfs); setExecutions(runs); setWorkers(ws); setPlugins(ps); setCatalog(cat);
       try { setConfig((await api.getConfig(next)).config); } catch { /* the global API may not expose config yet */ }
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setLoading(false); }
-  }, [project]);
-  useEffect(() => { void refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (project) void refresh(project); }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [project, route.projectId]);
+  useEffect(() => { void refresh(project); }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!route.projectId) {
+      if (project) setProject(undefined);
+      return;
+    }
+    if (!projects.length) return;
+    if (route.projectId) {
+      const selected = projects.find((entry) => entry.id === route.projectId);
+      if (selected?.id !== project?.id) setProject(selected);
+    }
+  }, [projects, route.projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (loading) return;
+    if (route.workflowId && !workflows.some((workflow) => workflow.id === route.workflowId)) {
+      setError(`Workflow '${route.workflowId}' was not found.`);
+    }
+  }, [loading, route.workflowId, workflows]);
   useEffect(() => { const timer = window.setInterval(() => { void Promise.all([api.getExecutions(project).then(setExecutions), api.getWorkers(project).then(setWorkers)]); }, 5000); return () => window.clearInterval(timer); }, [project]);
   const active = executions.filter((run) => ["running", "started", "launching", "claimed", "provisioning", "pending"].includes(run.status)).length;
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><span className="brand-mark">◆</span><div><b>task relay</b><small>control plane</small></div></div>
-      <div className="workspace-label">WORKSPACE</div><select value={project?.id ?? ""} onChange={(event) => setProject(projects.find((entry) => entry.id === event.target.value))}><option value="">Current repository</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.displayName || entry.root || entry.id}</option>)}</select>
-      <nav>{nav.map((entry) => <button key={entry.id} className={page === entry.id ? "active" : ""} onClick={() => setPage(entry.id)}><span>{entry.icon}</span>{entry.label}{entry.id === "executions" && active > 0 && <em>{active}</em>}</button>)}</nav>
+      <div className="workspace-label">WORKSPACE</div><select value={project?.id ?? ""} onChange={(event) => { const selected = projects.find((entry) => entry.id === event.target.value); setProject(selected); navigate(routeForPage(route.page, selected?.id)); }}><option value="">Current repository</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.displayName || entry.root || entry.id}</option>)}</select>
+      <nav>{nav.map((entry) => <button key={entry.id} className={page === entry.id ? "active" : ""} onClick={() => navigatePage(entry.id)}><span>{entry.icon}</span>{entry.label}{entry.id === "executions" && active > 0 && <em>{active}</em>}</button>)}</nav>
       <div className="sidebar-footer"><span className="online-dot" /> daemon connected <button className="icon-button" title="Refresh" onClick={() => void refresh()}>↻</button></div>
     </aside>
     <main className="main"><header><div><div className="breadcrumb">TASK RELAY / {project?.displayName || project?.root || "CURRENT REPOSITORY"}</div><h1>{nav.find((entry) => entry.id === page)?.label}</h1></div><div className="header-actions"><button className="button ghost" onClick={() => void refresh()}>↻ Refresh</button><button className="button primary" onClick={() => setRegisterOpen(true)}>+ Add repository</button></div></header>
       {error && <div className="alert error">{error}<button onClick={() => setError("")}>×</button></div>}
-      {loading && !workflows.length && !executions.length ? <div className="loading"><span className="spinner" /> Loading control plane…</div> : <>{page === "home" && <HomePage workflows={workflows} executions={executions} workers={workers} projects={projects} onNavigate={setPage} />}{page === "repositories" && <Repositories projects={projects} selected={project} onSelect={(p) => { setProject(p); setPage("home"); }} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} onRemoved={(id) => { setProjects((old) => old.filter((entry) => entry.id !== id)); if (project?.id === id) setProject(undefined); }} onChanged={() => refresh(project)} />}{page === "workflows" && <Workflows workflows={workflows} config={config} catalog={catalog} project={project} onSaved={(next) => { setConfig(next); void refresh(project); }} />}{page === "executions" && <Executions executions={executions} workflows={workflows} onRefresh={() => void refresh(project)} />}{page === "workers" && <Workers workers={workers} project={project} />}{page === "plugins" && <Plugins plugins={plugins} catalog={catalog} />} </>}
+      {loading && !workflows.length && !executions.length ? <div className="loading"><span className="spinner" /> Loading control plane…</div> : <>{page === "home" && <HomePage workflows={workflows} executions={executions} workers={workers} projects={projects} onNavigate={navigatePage} />}{page === "repositories" && <Repositories projects={projects} selected={project} onSelect={(p) => { setProject(p); navigate(routeForPage("home", p.id)); }} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); navigate(routeForPage(page, p.id)); setRegisterOpen(false); }} onRemoved={(id) => { setProjects((old) => old.filter((entry) => entry.id !== id)); if (project?.id === id) { setProject(undefined); navigate(routeForPage("home")); } }} onChanged={() => refresh(project)} />}{page === "workflows" && <Workflows workflows={workflows} config={config} catalog={catalog} project={project} selectedWorkflowId={route.workflowId} onSelectWorkflow={(id) => navigate(routeForPage("workflows", project?.id, id))} onSaved={(next) => { setConfig(next); void refresh(project); }} />}{page === "executions" && <Executions executions={executions} workflows={workflows} selectedExecutionId={route.executionId} onInspect={(id) => navigate(routeForPage("executions", project?.id, id))} onCloseDetail={() => navigate(routeForPage("executions", project?.id))} onRefresh={() => void refresh(project)} />}{page === "workers" && <Workers workers={workers} project={project} />}{page === "plugins" && <Plugins plugins={plugins} catalog={catalog} />} </>}
     </main>{registerOpen && <RegisterDialog onClose={() => setRegisterOpen(false)} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} />}
   </div>;
 }
@@ -127,13 +164,17 @@ function Repositories({ projects, selected, onSelect, onAdded, onRemoved, onChan
 function RegisterInline({ onAdded }: { onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="register-inline"><input placeholder="/path/to/repository" value={value} onChange={(e) => setValue(e.target.value)} /><button className="button ghost" disabled={!value} onClick={() => api.registerProject(value).then((p) => { setValue(""); onAdded(p); }).catch((e) => window.alert(e.message))}>Register path</button></div>; }
 function RegisterDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><h2>Add repository</h2><button className="icon-button" onClick={onClose}>×</button></div><p>Register a local Git folder with the global control plane.</p><input autoFocus placeholder="/Users/me/Development/project" value={value} onChange={(e) => setValue(e.target.value)} /><div className="modal-actions"><button className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" disabled={!value.trim()} onClick={() => api.registerProject(value.trim()).then(onAdded).catch((e) => window.alert(e.message))}>Register folder</button></div></div></div>; }
 
-function Workflows({ workflows, config, catalog, project, onSaved }: { workflows: WorkflowSummary[]; config: Json; catalog: Json; project?: ProjectFolder; onSaved: (config: Json) => void }) {
-  const [selected, setSelected] = useState(workflows[0]?.id ?? "");
+function Workflows({ workflows, config, catalog, project, selectedWorkflowId, onSelectWorkflow, onSaved }: { workflows: WorkflowSummary[]; config: Json; catalog: Json; project?: ProjectFolder; selectedWorkflowId?: string; onSelectWorkflow: (id?: string) => void; onSaved: (config: Json) => void }) {
+  const [selected, setSelected] = useState(selectedWorkflowId ?? workflows[0]?.id ?? "");
   const [draft, setDraft] = useState<WorkflowSummary>();
   useEffect(() => {
+    if (selectedWorkflowId) {
+      if (selectedWorkflowId !== selected) setSelected(selectedWorkflowId);
+      if (!workflows.some((workflow) => workflow.id === selectedWorkflowId) && draft?.id !== selectedWorkflowId) return;
+    }
     if (selected && (workflows.some((workflow) => workflow.id === selected) || draft?.id === selected)) return;
     setSelected(workflows[0]?.id ?? "");
-  }, [workflows, selected, draft]);
+  }, [workflows, selected, draft, selectedWorkflowId]);
   const create = () => {
     if (!project) return window.alert("Register and select a repository first.");
     const id = window.prompt("Workflow id", "cleanup-on-done")?.trim();
@@ -145,11 +186,11 @@ function Workflows({ workflows, config, catalog, project, onSaved }: { workflows
     // scoped to its own repository/source/item and cleans every Relay-owned
     // tmux worker plus its worktree. The canvas remains fully editable.
     const next: WorkflowSummary = { id, enabled: true, on: { source, match: { statusTypes: ["completed"] }, fire: { policy: "once-per-match" } }, source, targets: { workers: { sourceItem: "current", runs: "all" } }, jobs: { cleanup: { use: "cleanup", with: { activeWorker: "stop", ownedTmuxOnly: true } } }, timeoutMinutes: 1440 };
-    setDraft(next); setSelected(id);
+    setDraft(next); setSelected(id); onSelectWorkflow(id);
   };
   const summary = workflows.find((workflow) => workflow.id === selected) ?? (draft?.id === selected ? draft : undefined);
   const current = summary ? { ...summary, ...(config.workflows?.[selected] ?? {}), id: selected } as WorkflowSummary : undefined;
-  return <div className="workflow-layout"><aside className="workflow-list"><div className="list-head"><h3>Workflows</h3><button className="icon-button" title="New workflow" onClick={create}>＋</button></div>{workflows.map((workflow) => <button key={workflow.id} className={workflow.id === selected ? "workflow-item selected" : "workflow-item"} onClick={() => { setDraft(undefined); setSelected(workflow.id); }}><span className="workflow-status" /><span><b>{workflow.id}</b><small>{Object.keys(workflow.jobs ?? {}).length} jobs · {workflow.enabled === false ? "paused" : "active"}</small></span></button>)}{draft && !workflows.some((workflow) => workflow.id === draft.id) && <button className="workflow-item selected"><span className="workflow-status" /><span><b>{draft.id}</b><small>unsaved draft</small></span></button>}{!workflows.length && !draft && <Empty text="No workflows" />}</aside>{current ? <WorkflowEditor key={current.id} workflow={current} config={config} catalog={catalog} project={project} onSaved={(next) => { setDraft(undefined); onSaved(next); }} /> : <div className="editor-empty"><div className="empty-graphic">◇</div><h2>Select a workflow</h2><p>Create or select a workflow to open the canvas.</p><button className="button primary" onClick={create}>Create workflow</button></div>}</div>;
+  return <div className="workflow-layout"><aside className="workflow-list"><div className="list-head"><h3>Workflows</h3><button className="icon-button" title="New workflow" onClick={create}>＋</button></div>{workflows.map((workflow) => <button key={workflow.id} className={workflow.id === selected ? "workflow-item selected" : "workflow-item"} onClick={() => { setDraft(undefined); setSelected(workflow.id); onSelectWorkflow(workflow.id); }}><span className="workflow-status" /><span><b>{workflow.id}</b><small>{Object.keys(workflow.jobs ?? {}).length} jobs · {workflow.enabled === false ? "paused" : "active"}</small></span></button>)}{draft && !workflows.some((workflow) => workflow.id === draft.id) && <button className="workflow-item selected"><span className="workflow-status" /><span><b>{draft.id}</b><small>unsaved draft</small></span></button>}{!workflows.length && !draft && <Empty text="No workflows" />}</aside>{current ? <WorkflowEditor key={current.id} workflow={current} config={config} catalog={catalog} project={project} onSaved={(next) => { setDraft(undefined); onSaved(next); }} /> : <div className="editor-empty"><div className="empty-graphic">◇</div><h2>Select a workflow</h2><p>Create or select a workflow to open the canvas.</p><button className="button primary" onClick={create}>Create workflow</button></div>}</div>;
 }
 
 function WorkflowEditor({ workflow, config, catalog, project, onSaved }: { workflow: WorkflowSummary; config: Json; catalog: Json; project?: ProjectFolder; onSaved: (config: Json) => void }) {
@@ -280,12 +321,13 @@ function LinearTriggerFields({ sourceId, project, value, onChange }: { sourceId:
 function SchemaField({ name, definition, value, onChange }: { name: string; definition: any; value: any; onChange: (value: any) => void }) { const title = definition.title || name.replace(/[-_]/g, " "); const effectiveValue = value ?? definition.default; if (definition.enum) return <label>{title}<select value={effectiveValue ?? ""} onChange={(e) => onChange(e.target.value)}><option value="">Select…</option>{definition.enum.map((option: string) => <option key={option}>{option}</option>)}</select></label>; if (definition.type === "boolean") return <label className="check-label"><input type="checkbox" checked={Boolean(effectiveValue)} onChange={(e) => onChange(e.target.checked)} /> {title}</label>; if (definition.type === "object" || definition.type === "array") return <label>{title}{definition.description && <small className="field-help">{definition.description}</small>}<textarea className="schema-json-field" value={value === undefined ? "" : JSON.stringify(value, null, 2)} placeholder={definition.type === "array" ? "[]" : "{}"} onChange={(e) => { try { onChange(e.target.value.trim() ? JSON.parse(e.target.value) : undefined); } catch { /* keep editing invalid JSON until it parses */ } }} /></label>; const numeric = definition.type === "integer" || definition.type === "number"; const multiline = name === "prompt"; return <label>{title}{definition.description && <small className="field-help">{definition.description}</small>}{multiline ? <textarea className="schema-json-field" value={value ?? ""} onChange={(e) => onChange(e.target.value)} /> : <input type={numeric ? "number" : "text"} value={value ?? ""} placeholder={definition.default ?? ""} onChange={(e) => onChange(numeric && e.target.value !== "" ? Number(e.target.value) : e.target.value)} />}</label>; }
 function RawDialog({ value, onChange, onClose, onApply }: { value: string; onChange: (value: string) => void; onClose: () => void; onApply: () => void }) { return <div className="modal-backdrop"><div className="modal raw-modal"><div className="modal-head"><h2>Raw node configuration</h2><button className="icon-button" onClick={onClose}>×</button></div><textarea value={value} onChange={(e) => onChange(e.target.value)} spellCheck={false} /><div className="modal-actions"><button className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" onClick={onApply}>Apply</button></div></div></div>; }
 
-function Executions({ executions, workflows, onRefresh }: { executions: any[]; workflows: WorkflowSummary[]; onRefresh: () => void }) {
+function Executions({ executions, workflows, selectedExecutionId, onInspect, onCloseDetail, onRefresh }: { executions: any[]; workflows: WorkflowSummary[]; selectedExecutionId?: string; onInspect: (id: string) => void; onCloseDetail: () => void; onRefresh: () => void }) {
   const [filter, setFilter] = useState("all"); const [busy, setBusy] = useState(""); const [detail, setDetail] = useState<ExecutionDetail>(); const [inspectError, setInspectError] = useState("");
   const visible = executions.filter((run) => filter === "all" || run.status === filter);
-  const inspect = async (run: any) => { setInspectError(""); try { setDetail(await api.getExecution(run.id)); } catch (error) { setInspectError(error instanceof Error ? error.message : String(error)); } };
+  const inspect = async (run: any) => { setInspectError(""); onInspect(run.id); try { setDetail(await api.getExecution(run.id)); } catch (error) { setInspectError(error instanceof Error ? error.message : String(error)); } };
+  useEffect(() => { if (!selectedExecutionId) { setDetail(undefined); return; } const run = executions.find((candidate) => candidate.id === selectedExecutionId); if (run) void inspect(run); else setInspectError(`Execution '${selectedExecutionId}' was not found.`); }, [selectedExecutionId, executions]);
   const retry = async (run: any) => { setBusy(run.id); try { await api.retryExecution(run.id); onRefresh(); } catch (error) { setInspectError(error instanceof Error ? error.message : String(error)); } finally { setBusy(""); } };
-  return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">GLOBAL EXECUTION LOG</span><p>Live state indexed across every registered repository.</p></div><select className="filter-select" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter executions by status"><option value="all">All statuses</option>{["running", "pending", "succeeded", "failed", "stopped"].map((status) => <option key={status}>{status}</option>)}</select></div>{inspectError && <div className="alert error" role="alert">{inspectError}<button onClick={() => setInspectError("")} aria-label="Dismiss execution error">×</button></div>}<section className="panel table-panel"><table><thead><tr><th>Work item</th><th>Workflow</th><th>Status</th><th>Updated</th><th>Jobs</th><th>Actions</th></tr></thead><tbody>{visible.map((run, index) => <tr key={run.id ?? index}><td><b>{run.item?.id || run.id || "—"}</b><small>{run.item?.title || ""}</small></td><td>{run.identity?.workflowId || run.workflowId || workflows.find((w) => w.runs?.some((item) => item.id === run.id))?.id || "—"}</td><td><span className={statusClass(run.status)}>{run.status || "unknown"}</span></td><td>{time(run.updatedAt || run.startedAt)}</td><td>{run.jobs ? Object.keys(run.jobs).length : "—"}</td><td><button className="small-button" onClick={() => void inspect(run)} aria-label={`Inspect execution ${run.item?.id || run.id || index}`}>Inspect</button>{run.status === "failed" && <button className="small-button" disabled={busy === run.id} onClick={() => void retry(run)} aria-label={`Retry execution ${run.item?.id || run.id || index}`}>Retry</button>}</td></tr>)}</tbody></table>{!visible.length && <Empty text="No executions match this filter." />}</section>{detail && <ExecutionInspector detail={detail} onClose={() => setDetail(undefined)} />}</div>;
+  return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">GLOBAL EXECUTION LOG</span><p>Live state indexed across every registered repository.</p></div><select className="filter-select" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter executions by status"><option value="all">All statuses</option>{["running", "pending", "succeeded", "failed", "stopped"].map((status) => <option key={status}>{status}</option>)}</select></div>{inspectError && <div className="alert error" role="alert">{inspectError}<button onClick={() => setInspectError("")} aria-label="Dismiss execution error">×</button></div>}<section className="panel table-panel"><table><thead><tr><th>Work item</th><th>Workflow</th><th>Status</th><th>Updated</th><th>Jobs</th><th>Actions</th></tr></thead><tbody>{visible.map((run, index) => <tr key={run.id ?? index}><td><b>{run.item?.id || run.id || "—"}</b><small>{run.item?.title || ""}</small></td><td>{run.identity?.workflowId || run.workflowId || workflows.find((w) => w.runs?.some((item) => item.id === run.id))?.id || "—"}</td><td><span className={statusClass(run.status)}>{run.status || "unknown"}</span></td><td>{time(run.updatedAt || run.startedAt)}</td><td>{run.jobs ? Object.keys(run.jobs).length : "—"}</td><td><button className="small-button" onClick={() => void inspect(run)} aria-label={`Inspect execution ${run.item?.id || run.id || index}`}>Inspect</button>{run.status === "failed" && <button className="small-button" disabled={busy === run.id} onClick={() => void retry(run)} aria-label={`Retry execution ${run.item?.id || run.id || index}`}>Retry</button>}</td></tr>)}</tbody></table>{!visible.length && <Empty text="No executions match this filter." />}</section>{detail && <ExecutionInspector detail={detail} onClose={() => { setDetail(undefined); onCloseDetail(); }} />}</div>;
 }
 
 function ExecutionInspector({ detail, onClose }: { detail: ExecutionDetail; onClose: () => void }) {
