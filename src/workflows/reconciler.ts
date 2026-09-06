@@ -119,7 +119,7 @@ export function expressionContexts(
     jobs[id] = { result: resultOf(state.status), status: state.status, outputs: state.outputs ?? {} };
   }
   return {
-    item: { id: item.id, title: item.title, url: item.url ?? "", state: item.state ?? "unknown", metadata: item.metadata ?? {} },
+    item: { id: item.id, title: item.title, description: item.description ?? "", url: item.url ?? "", state: item.state ?? "unknown", metadata: item.metadata ?? {} },
     needs,
     jobs,
     matrix: job.matrix ?? {},

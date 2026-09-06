@@ -1,0 +1,17 @@
+{
+  "name": "@task-relay/domain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/domain/test",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "build": "npm run build --prefix ../.."
+  }
+}

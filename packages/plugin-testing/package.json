@@ -1,0 +1,9 @@
+{
+  "name": "@task-relay/plugin-testing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "dependencies": { "@task-relay/plugin-host": "file:../plugin-host", "@task-relay/plugin-sdk": "file:../plugin-sdk", "zod": "^3.24.3" },
+  "scripts": { "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/plugin-testing/test", "check": "tsc --noEmit -p ../../tsconfig.json", "build": "npm run build --prefix ../.." }
+}

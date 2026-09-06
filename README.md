@@ -2,7 +2,7 @@
 
 Task Relay is a repository-scoped automation engine for coding agents. It is not tied to Pi, Linear, Codex, or any one model: a source discovers items, its provider evaluates source-specific match rules, and Relay runs an ordered action pipeline.
 
-The built-ins provide Linear, coding-agent launch, worker control, worker cleanup, and the common harnesses (`codex`, `claude`, `pi`, and `opencode`). Sources, actions, and harnesses can all be added as installed packages or local modules; see [Custom plugins](#custom-plugins).
+The built-ins provide Linear, coding-agent launch, worker control, worker cleanup, and the common harnesses (`codex`, `claude`, `pi`, and `opencode`). Sources, versioned polling triggers, actions, and harnesses can all be added as installed packages or local modules; see [Custom plugins](#custom-plugins).
 
 ## Install
 
@@ -72,6 +72,46 @@ source item -> source-specific match -> ordered actions -> outputs/workers
 `use` and `uses` are accepted interchangeably wherever a plugin is named.
 
 The core does not interpret fields under `match` or `with`. Their selected source/action/harness plugin validates them when Relay resolves that plugin.
+
+## Local architecture
+
+Relay runs locally. The refactoring places the CLI, dashboard, and scheduler at
+the application boundary, with plugins and storage outside the domain rules.
+
+```text
+CLI / dashboard / scheduler
+            |
+     application use cases
+            |
+ domain rules + plugin SDK contracts
+      |                 |
+SQLite ledger       plugin host
+      |                 |
+global read index   triggers / sources / actions / harnesses
+```
+
+The workspace packages make these boundaries explicit:
+
+```text
+packages/
+  domain/             workflow state, identities, dependency rules
+  application/        polling, workflow execution, reconciliation use cases
+  plugin-sdk/         public source, trigger, action, and harness contracts
+  plugin-host/        registration, trusted loading, catalog, installation
+  storage-sqlite/     per-repository execution ledger and legacy importer
+  global-registry/    rebuildable cross-repository read model
+  trigger-*/          independently packaged trigger adapters
+  action-*/           independently packaged action implementations
+  integration-*/      provider clients shared by plugins
+```
+
+`src/` remains the composition and compatibility layer while the extraction is
+in progress. The import-boundary check guards package-to-package dependencies;
+package consumers import only each package's public entry point.
+
+Each enabled source polls every 30 seconds by default. Set that source's
+`pollIntervalMs` to use a different positive interval; per-source schedules
+avoid replaying missed ticks as a backlog after a pause.
 
 ## Example: Linear launch, PR review, and cleanup
 
@@ -513,6 +553,7 @@ beside a running one.
 relay workflow test feature    # matched items, each job, and what would start now
 relay workflow runs            # every run, with each job's state and why it is blocked
 relay workflow runs --json
+relay workflow inspect feature ENG-123  # redacted inputs, outputs, attempts, and waits
 relay dashboard                # global workflow canvas and live control plane
 relay dashboard --repo /path/to/another/repository
 ```
@@ -662,7 +703,7 @@ Every key, enum, and default above is then completed and validated as you type.
 
 ## Custom plugins
 
-Built-in short names such as `linear`, `launch`, `cleanup`, and `codex` are ordinary plugin names. Use a package or a local module for a custom source or action plugin:
+Built-in short names such as `linear`, `launch`, `cleanup`, and `codex` are ordinary plugin names. Use a package or a local module for a custom source, versioned trigger, action, or harness:
 
 ```yaml
 sources:
@@ -689,6 +730,59 @@ triggers:
 ```
 
 Only explicitly configured modules are loaded. Treat plugin modules as trusted code and keep secrets out of YAML.
+
+### Authoring a package
+
+Start from a scaffold, then build and validate the compiled entry before
+installing it:
+
+```bash
+relay plugin init @company/relay-github-trigger --kind trigger
+cd relay-github-trigger
+npm install
+npm run check && npm test && npm run build
+relay plugin validate .
+relay plugin pack . --out dist
+```
+
+The scaffold creates `package.json`, `relay-plugin.json`, TypeScript source,
+tests, and a README. A package exports one default value (or `plugin`) with a
+stable `kind` and `use`. It must provide Zod schemas for configuration; a
+versioned trigger also provides payload and cursor schemas, the SDK API version,
+and `poll()`. An action may use the compatibility `ActionPlugin` contract or
+the versioned action contract with explicit `succeeded`, `skipped`, `deferred`,
+`running`, or `failed` outcomes.
+
+Use a `source` plugin for discovery that fits the existing source/match
+configuration. Use a `trigger` plugin when it owns a durable cursor and emits
+stable event IDs. Both are configured under `sources:`; Relay detects the
+plugin contract at registration. Actions belong under `actions:` and harnesses
+under `harnesses:`.
+
+Keep a trigger and an action as separate packages when they can evolve
+independently. Build each package, install each one, then bind the trigger under
+`sources:` and the action under `actions:` with its package name or declared
+`use` alias:
+
+```bash
+relay plugin install @company/relay-github-trigger
+relay plugin install @company/relay-notify-action
+```
+
+```yaml
+sources:
+  github:
+    use: "@company/relay-github-trigger"
+    with: { organisation: acme }
+actions:
+  notify:
+    use: "@company/relay-notify-action"
+    with: { channel: engineering-agents }
+```
+
+Installation validates and records each module; when configuration resolves
+them, Relay registers both through the same plugin host as built-ins. No core
+or dashboard branch is needed for a separately packaged trigger or action.
 
 ### Installing a plugin
 
@@ -755,14 +849,19 @@ Plugin packages import the extension contracts from `task-relay/plugin`:
 import type { ActionContext, ActionPlugin, ActionResult } from "task-relay/plugin";
 ```
 
-That entry point exports only the plugin contracts and the domain types they use.
-It never pulls in Relay's CLI, dashboard, daemon, or state store, so a plugin's
-`tsc` does not have to resolve Relay's own runtime dependencies. Everything it
-exports is covered by Relay's semantic versioning: a breaking change to those
-types requires a major release. Do not import from `task-relay` itself or from
-`task-relay/src/...`.
+That entry point exposes the plugin contracts and the domain types they use. It
+does not expose Relay's CLI, dashboard, daemon, or state store. The legacy
+`RelayPluginRegistry` compatibility export remains temporarily deprecated;
+workspace code should import it from `@task-relay/plugin-host` instead.
+Everything it exports is covered by Relay's semantic versioning: a breaking
+change to those types requires a major release. Do not import from `task-relay`
+itself or from `task-relay/src/...`.
 
 For a custom local coding CLI, the built-in `command` harness is usually enough: give it an executable, its arguments, and how it takes a prompt. Reach for a harness plugin when the agent is not a local command — a hosted service, or anything whose lifecycle Relay cannot express as one process.
+
+Workspace packages use `@task-relay/plugin-sdk` directly. External packages
+should use the stable `task-relay/plugin` compatibility entry point generated by
+the scaffold.
 
 ## Commands and observability
 
@@ -771,6 +870,7 @@ relay doctor                    # config, plugin health, and harness checks
 relay plugin install <package>  # install into the managed plugin directory
 relay plugin list               # installed plugins and what this project uses
 relay status                    # sources, harnesses, actions, triggers, and run state
+relay state migrate             # import legacy JSON after stopping Relay writers
 relay runs                      # persisted worker/run table
 relay worker list               # workers from every repository on this machine
 relay worker show ENG-123       # locate a worker by issue from any directory
@@ -781,6 +881,7 @@ relay config schema --write        # JSON Schema for editor completion
 relay trigger test implement-linear-issue
 relay workflow test feature       # preview a workflow's job graph
 relay workflow runs               # persisted workflow runs and job states
+relay workflow inspect feature ENG-123
 relay workflow retry feature ENG-123
 relay signal ENG-123 done --output changed=true
 relay once --trigger implement-linear-issue
@@ -794,16 +895,37 @@ relay dashboard [--repo <paths...>] [--port 3001] [--no-open]
 
 `trigger test` should preview the source items, matching result, selected workers, planned actions, and rendered prompt without changing state. Events are structured JSONL under `${XDG_STATE_HOME:-~/.local/state}/task-relay/<repo>-<hash>/events.jsonl`; human tables are rendered from those records.
 
-Worker and workflow discovery are machine-global. Relay stores an SQLite registry at
-`${XDG_STATE_HOME:-~/.local/state}/task-relay/registry.sqlite`, while keeping the
-repository JSON state as the dispatch ledger. The SQLite schema includes project
-folders, workflow runs, job runs, append-only workflow events, worker records,
-and lifecycle events. It is a rebuildable query index, not a second execution
-authority. A normalized Git origin identifies
+The repository execution ledger is SQLite at
+`${XDG_STATE_HOME:-~/.local/state}/task-relay/<repository>-<hash>/state.sqlite`.
+The machine-global registry at
+`${XDG_STATE_HOME:-~/.local/state}/task-relay/registry.sqlite` is a rebuildable
+query index, not a second execution authority. A normalized Git origin identifies
 the same repository across clones and linked worktrees; repositories without an
 origin use their canonical Git common-directory path. Existing JSON runs are
-indexed automatically when that repository is next opened; the repository JSON
-ledger remains backward-compatible and is not replaced.
+imported only by the explicit migration command and the original JSON is kept
+with a `pre-sqlite-backup` suffix. This migration path has only been exercised
+in disposable fixtures in this checkout; it is not evidence of a completed live
+repository rollout.
+
+### Local SQLite migration and recovery
+
+For a repository that still has legacy `state.json`, stop the Relay watch,
+daemon, or dashboard supervision that owns it, then run:
+
+```bash
+relay state migrate
+relay status
+relay workflow runs
+relay workflow inspect <workflow-id> <item-id>
+```
+
+`relay state migrate` refuses while the repository daemon or dashboard
+supervisor owns execution. It validates the imported record counts and keeps an
+untouched legacy backup. Do not delete that backup during a staged rollout. If
+the command reports an interrupted or changing legacy file, keep Relay stopped,
+preserve both files for inspection, and rerun the command only after resolving
+the competing writer. A backup is not a safe rollback after new external work
+has run; inspect the execution and repair forward.
 
 The optional global runtime supervisor polls every enabled registered folder.
 It takes a per-repository lease and refuses to start when that repository's

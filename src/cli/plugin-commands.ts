@@ -10,7 +10,7 @@ import { CONFIG_FILE } from "../config/load.js";
 export interface RelayPluginManifest {
   name: string;
   version: string;
-  kind: "source" | "action" | "harness";
+  kind: "source" | "trigger" | "action" | "harness";
   use: string;
   minRelayVersion?: string;
   description?: string;
@@ -25,8 +25,8 @@ function validateManifest(raw: unknown): RelayPluginManifest {
   for (const key of required) {
     if (typeof m[key] !== "string") throw new Error(`relay-plugin.json: field '${key}' must be a non-empty string.`);
   }
-  if (!["source", "action", "harness"].includes(m.kind as string)) {
-    throw new Error(`relay-plugin.json: 'kind' must be 'source', 'action', or 'harness', got '${m.kind}'.`);
+  if (!["source", "trigger", "action", "harness"].includes(m.kind as string)) {
+    throw new Error(`relay-plugin.json: 'kind' must be 'source', 'trigger', 'action', or 'harness', got '${m.kind}'.`);
   }
   return m as unknown as RelayPluginManifest;
 }
@@ -77,7 +77,7 @@ function pluginTsConfig(): string {
   }, null, 2);
 }
 
-function pluginManifest(name: string, use: string, kind: "source" | "action" | "harness"): string {
+function pluginManifest(name: string, use: string, kind: RelayPluginManifest["kind"]): string {
   const manifest: RelayPluginManifest = {
     name,
     version: "0.1.0",
@@ -128,6 +128,46 @@ const plugin: SourcePlugin<Config, Match> = {
 
   // Optional: clean up connections when the relay stops
   // async close() { },
+};
+
+export default plugin;
+`;
+}
+
+function triggerPluginTemplate(use: string): string {
+  return `import { z } from "zod";
+import { PLUGIN_SDK_API_VERSION, type TriggerPlugin } from "task-relay/plugin";
+
+const configSchema = z.object({
+  // Add your trigger configuration fields here
+  example: z.string().optional(),
+});
+const payloadSchema = z.object({
+  // Define the durable event payload here
+  id: z.string(),
+});
+const cursorSchema = z.object({
+  // Store the provider checkpoint here
+  since: z.string().optional(),
+});
+
+type Config = z.infer<typeof configSchema>;
+type Payload = z.infer<typeof payloadSchema>;
+type Cursor = z.infer<typeof cursorSchema>;
+
+const plugin: TriggerPlugin<Config, Payload, Cursor> = {
+  kind: "trigger",
+  use: "${use}",
+  apiVersion: PLUGIN_SDK_API_VERSION,
+  configSchema,
+  payloadSchema,
+  cursorSchema,
+
+  async poll(context, config) {
+    // Return stable event ids and advance cursor only for this complete page.
+    // Relay persists accepted events and the cursor before dispatching actions.
+    return { events: [], cursor: context.cursor };
+  },
 };
 
 export default plugin;
@@ -255,6 +295,15 @@ describe("${use} ${kind} plugin", () => {
     expect(["succeeded", "skipped"]).toContain(result.status);
   });
   ` : ""}
+  ${kind === "trigger" ? `
+  it("returns an event page and cursor from poll", async () => {
+    const result = await plugin.poll(
+      { bindingId: "test", repository: { id: "test-repo", root: "/tmp/test" } },
+      plugin.configSchema.parse({}),
+    );
+    expect(Array.isArray(result.events)).toBe(true);
+  });
+  ` : ""}
 });
 `;
 }
@@ -275,11 +324,11 @@ relay plugin install ${name}
 Add to your \`.task-relay.yaml\`:
 
 \`\`\`yaml
-${kind === "source" ? `sources:
+${kind === "source" || kind === "trigger" ? `sources:
   my-source:
     use: ${name}
     with:
-      # Your source configuration here` : ""}${kind === "action" ? `actions:
+      # Your ${kind} configuration here` : ""}${kind === "action" ? `actions:
   my-action:
     use: ${name}
     with:
@@ -314,13 +363,13 @@ export function addPluginCommands(program: Command, print: (value: string) => vo
 
   plugin.command("init <name>")
     .description("Scaffold a new plugin repository directory.")
-    .option("--kind <kind>", "plugin kind: source, action, or harness", "action")
+    .option("--kind <kind>", "plugin kind: source, trigger, action, or harness", "action")
     .option("--use <use>", "plugin use identifier (defaults to the name)")
     .option("--dir <dir>", "output directory (defaults to <name>)")
     .action(async (name: string, flags: { kind?: string; use?: string; dir?: string }) => {
-      const kind = (flags.kind || "action") as "source" | "action" | "harness";
-      if (!["source", "action", "harness"].includes(kind)) {
-        throw new Error(`--kind must be 'source', 'action', or 'harness', got '${kind}'.`);
+      const kind = (flags.kind || "action") as RelayPluginManifest["kind"];
+      if (!["source", "trigger", "action", "harness"].includes(kind)) {
+        throw new Error(`--kind must be 'source', 'trigger', 'action', or 'harness', got '${kind}'.`);
       }
       const use = flags.use || name.replace(/^@[^/]+\//, "").replace(/^relay-plugin-/, "");
       const outDir = path.resolve(flags.dir || name);
@@ -331,6 +380,7 @@ export function addPluginCommands(program: Command, print: (value: string) => vo
 
       const sourceCode =
         kind === "source" ? sourcePluginTemplate(use) :
+        kind === "trigger" ? triggerPluginTemplate(use) :
         kind === "action" ? actionPluginTemplate(use) :
         harnessPluginTemplate(use);
 
@@ -413,9 +463,9 @@ export function addPluginCommands(program: Command, print: (value: string) => vo
       print(`  entry: ${result.plugin.entry}`);
       print(`  ${result.plugin.integrity}`);
       print(`\nReference it in ${CONFIG_FILE} as:`);
-      print(`  ${result.plugin.kind === "source" ? "sources" : result.plugin.kind === "action" ? "actions" : "harnesses"}:`);
+      print(`  ${result.plugin.kind === "source" || result.plugin.kind === "trigger" ? "sources" : result.plugin.kind === "action" ? "actions" : "harnesses"}:`);
       print(`    my-${result.plugin.kind}:`);
-      print(`      uses: "${result.plugin.name}"`);
+      print(`      use: "${result.plugin.name}"`);
     });
 
   plugin.command("remove <name>")

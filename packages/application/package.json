@@ -1,0 +1,13 @@
+{
+  "name": "@task-relay/application",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "relay-built": "./dist/index.js", "import": "./dist/index.js" } },
+  "dependencies": { "@task-relay/domain": "file:../domain", "@task-relay/plugin-sdk": "file:../plugin-sdk", "handlebars": "^4.7.8", "p-queue": "^8.1.0" },
+  "scripts": {
+    "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/application/test",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "build": "npm run build --prefix ../.."
+  }
+}

@@ -4,6 +4,7 @@ import { basename, dirname, resolve } from "node:path";
 import { cosmiconfig } from "cosmiconfig";
 import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
+import { mergeConfigDocuments } from "@task-relay/config";
 import { normalizeRelayConfig, type RelayConfigV2 } from "./schema.js";
 
 export const CONFIG_FILE = ".task-relay.yaml";
@@ -23,13 +24,6 @@ export async function findProjectRoot(start = process.cwd()): Promise<string> {
   }
 }
 
-function deepMerge(base: unknown, override: unknown): unknown {
-  if (!isRecord(base) || !isRecord(override)) return override === undefined ? base : override;
-  const result: Record<string, unknown> = { ...base };
-  for (const [key, value] of Object.entries(override)) result[key] = key in result ? deepMerge(result[key], value) : value;
-  return result;
-}
-function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 
 async function yamlFile(path: string): Promise<unknown | undefined> {
   const explorer = cosmiconfig("task-relay", { searchPlaces: [CONFIG_FILE], loaders: { ".yaml": (_path, content) => parse(content), ".yml": (_path, content) => parse(content) } });
@@ -48,7 +42,7 @@ export async function loadRelayConfig(start?: string): Promise<{ config: RelayCo
   if (!existsSync(configPath)) throw new RelayConfigError(`No ${CONFIG_FILE} found for ${projectRoot}. Run 'relay init' first.`);
   const localPath = resolve(projectRoot, LOCAL_CONFIG_FILE);
   try {
-    const merged = deepMerge(await yamlFile(configPath), existsSync(localPath) ? await yamlFile(localPath) : undefined);
+    const merged = mergeConfigDocuments(await yamlFile(configPath), existsSync(localPath) ? await yamlFile(localPath) : undefined);
     const config = normalizeRelayConfig(merged);
     return { config, projectRoot, configPath, localConfigPath: existsSync(localPath) ? localPath : undefined };
   } catch (error) {

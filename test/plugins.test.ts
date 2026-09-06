@@ -1,9 +1,11 @@
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { RelayPluginRegistry, type ActionPlugin, type HarnessPlugin, type SourcePlugin } from "../src/plugins/index.js";
+import { createRelayProgram } from "../src/cli/program.js";
+import { RelayPluginRegistry, type ActionPlugin, type HarnessPlugin, type SourcePlugin, type TriggerPlugin } from "../src/plugins/index.js";
 
 describe("Relay plugin contracts", () => {
   it("keeps source matching and plugin configuration under the source provider", async () => {
@@ -36,6 +38,7 @@ describe("Relay plugin contracts", () => {
     expect(registry.harness("codex")).toBe(harness);
     expect(() => registry.registerAction(action)).toThrow(/already registered/);
   });
+
 });
 
 describe("managed plugin store", () => {
@@ -48,14 +51,27 @@ describe("managed plugin store", () => {
       exports: { ".": { import: `./${entry}` } },
       main: `./${entry}`,
     }));
-    await writeFile(join(directory, entry), [
-      `export default {`,
-      `  kind: ${JSON.stringify(options.kind)},`,
-      `  use: ${JSON.stringify(options.use)},`,
-      `  configSchema: { parse: (value) => value ?? {} },`,
-      `  async execute() { return { status: "succeeded" }; },`,
-      `};`,
-    ].join("\n"));
+    const plugin = options.kind === "trigger"
+      ? [
+        `export default {`,
+        `  kind: "trigger",`,
+        `  use: ${JSON.stringify(options.use)},`,
+        `  apiVersion: 1,`,
+        `  configSchema: { parse: (value) => value ?? {} },`,
+        `  payloadSchema: { parse: (value) => value },`,
+        `  cursorSchema: { parse: (value) => value },`,
+        `  async poll() { return { events: [] }; },`,
+        `};`,
+      ]
+      : [
+        `export default {`,
+        `  kind: ${JSON.stringify(options.kind)},`,
+        `  use: ${JSON.stringify(options.use)},`,
+        `  configSchema: { parse: (value) => value ?? {} },`,
+        `  async execute() { return { status: "succeeded" }; },`,
+        `};`,
+      ];
+    await writeFile(join(directory, entry), plugin.join("\n"));
     if (options.withManifest !== false) {
       await writeFile(join(directory, "relay-plugin.json"), JSON.stringify({
         name: options.name, version: "1.2.3", kind: options.kind, use: options.use, minRelayVersion: "0.1.0",
@@ -114,6 +130,24 @@ describe("managed plugin store", () => {
     expect(await checkPlugin("relay-fixture-action", lock)).toMatchObject({ state: "ok" });
   });
 
+  it("installs, loads, and registers a versioned trigger", async () => {
+    const source = await fixture({ name: "relay-fixture-trigger", use: "fixture-trigger", kind: "trigger" });
+    const store = await mkdtemp(join(tmpdir(), "relay-plugin-trigger-"));
+    const { installPlugin, readPluginLock } = await import("../src/plugins/store.js");
+    const { loadPluginFromEntry, loadRelayPlugin } = await import("../src/plugins/loader.js");
+    await installPlugin({
+      reference: source,
+      directory: store,
+      validate: async (entry) => {
+        const loaded = await loadPluginFromEntry(entry);
+        return { kind: loaded.kind, use: loaded.use };
+      },
+    });
+    const loaded = await loadRelayPlugin("fixture-trigger", "/nowhere", await readPluginLock(store));
+    const registry = new RelayPluginRegistry().registerTrigger(loaded as TriggerPlugin);
+    expect(registry.parseTriggerConfig("fixture-trigger", {})).toEqual({});
+  });
+
   it("reports a plugin that is missing, altered, or never installed", async () => {
     const source = await fixture({ name: "relay-fixture-health", use: "fixture-health", kind: "action" });
     const store = await mkdtemp(join(tmpdir(), "relay-plugin-health-"));
@@ -158,8 +192,47 @@ describe("managed plugin store", () => {
 
   it("still loads a local module path without consulting the store", async () => {
     const project = await mkdtemp(join(tmpdir(), "relay-plugin-local-"));
-    await writeFile(join(project, "local.mjs"), `export default { kind: "action", use: "local-action", configSchema: { parse: (v) => v ?? {} } };`);
+    await writeFile(join(project, "local.mjs"), `export default { kind: "action", use: "local-action", execute: async () => ({ status: "succeeded" }), configSchema: { parse: (v) => v ?? {} } };`);
     const { loadRelayPlugin } = await import("../src/plugins/loader.js");
     await expect(loadRelayPlugin("./local.mjs", project, { version: 1, plugins: {} })).resolves.toMatchObject({ use: "local-action" });
+  });
+
+  it("loads and registers a local versioned trigger module", async () => {
+    const project = await mkdtemp(join(tmpdir(), "relay-plugin-local-trigger-"));
+    await writeFile(join(project, "trigger.mjs"), [
+      `export default {`,
+      `  kind: "trigger", use: "local-trigger", apiVersion: 1,`,
+      `  configSchema: { parse: (value) => value ?? {} },`,
+      `  payloadSchema: { parse: (value) => value },`,
+      `  cursorSchema: { parse: (value) => value },`,
+      `  async poll() { return { events: [] }; },`,
+      `};`,
+    ].join("\n"));
+    const { loadRelayPlugin } = await import("../src/plugins/loader.js");
+    const plugin = await loadRelayPlugin("./trigger.mjs", project, { version: 1, plugins: {} });
+    const registry = new RelayPluginRegistry().registerTrigger(plugin as TriggerPlugin);
+    expect(registry.trigger("local-trigger")).toBe(plugin);
+  });
+
+  it("scaffolds a versioned trigger package", async () => {
+    const root = await mkdtemp(join(tmpdir(), "relay-plugin-init-trigger-"));
+    const target = join(root, "plugin");
+    const output = new PassThrough();
+    const program = createRelayProgram({
+      cwd: () => root,
+      stdout: output as unknown as NodeJS.WriteStream,
+      stderr: output as unknown as NodeJS.WriteStream,
+    });
+    await program.parseAsync(["node", "relay", "plugin", "init", "@fixture/relay-trigger", "--kind", "trigger", "--dir", target]);
+    const manifest = JSON.parse(await readFile(join(target, "relay-plugin.json"), "utf8")) as { kind: string; use: string };
+    const source = await readFile(join(target, "src", "index.ts"), "utf8");
+    expect(manifest).toEqual({
+      name: "@fixture/relay-trigger", version: "0.1.0", kind: "trigger", use: "relay-trigger",
+      minRelayVersion: "0.1.0", description: "Task Relay trigger plugin", capabilities: [],
+    });
+    expect(source).toContain("PLUGIN_SDK_API_VERSION");
+    expect(source).toContain("payloadSchema");
+    expect(source).toContain("cursorSchema");
+    expect(source).toContain("async poll");
   });
 });

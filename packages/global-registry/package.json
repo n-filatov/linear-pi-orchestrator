@@ -1,0 +1,9 @@
+{
+  "name": "@task-relay/global-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "dependencies": { "@task-relay/domain": "file:../domain" },
+  "scripts": { "test": "vitest run --config ../../vitest.config.ts --root ../.. test/global-worker-registry.test.ts test/global-workflow-registry.test.ts", "check": "tsc --noEmit -p ../../tsconfig.json", "build": "npm run build --prefix ../.." }
+}

@@ -16,4 +16,5 @@ export * from "./state/global-worker-registry.js";
 export * from "./state/repository-identity.js";
 export * from "./cli/program.js";
 export * from "./app.js";
+export * from "./application/relay-module.js";
 export * from "./daemon.js";

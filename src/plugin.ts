@@ -2,10 +2,10 @@
  * The public Task Relay extension ABI.
  *
  * Plugin packages import from `task-relay/plugin`, never from `task-relay`
- * itself. This entry point deliberately exposes only the plugin contracts and
- * the domain types those contracts reference. It pulls in no dashboard, daemon,
- * state store, or CLI code, so a plugin author's `tsc` never has to resolve
- * Relay's own runtime dependencies.
+ * itself. This entry point exposes the plugin contracts and the domain types
+ * those contracts reference. It does not expose dashboard, daemon, state-store,
+ * or CLI APIs. `RelayPluginRegistry` remains as a deprecated compatibility
+ * export while external plugins migrate to the SDK contracts.
  *
  * Everything exported here is covered by Relay's semantic versioning promise:
  * a breaking change to these types requires a major release.
@@ -14,23 +14,35 @@ export type {
   ActionContext,
   ActionPlugin,
   ActionResult,
+  AnyActionPlugin,
+  ExplicitActionOutcome,
   HarnessLaunchRequest,
   HarnessPlugin,
   LaunchWorkerActionRequest,
   MaybePromise,
   PluginPresentation,
+  PluginJson,
+  PluginJsonObject,
+  PluginSdkApiVersion,
   PluginUse,
   RelayPlugin,
   ResolvedWorker,
   SourcePlugin,
   SourcePluginContext,
+  TriggerPlugin,
+  VersionedActionPlugin,
   WorkerActions,
   WorkerRef,
   WorkerTargetSelector,
 } from "./plugins/contracts.js";
 
-export { RelayPluginRegistry } from "./plugins/contracts.js";
-
+export { PLUGIN_SDK_API_VERSION, assertPluginJson, isVersionedActionPlugin, validatePluginContract } from "./plugins/contracts.js";
+/**
+ * @deprecated Import registry and loading utilities from `@task-relay/plugin-host`
+ * inside workspace code. Kept here for external plugin compatibility during the
+ * package extraction.
+ */
+export { RelayPluginRegistry } from "@task-relay/plugin-host";
 export type {
   AgentResolution,
   RepositoryScope,
