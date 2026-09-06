@@ -67,7 +67,30 @@ logging:
   level: info
   pretty: true
 workflows:
-  new-workflow:
+  linear-cleanup-on-done:
+    enabled: true
+    maxConcurrent: 1
+    on:
+      source: linear
+      match:
+        statusTypes:
+          - completed
+      fire:
+        policy: on-change
+    targets:
+      workers:
+        sourceItem: current
+        runs: active
+    timeoutMinutes: 60
+    jobs:
+      cleanup-workers:
+        use: cleanup
+        with:
+          activeWorker: stop
+          ownedTmuxOnly: true
+        continueOnError: false
+        enabled: true
+  start-session:
     enabled: true
     on:
       source: linear
@@ -124,28 +147,5 @@ workflows:
             status: succeeded
           - job: codex.start-session-2
             status: started
-        continueOnError: false
-        enabled: true
-  linear-cleanup-on-done:
-    enabled: true
-    maxConcurrent: 1
-    on:
-      source: linear
-      match:
-        statusTypes:
-          - completed
-      fire:
-        policy: on-change
-    targets:
-      workers:
-        sourceItem: current
-        runs: active
-    timeoutMinutes: 60
-    jobs:
-      cleanup-workers:
-        use: cleanup
-        with:
-          activeWorker: stop
-          ownedTmuxOnly: true
         continueOnError: false
         enabled: true

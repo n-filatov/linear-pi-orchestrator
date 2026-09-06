@@ -84,3 +84,5 @@ The following is the issue description as it was when this task was dispatched. 
 {{else}}
 *(no description provided)*
 {{/if}}
+
+Name current session based on ticket name
