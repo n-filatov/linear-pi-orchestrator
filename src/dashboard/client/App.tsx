@@ -1,356 +1,563 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ReactFlow, Background, Controls, MiniMap, ReactFlowProvider, Handle, Position, addEdge, reconnectEdge, useEdgesState, useNodesState, type Connection, type Edge, type NodeProps, type Viewport } from "@xyflow/react";
-import { MantineProvider, MultiSelect, Select } from "@mantine/core";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Alert,
+  AppShell,
+  Badge,
+  Burger,
+  Button,
+  Group,
+  MantineProvider,
+  Modal,
+  NavLink,
+  Select,
+  Stack,
+  Text,
+  Title,
+} from "@mantine/core";
+import { ReactFlowProvider } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "@mantine/core/styles.css";
 import "./canvas-overrides.css";
+import "./dashboard.css";
 import * as api from "./api";
-import type { ActionTestResult, ExecutionDetail, ExecutionInspection, Json, ProjectFolder, WatcherStatus, WorkflowSummary, Worker } from "./api";
-import { dashboardRoutePath, parseDashboardRoute, routeForPage, type DashboardPage, type DashboardRoute } from "./router";
-import { actionReferenceFor, actionReferenceValue, autoLayout, findDanglingActionReferences, findDanglingEdges, graphToWorkflow, setActionReference, syncActionReferenceEdge, upstreamReferenceNodes, wouldCycle, workflowToGraph, type GraphNode, type GraphNodeData } from "./graph";
+import type { ProjectFolder } from "./api";
+import {
+  dashboardRoutePath,
+  parseDashboardRoute,
+  routeForPage,
+  type DashboardPage,
+  type DashboardRoute,
+} from "./router";
+import { useResource } from "./resource";
+import { dashboardTheme } from "./theme";
+import {
+  formatTime,
+  repositoryName,
+  ResourceFeedback,
+} from "./components/shared";
+import { Overview } from "./pages/Overview";
+import { Repositories, RegisterDialog } from "./pages/Repositories";
+import Workflows from "./pages/Workflows";
+import { Executions } from "./pages/Executions";
 
-type Page = DashboardPage;
-const nav: { id: Page; label: string; icon: string }[] = [
-  { id: "home", label: "Home", icon: "⌂" }, { id: "repositories", label: "Repositories", icon: "▣" }, { id: "workflows", label: "Workflows", icon: "◇" },
-  { id: "executions", label: "Executions", icon: "≡" }, { id: "workers", label: "Workers", icon: "⚙" }, { id: "plugins", label: "Plugins", icon: "⬡" },
+const navigation: { page: DashboardPage; label: string; icon: string }[] = [
+  { page: "home", label: "Work", icon: "⌂" },
+  { page: "workflows", label: "Workflows", icon: "◇" },
+  { page: "repositories", label: "Repositories", icon: "▣" },
 ];
-const statusClass = (status?: string) => `status status-${String(status ?? "unknown").toLowerCase().replace(/[^a-z]/g, "-")}`;
-const time = (value?: string) => value ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 
-/** The intentionally small workflow vocabulary exposed by the canvas. */
-const CANVAS_ACTION_USES = ["tmux.create-window", "codex.start-session", "codex.send-prompt", "cleanup"] as const;
-const canvasActionUses = new Set<string>(CANVAS_ACTION_USES);
+const selectedRepositoryStorageKey = "task-relay:selected-repository";
 
-type CatalogEntry = { kind?: string; use?: string; schema?: Json; configSchema?: Json; matchSchema?: Json; presentation?: { name?: string; description?: string; category?: string }; health?: string; };
-
-/** Accept the current catalog contract as well as the old schemas map. */
-function catalogEntries(catalog: Json): CatalogEntry[] {
-  if (Array.isArray(catalog.entries)) return catalog.entries as CatalogEntry[];
-  const values = catalog.schemas && typeof catalog.schemas === "object" ? Object.values(catalog.schemas) : Object.values(catalog);
-  return values.filter((entry): entry is CatalogEntry => Boolean(entry && typeof entry === "object"));
+function readSelectedRepository(): string | undefined {
+  try {
+    return window.localStorage.getItem(selectedRepositoryStorageKey) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function entrySchema(entry?: CatalogEntry, kind?: string): Json | undefined { return kind === "source" ? (entry?.matchSchema ?? entry?.schema ?? entry?.configSchema) : (entry?.schema ?? entry?.configSchema); }
-
-function friendlyUseLabel(use: string): string {
-  const known: Record<string, string> = {
-    "tmux.create-window": "Start tmux window",
-    "codex.start-session": "Start Codex in tmux window",
-    "codex.send-prompt": "Send prompt to started Codex",
-    "cleanup": "Cleanup",
-  };
-  if (known[use]) return known[use];
-  return use.split(/[.:/_-]+/).filter(Boolean).map((part, index) => `${index === 0 ? part.charAt(0).toUpperCase() : part.charAt(0).toLowerCase()}${part.slice(1)}`).join(" ") || use;
+function persistSelectedRepository(projectId?: string) {
+  try {
+    if (projectId) window.localStorage.setItem(selectedRepositoryStorageKey, projectId);
+    else window.localStorage.removeItem(selectedRepositoryStorageKey);
+  } catch {
+    // Storage is a preference only; private-mode restrictions must not block work.
+  }
 }
 
-function entryLabel(entry: CatalogEntry): string {
-  return entry.presentation?.name && entry.presentation.name !== entry.use ? entry.presentation.name : friendlyUseLabel(entry.use ?? "action");
-}
-
-function TriggerNode({ data, selected }: NodeProps<GraphNode>) { return <div className={`flow-node trigger-node ${selected ? "selected" : ""}`}><Handle type="source" position={Position.Right} /><span className="node-kicker">TRIGGER</span><strong>{data.label}</strong><small>{data.use || "source"}</small></div>; }
-function ActionNode({ data, selected }: NodeProps<GraphNode>) { const title = data.use === "cleanup" ? "Cleans all workers for the current source item; no upstream dependency required." : undefined; return <div className={`flow-node action-node ${selected ? "selected" : ""}`} title={title}><Handle type="target" position={Position.Left} /><Handle type="source" position={Position.Right} /><span className="node-kicker">ACTION</span><strong>{data.label}</strong><small>{data.use}</small>{data.status && <span className={statusClass(data.status)}>{data.status}</span>}</div>; }
-const nodeTypes = { trigger: TriggerNode, action: ActionNode };
-
-function App() {
-  const [route, setRoute] = useState<DashboardRoute>(() => parseDashboardRoute(window.location.pathname, window.location.search));
-  const page = route.page;
-  const [projects, setProjects] = useState<ProjectFolder[]>([]);
-  const [project, setProject] = useState<ProjectFolder>();
-  const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
-  const [executions, setExecutions] = useState<any[]>([]);
-  const [workers, setWorkers] = useState<Worker[]>([]);
-  const [plugins, setPlugins] = useState<Json>({ installed: [], referenced: [] });
-  const [catalog, setCatalog] = useState<Json>({ schemas: {} });
-  const [config, setConfig] = useState<Json>({});
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [registerOpen, setRegisterOpen] = useState(false);
-  const navigate = useCallback((next: DashboardRoute, replace = false) => {
+function Dashboard() {
+  const [route, setRoute] = useState(() =>
+    parseDashboardRoute(window.location.pathname, window.location.search),
+  );
+  const [mobileOpened, setMobileOpened] = useState(false);
+  const [registerOpened, setRegisterOpened] = useState(false);
+  const [selectedRepository, setSelectedRepository] = useState(
+    readSelectedRepository,
+  );
+  const dirty = useRef(false);
+  const [operationBusy, setOperationBusy] = useState(false);
+  const [pendingRoute, setPendingRoute] = useState<DashboardRoute>();
+  // Legacy detail-only pages remain addressable in old browser history, but
+  // deliberately do not compete with the three daily work surfaces.
+  const page =
+    route.page === "workers" ||
+    route.page === "plugins" ||
+    route.page === "settings" ||
+    (route.page === "executions" && route.executionId)
+      ? "home"
+      : route.page;
+  const onDirtyChange = useCallback((value: boolean) => {
+    dirty.current = value;
+  }, []);
+  const folders = useResource("projects", api.getProjects, 10000);
+  const watchers = useResource("watchers", api.getWatcherStatuses, 5000);
+  // A successful supervisor snapshot lists active/known controllers. Absence
+  // means this supervisor is stopped; a failed initial request remains unknown.
+  const projects = (folders.data ?? []).map((project) => ({
+    ...project,
+    watcher: watchers.data
+      ? (watchers.data.find((status) => status.projectId === project.id) ?? {
+          projectId: project.id,
+          state: "stopped" as const,
+        })
+      : undefined,
+  }));
+  const project = projects.find((project) => project.id === route.projectId);
+  const requestedProject: ProjectFolder | undefined =
+    route.projectId && page !== "repositories"
+      ? (project ?? { id: route.projectId, root: "" })
+      : undefined;
+  const scopeKey = requestedProject?.id || "all";
+  const workflows = useResource(
+    `workflows:${page === "workflows" ? scopeKey : "inactive"}`,
+    () =>
+      page === "workflows"
+        ? api.getWorkflows(requestedProject)
+        : Promise.resolve([]),
+    10000,
+  );
+  const executions = useResource(
+    `executions:${scopeKey}`,
+    () => api.getExecutions(requestedProject),
+    5000,
+  );
+  const catalog = useResource(`catalog:${page === "workflows" ? scopeKey : "inactive"}`, () =>
+    page === "workflows" && requestedProject
+      ? api.getCatalog(requestedProject)
+      : Promise.resolve({}),
+  );
+  const config = useResource(
+    `config:${page === "workflows" ? scopeKey : "inactive"}`,
+    () =>
+      page === "workflows" && requestedProject
+        ? api.getConfig(requestedProject)
+        : Promise.resolve({ config: {} }),
+    10000,
+  );
+  const commitRoute = useCallback((next: DashboardRoute, replace = false) => {
     const path = dashboardRoutePath(next);
-    if (window.location.pathname !== path || window.location.search) {
+    if (`${window.location.pathname}${window.location.search}` !== path)
       window.history[replace ? "replaceState" : "pushState"]({}, "", path);
-    }
     setRoute(next);
+    setMobileOpened(false);
   }, []);
-  const navigatePage = useCallback((next: Page, detail?: string) => navigate(routeForPage(next, project?.id, detail)), [navigate, project?.id]);
-  useEffect(() => {
-    const onPopState = () => setRoute(parseDashboardRoute(window.location.pathname, window.location.search));
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-  const refresh = useCallback(async (next = project) => {
-    setLoading(true); setError("");
-    try {
-      const [folders, wfs, runs, ws, ps, cat, watcherStatuses] = await Promise.all([api.getProjects(), api.getWorkflows(next), api.getExecutions(next), api.getWorkers(next), api.getPlugins(next), api.getCatalog(next), api.getWatcherStatuses()]);
-      const watchers = new Map<string, WatcherStatus>(watcherStatuses.map((status) => [status.projectId, status]));
-      const projectsWithWatchers = folders.map((folder) => ({ ...folder, watcher: watchers.get(folder.id) ?? { projectId: folder.id, state: "stopped" as const } }));
-      setProjects(projectsWithWatchers);
-      if (!next) {
-        const routedProject = route.projectId ? projectsWithWatchers.find((entry) => entry.id === route.projectId) : undefined;
-        if (route.projectId && !routedProject) setError(`Repository '${route.projectId}' was not found.`);
-        else setProject(routedProject);
+  const navigate = useCallback(
+    (next: DashboardRoute, replace = false) => {
+      if (
+        operationBusy &&
+        (next.page !== "workflows" || next.projectId !== route.projectId)
+      )
+        return;
+      if (
+        dirty.current &&
+        (next.page !== "workflows" || next.projectId !== route.projectId)
+      ) {
+        setPendingRoute(next);
+        return;
       }
-      setWorkflows(wfs); setExecutions(runs); setWorkers(ws); setPlugins(ps); setCatalog(cat);
-      try { setConfig((await api.getConfig(next)).config); } catch { /* the global API may not expose config yet */ }
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setLoading(false); }
-  }, [project, route.projectId]);
-  useEffect(() => { void refresh(project); }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
+      commitRoute(next, replace);
+    },
+    [commitRoute, route, operationBusy],
+  );
+  const navigatePage = (page: DashboardPage) =>
+    navigate(
+      routeForPage(
+        page,
+        page === "repositories"
+          ? undefined
+          : route.projectId || selectedRepository,
+      ),
+    );
+  const selectRepository = (value: string | null) => {
+    const projectId = value && value !== "all" ? value : undefined;
+    setSelectedRepository(projectId);
+    persistSelectedRepository(projectId);
+    navigate(
+      routeForPage(page === "repositories" ? "home" : page, projectId),
+    );
+  };
   useEffect(() => {
-    if (!route.projectId) {
-      if (project) setProject(undefined);
+    if (!folders.data) return;
+    if (route.projectId) {
+      if (folders.data.some((folder) => folder.id === route.projectId)) {
+        if (selectedRepository !== route.projectId) {
+          setSelectedRepository(route.projectId);
+          persistSelectedRepository(route.projectId);
+        }
+      }
       return;
     }
-    if (!projects.length) return;
-    if (route.projectId) {
-      const selected = projects.find((entry) => entry.id === route.projectId);
-      if (selected?.id !== project?.id) setProject(selected);
+    if (!selectedRepository || page === "repositories") return;
+    if (folders.data.some((folder) => folder.id === selectedRepository)) {
+      navigate(routeForPage(page, selectedRepository), true);
+    } else {
+      setSelectedRepository(undefined);
+      persistSelectedRepository(undefined);
     }
-  }, [projects, route.projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [
+    folders.data,
+    navigate,
+    page,
+    route.projectId,
+    selectedRepository,
+  ]);
   useEffect(() => {
-    if (loading) return;
-    if (route.workflowId && !workflows.some((workflow) => workflow.id === route.workflowId)) {
-      setError(`Workflow '${route.workflowId}' was not found.`);
-    }
-  }, [loading, route.workflowId, workflows]);
-  useEffect(() => { const timer = window.setInterval(() => { void Promise.all([api.getExecutions(project).then(setExecutions), api.getWorkers(project).then(setWorkers)]); }, 5000); return () => window.clearInterval(timer); }, [project]);
-  const active = executions.filter((run) => ["running", "started", "launching", "claimed", "provisioning", "pending"].includes(run.status)).length;
-  return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><span className="brand-mark">◆</span><div><b>task relay</b><small>control plane</small></div></div>
-      <div className="workspace-label">WORKSPACE</div><select value={project?.id ?? ""} onChange={(event) => { const selected = projects.find((entry) => entry.id === event.target.value); setProject(selected); navigate(routeForPage(route.page, selected?.id)); }}><option value="">Current repository</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.displayName || entry.root || entry.id}</option>)}</select>
-      <nav>{nav.map((entry) => <button key={entry.id} className={page === entry.id ? "active" : ""} onClick={() => navigatePage(entry.id)}><span>{entry.icon}</span>{entry.label}{entry.id === "executions" && active > 0 && <em>{active}</em>}</button>)}</nav>
-      <div className="sidebar-footer"><span className="online-dot" /> daemon connected <button className="icon-button" title="Refresh" onClick={() => void refresh()}>↻</button></div>
-    </aside>
-    <main className="main"><header><div><div className="breadcrumb">TASK RELAY / {project?.displayName || project?.root || "CURRENT REPOSITORY"}</div><h1>{nav.find((entry) => entry.id === page)?.label}</h1></div><div className="header-actions"><button className="button ghost" onClick={() => void refresh()}>↻ Refresh</button><button className="button primary" onClick={() => setRegisterOpen(true)}>+ Add repository</button></div></header>
-      {error && <div className="alert error">{error}<button onClick={() => setError("")}>×</button></div>}
-      {loading && !workflows.length && !executions.length ? <div className="loading"><span className="spinner" /> Loading control plane…</div> : <>{page === "home" && <HomePage workflows={workflows} executions={executions} workers={workers} projects={projects} onNavigate={navigatePage} />}{page === "repositories" && <Repositories projects={projects} selected={project} onSelect={(p) => { setProject(p); navigate(routeForPage("home", p.id)); }} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); navigate(routeForPage(page, p.id)); setRegisterOpen(false); }} onRemoved={(id) => { setProjects((old) => old.filter((entry) => entry.id !== id)); if (project?.id === id) { setProject(undefined); navigate(routeForPage("home")); } }} onChanged={() => refresh(project)} />}{page === "workflows" && <Workflows workflows={workflows} config={config} catalog={catalog} project={project} selectedWorkflowId={route.workflowId} onSelectWorkflow={(id) => navigate(routeForPage("workflows", project?.id, id))} onSaved={(next) => { setConfig(next); void refresh(project); }} />}{page === "executions" && <Executions executions={executions} workflows={workflows} selectedExecutionId={route.executionId} onInspect={(id) => navigate(routeForPage("executions", project?.id, id))} onCloseDetail={() => navigate(routeForPage("executions", project?.id))} onRefresh={() => void refresh(project)} />}{page === "workers" && <Workers workers={workers} project={project} />}{page === "plugins" && <Plugins plugins={plugins} catalog={catalog} />} </>}
-    </main>{registerOpen && <RegisterDialog onClose={() => setRegisterOpen(false)} onAdded={(p) => { setProjects((old) => [...old, p]); setProject(p); setRegisterOpen(false); }} />}
-  </div>;
-}
-
-function HomePage({ workflows, executions, workers, projects, onNavigate }: { workflows: WorkflowSummary[]; executions: any[]; workers: Worker[]; projects: ProjectFolder[]; onNavigate: (p: Page) => void }) {
-  const failed = executions.filter((run) => run.status === "failed").length;
-  return <div className="page-stack"><section className="hero"><div><span className="eyebrow">GLOBAL CONTROL PLANE</span><h2>Good morning, orchestrator.</h2><p>One view of every workflow, worker and repository in your relay network.</p></div><button className="button primary" onClick={() => onNavigate("workflows")}>Open workflow canvas →</button></section><div className="metric-grid"><Metric label="Running" value={executions.filter((run) => ["running", "started"].includes(run.status)).length} tone="green" /><Metric label="Failed" value={failed} tone="red" /><Metric label="Workers" value={workers.length} tone="purple" /><Metric label="Repositories" value={projects.length} tone="blue" /></div><div className="two-column"><section className="panel"><PanelTitle title="Live executions" action="View all" onClick={() => onNavigate("executions")} />{executions.slice(0, 5).map((run, index) => <ExecutionRow key={run.id ?? index} run={run} />)}{!executions.length && <Empty text="No executions yet" />}</section><section className="panel"><PanelTitle title="Workflows" action="Manage" onClick={() => onNavigate("workflows")} />{workflows.slice(0, 5).map((workflow) => <div className="list-row" key={workflow.id}><div className="list-icon workflow-icon">◇</div><div className="row-main"><b>{workflow.id}</b><small>{workflow.source || workflow.on?.source || "No source"}</small></div><span className={workflow.enabled === false ? "muted" : "status status-succeeded"}>{workflow.enabled === false ? "paused" : "enabled"}</span></div>)}{!workflows.length && <Empty text="No workflows configured" />}</section></div></div>;
-}
-function Metric({ label, value, tone }: { label: string; value: number; tone: string }) { return <div className="metric"><span className={`metric-dot ${tone}`} /><div><b>{value}</b><small>{label}</small></div></div>; }
-function PanelTitle({ title, action, onClick }: { title: string; action?: string; onClick?: () => void }) { return <div className="panel-title"><h3>{title}</h3>{action && <button className="text-button" onClick={onClick}>{action} →</button>}</div>; }
-function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }
-function ExecutionRow({ run }: { run: any }) { return <div className="list-row"><div className={`list-icon ${run.status === "failed" ? "failed-icon" : "run-icon"}`}>{run.status === "failed" ? "!" : "↗"}</div><div className="row-main"><b>{run.item?.id || run.id || "Execution"}</b><small>{run.item?.title || run.workflowId || run.identity?.workflowId || "Workflow execution"}</small></div><span className={statusClass(run.status)}>{run.status || "unknown"}</span><time>{time(run.updatedAt || run.startedAt || run.claimedAt)}</time></div>; }
-
-function Repositories({ projects, selected, onSelect, onAdded, onRemoved, onChanged }: { projects: ProjectFolder[]; selected?: ProjectFolder; onSelect: (p: ProjectFolder) => void; onAdded: (p: ProjectFolder) => void; onRemoved: (id: string) => void; onChanged: () => Promise<void> }) {
-  const [pending, setPending] = useState<Record<string, "sync" | "start" | "stop">>({});
-  const control = async (event: React.MouseEvent, project: ProjectFolder, action: "sync" | "start" | "stop") => {
-    event.stopPropagation();
-    setPending((current) => ({ ...current, [project.id]: action }));
-    try {
-      const result = await api.controlProject(project, action);
-      await onChanged();
-      window.alert(result.status?.error || result.status?.state || `${action} complete`);
-    } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
-    finally { setPending((current) => { const next = { ...current }; delete next[project.id]; return next; }); }
+    const pop = () => {
+      const next = parseDashboardRoute(
+        window.location.pathname,
+        window.location.search,
+      );
+      if (operationBusy) {
+        window.history.pushState({}, "", dashboardRoutePath(route));
+        return;
+      }
+      if (
+        dirty.current &&
+        (next.page !== "workflows" || next.projectId !== route.projectId)
+      ) {
+        window.history.pushState({}, "", dashboardRoutePath(route));
+        setPendingRoute(next);
+      } else setRoute(next);
+    };
+    const unload = (event: BeforeUnloadEvent) => {
+      if (dirty.current) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    window.addEventListener("popstate", pop);
+    window.addEventListener("beforeunload", unload);
+    return () => {
+      window.removeEventListener("popstate", pop);
+      window.removeEventListener("beforeunload", unload);
+    };
+  }, [route, operationBusy]);
+  const refresh = async () => {
+    await Promise.allSettled([
+      folders.refresh(),
+      watchers.refresh(),
+      workflows.refresh(),
+      executions.refresh(),
+      catalog.refresh(),
+      config.refresh(),
+    ]);
   };
-  const remove = async (event: React.MouseEvent, entry: ProjectFolder) => {
-    event.stopPropagation();
-    if (!window.confirm(`Unregister '${entry.displayName || entry.root || entry.id}'? Files will not be deleted.`)) return;
-    try { await api.removeProject(entry); onRemoved(entry.id); } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
-  };
-  return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">PROJECT FOLDERS</span><p>Each folder keeps its YAML authoritative while the registry provides the global index.</p></div><button className="button primary" onClick={() => { const root = window.prompt("Repository folder path"); if (root) api.registerProject(root).then(onAdded).catch((e) => window.alert(e.message)); }}>+ Register folder</button></div><div className="repository-grid">{projects.map((entry) => {
-    const watcher = entry.watcher ?? { projectId: entry.id, state: "stopped" as const };
-    const pendingAction = pending[entry.id];
-    const watcherLabel = watcher.state === "running" ? "watching" : watcher.state;
-    return <div role="button" tabIndex={0} aria-busy={Boolean(pendingAction)} className={`repository-card ${selected?.id === entry.id ? "selected" : ""}`} key={entry.id} onClick={() => onSelect(entry)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(entry); }}><div className="repo-card-head"><span className="repo-icon">▣</span><span className="repo-card-statuses"><span className="status status-succeeded">{entry.enabled === false ? "disabled" : "connected"}</span><span className={`status status-${pendingAction ? "pending" : watcher.state}`} title={watcher.error}>{pendingAction ? `${pendingAction}…` : watcherLabel}</span></span></div><h3>{entry.displayName || entry.id}</h3><code>{entry.root || "Current working directory"}</code><div className="watcher-detail">{pendingAction ? <><span className="button-spinner" />{pendingAction === "start" ? "Starting watcher…" : pendingAction === "stop" ? "Stopping watcher…" : "Syncing project…"}</> : <>Watcher: {watcherLabel}{watcher.lastTickAt ? ` · last tick ${time(watcher.lastTickAt)}` : ""}{watcher.error ? ` · ${watcher.error}` : ""}</>}</div><div className="repo-meta"><span>{entry.configStatus || "configuration loaded"}</span><span className="repo-controls"><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "sync")}>{pendingAction === "sync" ? "Syncing…" : "Sync"}</button><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "start")}>{pendingAction === "start" ? "Starting…" : "Start"}</button><button disabled={Boolean(pendingAction)} onClick={(event) => void control(event, entry, "stop")}>{pendingAction === "stop" ? "Stopping…" : "Stop"}</button><button disabled={Boolean(pendingAction)} className="danger-link" onClick={(event) => void remove(event, entry)}>Remove</button></span></div></div>;
-  })}</div>{!projects.length && <Empty text="Register a repository folder to get started." />}<RegisterInline onAdded={onAdded} /></div>;
+  const resources = [
+    folders,
+    watchers,
+    workflows,
+    executions,
+    ...(route.projectId ? [catalog, config] : []),
+  ];
+  const errors = resources.filter((resource) => resource.error);
+  const successful = resources
+    .map((resource) => resource.refreshedAt)
+    .filter((value): value is number => Boolean(value));
+  const lastRefresh = successful.length ? Math.max(...successful) : undefined;
+  const scopeName =
+    page === "repositories"
+      ? "All repositories"
+      : project
+        ? repositoryName(project)
+        : route.projectId
+          ? route.projectId
+          : "All repositories";
+  const required =
+    page === "repositories"
+      ? ([
+          ["Repositories", folders],
+          ["Watcher status", watchers],
+          ["Executions", executions],
+        ] as const)
+      : page === "workflows"
+        ? ([
+            ["Workflows", workflows],
+            ["Configuration", config],
+            ["Plugin catalog", catalog],
+          ] as const)
+        : page === "executions"
+          ? ([["Executions", executions]] as const)
+          : ([["Executions", executions]] as const);
+  return (
+    <AppShell
+      header={{ height: 72 }}
+      navbar={{
+        width: 240,
+        breakpoint: "sm",
+        collapsed: { mobile: !mobileOpened },
+      }}
+      padding={{ base: "md", md: "xl" }}
+    >
+      <AppShell.Header>
+        <Group h="100%" px="md" justify="space-between" wrap="nowrap">
+          <Group gap="sm">
+            <Burger
+              opened={mobileOpened}
+              onClick={() => setMobileOpened((value) => !value)}
+              hiddenFrom="sm"
+              size="sm"
+              aria-label="Toggle navigation"
+            />
+            <div>
+              <Text size="xs" c="dimmed">
+                TASK RELAY / {scopeName}
+              </Text>
+              <Title order={3}>
+                {navigation.find((item) => item.page === page)?.label}
+              </Title>
+            </div>
+          </Group>
+          <Group gap="xs">
+            <Button
+              variant="default"
+              onClick={() => void refresh()}
+              loading={resources.some((resource) => resource.refreshing)}
+              aria-label="Refresh dashboard"
+            >
+              Refresh
+            </Button>
+          </Group>
+        </Group>
+      </AppShell.Header>
+      <AppShell.Navbar p="md">
+        <Stack h="100%" gap="lg">
+          <Group gap="sm">
+            <span className="brand-mark">◆</span>
+            <div>
+              <Text fw={650}>task relay</Text>
+              <Text size="xs" c="dimmed">
+                Developer control plane
+              </Text>
+            </div>
+          </Group>
+          <Select
+            label="Repository scope"
+            aria-label="Repository scope"
+            data={[
+              { value: "all", label: "All repositories" },
+              ...projects.map((project) => ({
+                value: project.id,
+                label: repositoryName(project),
+              })),
+            ]}
+            value={route.projectId || "all"}
+            onChange={selectRepository}
+            searchable
+            allowDeselect={false}
+            nothingFoundMessage="No repositories found"
+          />
+          <nav aria-label="Main navigation">
+            {navigation.map((item) => (
+              <NavLink
+                key={item.page}
+                active={page === item.page}
+                label={item.label}
+                leftSection={<span aria-hidden>{item.icon}</span>}
+                onClick={() => navigatePage(item.page)}
+              />
+            ))}
+          </nav>
+          <Stack gap="xs" mt="auto">
+            <Badge
+              color={errors.length ? "orange" : lastRefresh ? "teal" : "gray"}
+              variant="light"
+            >
+              {errors.length
+                ? "Connection degraded"
+                : lastRefresh
+                  ? "API responding"
+                  : "Connecting"}
+            </Badge>
+            <Text size="xs" c="dimmed">
+              Last successful response
+              <br />
+              {formatTime(lastRefresh)}
+            </Text>
+          </Stack>
+        </Stack>
+      </AppShell.Navbar>
+      <AppShell.Main>
+        <Stack gap="md">
+          <div className="mobile-scope">
+            <Text size="xs" c="dimmed">
+              Scope: {scopeName} · change scope in navigation
+            </Text>
+          </div>
+          {route.projectId && folders.data && !project && (
+            <Alert color="red" title="Repository not found">
+              Repository '{route.projectId}' is not registered. Select another
+              repository or All repositories.
+            </Alert>
+          )}
+          {errors.some(
+            (resource) =>
+              resource.error instanceof api.ApiError &&
+              resource.error.status === 401,
+          ) && (
+            <Alert color="red" title="Session expired" role="alert">
+              The dashboard rejected authentication. Reopen the dashboard using
+              its authenticated URL, then refresh.
+            </Alert>
+          )}
+          {required.map(([name, resource]) => (
+            <ResourceFeedback key={name} name={name} resource={resource} />
+          ))}
+          {page === "home" && executions.data && (
+            <>
+              <Overview
+                executions={executions.data}
+                projects={projects}
+                scope={project}
+                onExecution={(id) =>
+                  navigate(routeForPage("executions", route.projectId, id))
+                }
+                onWorkflows={() => navigatePage("workflows")}
+              />
+              {route.page === "executions" && route.executionId && (
+                <Executions
+                  minimal
+                  executions={executions.data}
+                  workflows={workflows.data ?? []}
+                  projects={projects}
+                  route={route}
+                  onRoute={navigate}
+                  onRefresh={() => void executions.refresh()}
+                />
+              )}
+            </>
+          )}
+          {page === "repositories" && folders.data && (
+            <Repositories
+              projects={projects}
+              executions={executions.data ?? []}
+              onSelect={(project) => navigate(routeForPage("home", project.id))}
+              onAdd={() => setRegisterOpened(true)}
+              onRefresh={refresh}
+              onRemoved={(id) => {
+                if (route.projectId === id)
+                  navigate(routeForPage("repositories"));
+              }}
+            />
+          )}
+          {page === "workflows" &&
+            (route.projectId ? (
+              project &&
+              workflows.data &&
+              config.data &&
+              catalog.data && (
+                <Workflows
+                  key={project.id}
+                  workflows={workflows.data}
+                  config={config.data.config}
+                  catalog={catalog.data}
+                  project={project}
+                  selectedWorkflowId={route.workflowId}
+                  onSelectWorkflow={(id) =>
+                    navigate(routeForPage("workflows", project.id, id))
+                  }
+                  onSaved={() => {
+                    void config.refresh();
+                    void workflows.refresh();
+                  }}
+                  onDirtyChange={onDirtyChange}
+                  onBusyChange={setOperationBusy}
+                />
+              )
+            ) : (
+              <Stack>
+                <Alert title="Choose a repository to author workflows">
+                  Workflow edits must target a named repository. Select one in
+                  Repository scope.
+                </Alert>
+                {(workflows.data ?? []).map((workflow: any) => (
+                  <Button
+                    key={`${workflow.projectFolderId}:${workflow.id}`}
+                    variant="default"
+                    onClick={() =>
+                      navigate(
+                        routeForPage(
+                          "workflows",
+                          workflow.projectFolderId || workflow.projectId,
+                          workflow.id,
+                        ),
+                      )
+                    }
+                  >
+                    {workflow.id} ·{" "}
+                    {projects.find(
+                      (project) =>
+                        project.id ===
+                        (workflow.projectFolderId || workflow.projectId),
+                    )?.displayName ||
+                      workflow.projectFolderId ||
+                      workflow.projectId ||
+                      "Repository not recorded"}
+                  </Button>
+                ))}
+              </Stack>
+            ))}
+          {page === "executions" && executions.data && (
+            <Executions
+              executions={executions.data}
+              workflows={workflows.data ?? []}
+              projects={projects}
+              route={route}
+              onRoute={navigate}
+              onRefresh={() => void executions.refresh()}
+            />
+          )}
+        </Stack>
+      </AppShell.Main>
+      <RegisterDialog
+        opened={registerOpened}
+        onClose={() => setRegisterOpened(false)}
+        onAdded={async (project) => {
+          await folders.refresh();
+          setSelectedRepository(project.id);
+          persistSelectedRepository(project.id);
+          navigate(routeForPage("home", project.id));
+        }}
+      />
+      <Modal
+        opened={Boolean(pendingRoute)}
+        onClose={() => setPendingRoute(undefined)}
+        title="Unsaved workflow changes"
+      >
+        <Stack>
+          <Text size="sm">
+            Leave this workflow and discard its unsaved changes?
+          </Text>
+          <Group justify="flex-end">
+            <Button
+              variant="default"
+              onClick={() => setPendingRoute(undefined)}
+            >
+              Keep editing
+            </Button>
+            <Button
+              color="red"
+              onClick={() => {
+                const next = pendingRoute;
+                dirty.current = false;
+                setPendingRoute(undefined);
+                if (next) commitRoute(next);
+              }}
+            >
+              Discard and leave
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+    </AppShell>
+  );
 }
-function RegisterInline({ onAdded }: { onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="register-inline"><input placeholder="/path/to/repository" value={value} onChange={(e) => setValue(e.target.value)} /><button className="button ghost" disabled={!value} onClick={() => api.registerProject(value).then((p) => { setValue(""); onAdded(p); }).catch((e) => window.alert(e.message))}>Register path</button></div>; }
-function RegisterDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (p: ProjectFolder) => void }) { const [value, setValue] = useState(""); return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><h2>Add repository</h2><button className="icon-button" onClick={onClose}>×</button></div><p>Register a local Git folder with the global control plane.</p><input autoFocus placeholder="/Users/me/Development/project" value={value} onChange={(e) => setValue(e.target.value)} /><div className="modal-actions"><button className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" disabled={!value.trim()} onClick={() => api.registerProject(value.trim()).then(onAdded).catch((e) => window.alert(e.message))}>Register folder</button></div></div></div>; }
 
-function Workflows({ workflows, config, catalog, project, selectedWorkflowId, onSelectWorkflow, onSaved }: { workflows: WorkflowSummary[]; config: Json; catalog: Json; project?: ProjectFolder; selectedWorkflowId?: string; onSelectWorkflow: (id?: string) => void; onSaved: (config: Json) => void }) {
-  const [selected, setSelected] = useState(selectedWorkflowId ?? workflows[0]?.id ?? "");
-  const [draft, setDraft] = useState<WorkflowSummary>();
-  useEffect(() => {
-    if (selectedWorkflowId) {
-      if (selectedWorkflowId !== selected) setSelected(selectedWorkflowId);
-      if (!workflows.some((workflow) => workflow.id === selectedWorkflowId) && draft?.id !== selectedWorkflowId) return;
-    }
-    if (selected && (workflows.some((workflow) => workflow.id === selected) || draft?.id === selected)) return;
-    setSelected(workflows[0]?.id ?? "");
-  }, [workflows, selected, draft, selectedWorkflowId]);
-  const create = () => {
-    if (!project) return window.alert("Register and select a repository first.");
-    const id = window.prompt("Workflow id", "cleanup-on-done")?.trim();
-    if (!id) return;
-    if (!/^[a-zA-Z0-9._:-]+$/.test(id) || workflows.some((workflow) => workflow.id === id)) return window.alert("Use a unique workflow id containing letters, numbers, '.', '_', ':' or '-'.");
-    const source = Object.keys(config.sources ?? {})[0];
-    if (!source) return window.alert("Configure a source before creating a workflow.");
-    // New workflows are terminal-cleanup workflows by default: a Done item is
-    // scoped to its own repository/source/item and cleans every Relay-owned
-    // tmux worker plus its worktree. The canvas remains fully editable.
-    const next: WorkflowSummary = { id, enabled: true, on: { source, match: { statusTypes: ["completed"] }, fire: { policy: "once-per-match" } }, source, targets: { workers: { sourceItem: "current", runs: "all" } }, jobs: { cleanup: { use: "cleanup", with: { activeWorker: "stop", ownedTmuxOnly: true } } }, timeoutMinutes: 1440 };
-    setDraft(next); setSelected(id); onSelectWorkflow(id);
-  };
-  const summary = workflows.find((workflow) => workflow.id === selected) ?? (draft?.id === selected ? draft : undefined);
-  const current = summary ? { ...summary, ...(config.workflows?.[selected] ?? {}), id: selected } as WorkflowSummary : undefined;
-  return <div className="workflow-layout"><aside className="workflow-list"><div className="list-head"><h3>Workflows</h3><button className="icon-button" title="New workflow" onClick={create}>＋</button></div>{workflows.map((workflow) => <button key={workflow.id} className={workflow.id === selected ? "workflow-item selected" : "workflow-item"} onClick={() => { setDraft(undefined); setSelected(workflow.id); onSelectWorkflow(workflow.id); }}><span className="workflow-status" /><span><b>{workflow.id}</b><small>{Object.keys(workflow.jobs ?? {}).length} jobs · {workflow.enabled === false ? "paused" : "active"}</small></span></button>)}{draft && !workflows.some((workflow) => workflow.id === draft.id) && <button className="workflow-item selected"><span className="workflow-status" /><span><b>{draft.id}</b><small>unsaved draft</small></span></button>}{!workflows.length && !draft && <Empty text="No workflows" />}</aside>{current ? <WorkflowEditor key={current.id} workflow={current} config={config} catalog={catalog} project={project} onSaved={(next) => { setDraft(undefined); onSaved(next); }} /> : <div className="editor-empty"><div className="empty-graphic">◇</div><h2>Select a workflow</h2><p>Create or select a workflow to open the canvas.</p><button className="button primary" onClick={create}>Create workflow</button></div>}</div>;
+export default function App() {
+  return (
+    <MantineProvider theme={dashboardTheme} defaultColorScheme="dark">
+      <ReactFlowProvider>
+        <Dashboard />
+      </ReactFlowProvider>
+    </MantineProvider>
+  );
 }
-
-function WorkflowEditor({ workflow, config, catalog, project, onSaved }: { workflow: WorkflowSummary; config: Json; catalog: Json; project?: ProjectFolder; onSaved: (config: Json) => void }) {
-  const schemas: Record<string, any> = useMemo(() => {
-    const values: Record<string, any> = {};
-    for (const entry of catalogEntries(catalog)) {
-      if (!entry.use || !entry.kind) continue;
-      const value = { ...entry, schema: entrySchema(entry, entry.kind) };
-      values[`${entry.kind}:${entry.use}`] = value;
-      // Existing dashboard code addresses action/source schemas by short use.
-      if (!(entry.use in values) || entry.kind === "action") values[entry.use] = value;
-    }
-    // Keep the editor usable while an older server is still warming its
-    // catalog endpoint; these built-ins are valid Relay action identifiers.
-    for (const use of CANVAS_ACTION_USES) {
-      if (!values[`action:${use}`] && !values[use]) values[`action:${use}`] = { use, kind: "action", schema: { type: "object", properties: {} }, presentation: { name: friendlyUseLabel(use) } };
-    }
-    for (const [sourceId, source] of Object.entries(config.sources ?? {}) as Array<[string, any]>) {
-      const plugin = values[`source:${source.use}`] ?? values[source.use];
-      values[`source:${sourceId}`] = { ...(plugin ?? { kind: "source", schema: { type: "object", properties: {} } }), kind: "source", use: sourceId, configured: true, schema: entrySchema(plugin, "source") ?? { type: "object", properties: {} }, presentation: { ...(plugin?.presentation ?? {}), name: sourceId, description: `Configured ${source.use} source` } };
-    }
-    return values;
-  }, [catalog, config.sources]);
-  const initial = useMemo(() => workflowToGraph(workflow, schemas), [workflow, schemas]);
-  const [nodes, setNodes, onNodesChange] = useNodesState<GraphNode>(initial.nodes); const [edges, setEdges, onEdgesChange] = useEdgesState(initial.edges); const [viewport, setViewport] = useState<Viewport>({ x: 0, y: 0, zoom: 1 }); const [loadedMtime, setLoadedMtime] = useState(0);
-  const [selectedNode, setSelectedNode] = useState<GraphNode>(); const [paletteOpen, setPaletteOpen] = useState(false); const [rawOpen, setRawOpen] = useState(false); const [raw, setRaw] = useState(""); const [message, setMessage] = useState(""); const [actionTest, setActionTest] = useState<ActionTestResult>(); const [testingAction, setTestingAction] = useState(false); const [promptFiles, setPromptFiles] = useState<string[]>([]);
-  const history = useRef<{ nodes: GraphNode[]; edges: Edge[] }[]>([]); const future = useRef<{ nodes: GraphNode[]; edges: Edge[] }[]>([]); const dragSnapshot = useRef<{ nodes: GraphNode[]; edges: Edge[] } | undefined>(undefined); const snapshot = () => ({ nodes: structuredClone(nodes), edges: structuredClone(edges) });
-  useEffect(() => { void api.getLayout(workflow.id, project).then((layout) => { const saved = layout?.nodes && !Array.isArray(layout.nodes) ? Object.entries(layout.nodes).map(([id, position]) => ({ id, ...(position as object) })) : (layout?.nodes ?? layout); if (layout?.viewport) setViewport(layout.viewport as Viewport); if (!Array.isArray(saved)) return; setNodes((current) => current.map((node) => { const position = saved.find((item: any) => item.id === node.id); return position ? { ...node, position: { x: position.x ?? node.position.x, y: position.y ?? node.position.y } } : node; })); }); void api.getConfigMtime(project).then(setLoadedMtime); void api.getPrompts(project).then((library) => setPromptFiles(library.prompts)); }, [workflow.id, project]);
-  const commit = (nextNodes: GraphNode[], nextEdges: Edge[]) => { history.current.push(snapshot()); future.current = []; setNodes(nextNodes); setEdges(nextEdges); };
-  const connect = useCallback((connection: Connection) => { if (!connection.source || !connection.target || wouldCycle(edges, connection.source, connection.target)) { setMessage("That connection would create a cycle."); return; } commit(nodes, addEdge({ ...connection, type: "smoothstep", label: "then" }, edges)); }, [nodes, edges]);
-  const reconnect = useCallback((oldEdge: Edge, connection: Connection) => { if (!connection.source || !connection.target || wouldCycle(edges.filter((edge) => edge.id !== oldEdge.id), connection.source, connection.target)) { setMessage("That reconnection would create a cycle."); return; } commit(nodes, reconnectEdge(oldEdge, connection, edges)); }, [nodes, edges]);
-  const editEdge = useCallback((_: unknown, edge: Edge) => { const condition = window.prompt("Dependency condition: succeeded, failed, started, or skipped", String(edge.label || "succeeded"))?.trim().toLowerCase(); if (!condition) return; if (!["succeeded", "failed", "started", "skipped"].includes(condition)) { setMessage("Unknown dependency condition."); return; } commit(nodes, edges.map((entry) => entry.id === edge.id ? { ...entry, label: condition } : entry)); }, [nodes, edges]);
-  const selectNode = useCallback((_: any, node: GraphNode) => { setSelectedNode(node); setActionTest(undefined); setPaletteOpen(false); }, []);
-  const updateNode = (data: Partial<GraphNodeData>) => { if (!selectedNode) return; const next = nodes.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, ...data } } : node); history.current.push(snapshot()); future.current = []; setNodes(next); setSelectedNode(next.find((node) => node.id === selectedNode.id)); };
-  const updateActionReference = (path: string, actionId?: string) => {
-    if (!selectedNode || selectedNode.data.kind !== "action") return;
-    const reference = actionReferenceFor(selectedNode.data.use);
-    const previousActionId = reference ? actionReferenceValue(selectedNode.data.config, path, reference.value) : undefined;
-    const config = setActionReference(selectedNode.data.config ?? {}, path, actionId, reference?.value);
-    const nextNodes = nodes.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, config } } : node);
-    const nextEdges = syncActionReferenceEdge(edges, selectedNode.id, path, typeof previousActionId === "string" ? previousActionId : undefined, actionId);
-    history.current.push(snapshot()); future.current = []; setNodes(nextNodes); setEdges(nextEdges); setSelectedNode(nextNodes.find((node) => node.id === selectedNode.id));
-  };
-  const changeActionUse = (nextUse: string) => {
-    if (!selectedNode) return;
-    const previousReference = actionReferenceFor(selectedNode.data.use);
-    let nextEdges = edges;
-    if (previousReference) {
-      const previousActionId = actionReferenceValue(selectedNode.data.config, previousReference.path, previousReference.value);
-      nextEdges = syncActionReferenceEdge(nextEdges, selectedNode.id, previousReference.path, typeof previousActionId === "string" ? previousActionId : undefined, undefined);
-    }
-    const nextSchema = schemas[`action:${nextUse}`] ?? schemas[nextUse];
-    const nextNodes = nodes.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, use: nextUse, schema: entrySchema(nextSchema), config: { use: nextUse, with: {} } } } : node);
-    history.current.push(snapshot()); future.current = []; setNodes(nextNodes); setEdges(nextEdges); setSelectedNode(nextNodes.find((node) => node.id === selectedNode.id));
-  };
-  const undo = () => { const previous = history.current.pop(); if (!previous) return; future.current.push(snapshot()); setNodes(previous.nodes); setEdges(previous.edges); setSelectedNode(undefined); }; const redo = () => { const next = future.current.pop(); if (!next) return; history.current.push(snapshot()); setNodes(next.nodes); setEdges(next.edges); };
-  const addAction = (use: string) => { const id = `${use.split(/[/:]/).pop() || "action"}-${nodes.filter((n) => n.data.kind === "action").length + 1}`; const node: GraphNode = { id, type: "action", position: { x: 400, y: 200 + nodes.length * 20 }, data: { label: id, use, kind: "action", config: { use, with: {} }, schema: (schemas[`action:${use}`] ?? schemas[use])?.schema } }; commit([...nodes, node], edges); setSelectedNode(node); setPaletteOpen(false); };
-  const deleteNode = () => { if (!selectedNode || selectedNode.data.kind === "trigger") return; const deletedId = selectedNode.id; const nextNodes = nodes.filter((node) => node.id !== deletedId).map((node) => { const reference = node.data.kind === "action" ? actionReferenceFor(node.data.use) : undefined; return reference && actionReferenceValue(node.data.config, reference.path, reference.value) === deletedId ? { ...node, data: { ...node.data, config: setActionReference(node.data.config, reference.path, undefined, reference.value) } } : node; }); commit(nextNodes, edges.filter((edge) => edge.source !== deletedId && edge.target !== deletedId)); setSelectedNode(undefined); };
-  const danglingEdges = findDanglingEdges(nodes, edges);
-  const danglingReferences = findDanglingActionReferences(nodes);
-  const danglingMessage = () => { const edge = danglingEdges[0]; if (edge) return `Cannot continue: dependency points to missing node '${!nodes.some((node) => node.id === edge.source) ? edge.source : edge.target}'. Reconnect or delete the dangling edge.`; const reference = danglingReferences[0]; return reference ? `Cannot continue: action '${reference.nodeId}' references missing or incompatible action '${reference.actionId}'. Select a valid upstream action or clear the reference.` : undefined; };
-  const save = async () => { try { const dangling = danglingMessage(); if (dangling) { setMessage(dangling); return; } const currentMtime = await api.getConfigMtime(project); if (loadedMtime && currentMtime && currentMtime !== loadedMtime) { setMessage("Configuration changed on disk. Reload before saving to avoid overwriting YAML."); return; } const nextWorkflow = graphToWorkflow({ nodes, edges }, workflow); const next = { ...config, workflows: { ...(config.workflows ?? {}), [workflow.id]: nextWorkflow } }; const isNew = !Object.prototype.hasOwnProperty.call(config.workflows ?? {}, workflow.id); try { const result = isNew ? await api.createWorkflow(workflow.id, nextWorkflow as Json, project) : await api.saveWorkflow(workflow.id, nextWorkflow as Json, project, workflow.revision); if (result?.workflow?.revision) nextWorkflow.revision = result.workflow.revision; } catch (error) { if (!(error instanceof api.ApiError) || ![404, 501].includes(error.status)) throw error; await api.saveConfig(next, project); } await api.saveLayout(workflow.id, { nodes: nodes.map((node) => ({ id: node.id, x: node.position.x, y: node.position.y })), viewport }, project).catch(() => undefined); onSaved(next); setLoadedMtime(await api.getConfigMtime(project) || currentMtime); setMessage("Saved to YAML"); } catch (e) { setMessage(`Save failed: ${e instanceof Error ? e.message : String(e)}`); } };
-  const test = async () => { try { const dangling = danglingMessage(); if (dangling) { setMessage(dangling); return; } const result = await api.testWorkflow(workflow.id, project); setMessage(result.output ? String(result.output) : "Dry run complete"); } catch (e) { setMessage(`Test failed: ${e instanceof Error ? e.message : String(e)}`); } };
-  const testSelectedAction = async () => {
-    if (!selectedNode || selectedNode.data.kind !== "action") return;
-    const dangling = danglingMessage();
-    if (dangling) { setMessage(dangling); return; }
-    setTestingAction(true); setActionTest(undefined); setMessage("");
-    try {
-      const draftWorkflow = graphToWorkflow({ nodes, edges }, workflow);
-      const result = await api.testAction(workflow.id, selectedNode.id, project, { workflow: draftWorkflow as Json, action: { id: selectedNode.id, use: selectedNode.data.use, ...selectedNode.data.config } });
-      setActionTest(result);
-    } catch (e) {
-      setMessage(`Action test failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally { setTestingAction(false); }
-  };
-  const duplicate = async () => { const id = window.prompt("Duplicate workflow as", `${workflow.id}-copy`)?.trim(); if (!id || !project) return; if (!/^[a-zA-Z0-9._:-]+$/.test(id)) { setMessage("Use a valid workflow id."); return; } try { const value = graphToWorkflow({ nodes, edges }, { ...workflow, id }); try { await api.createWorkflow(id, value as Json, project); } catch (error) { if (!(error instanceof api.ApiError) || ![404, 501].includes(error.status)) throw error; await api.saveConfig({ ...config, workflows: { ...(config.workflows ?? {}), [id]: value } }, project); } const next = { ...config, workflows: { ...(config.workflows ?? {}), [id]: value } }; onSaved(next); } catch (error) { setMessage(`Duplicate failed: ${error instanceof Error ? error.message : String(error)}`); } };
-  const rename = async () => { const id = window.prompt("Rename workflow", workflow.id)?.trim(); if (!id || id === workflow.id || !project) return; if (!/^[a-zA-Z0-9._:-]+$/.test(id)) { setMessage("Use a valid workflow id."); return; } try { const workflows = { ...(config.workflows ?? {}) }; workflows[id] = workflows[workflow.id] ?? graphToWorkflow({ nodes, edges }, workflow); delete workflows[workflow.id]; try { await api.renameWorkflow(workflow.id, id, project, workflow.revision); } catch (error) { if (!(error instanceof api.ApiError) || ![404, 501].includes(error.status)) throw error; await api.saveConfig({ ...config, workflows }, project); } onSaved({ ...config, workflows }); } catch (error) { setMessage(`Rename failed: ${error instanceof Error ? error.message : String(error)}`); } };
-  const remove = async () => { if (!project || !window.confirm(`Delete workflow '${workflow.id}'?`)) return; try { const workflows = { ...(config.workflows ?? {}) }; delete workflows[workflow.id]; try { await api.deleteWorkflow(workflow.id, project, workflow.revision); } catch (error) { if (!(error instanceof api.ApiError) || ![404, 501].includes(error.status)) throw error; await api.saveConfig({ ...config, workflows }, project); } onSaved({ ...config, workflows }); } catch (error) { setMessage(`Delete failed: ${error instanceof Error ? error.message : String(error)}`); } };
-  const onNodesDelete = (deleted: GraphNode[]) => { const ids = new Set(deleted.map((node) => node.id)); const nextNodes = nodes.filter((node) => !ids.has(node.id)).map((node) => { const reference = node.data.kind === "action" ? actionReferenceFor(node.data.use) : undefined; const actionId = reference ? actionReferenceValue(node.data.config, reference.path, reference.value) : undefined; return reference && actionId && ids.has(actionId) ? { ...node, data: { ...node.data, config: setActionReference(node.data.config, reference.path, undefined, reference.value) } } : node; }); const nextEdges = edges.filter((edge) => !ids.has(edge.source) && !ids.has(edge.target)); commit(nextNodes, nextEdges); if (selectedNode && ids.has(selectedNode.id)) setSelectedNode(undefined); };
-  const onNodeDragStart = () => { dragSnapshot.current = snapshot(); };
-  const onNodeDragStop = () => { if (dragSnapshot.current) { history.current.push(dragSnapshot.current); future.current = []; dragSnapshot.current = undefined; } };
-  return <section className="editor"><div className="editor-toolbar"><div><h2>{workflow.id}</h2><span className="muted">{workflow.enabled === false ? "Paused" : "Enabled"} · {nodes.length - 1} actions</span></div><div className="toolbar-actions"><button className="button ghost" onClick={undo} disabled={!history.current.length}>↶</button><button className="button ghost" onClick={redo} disabled={!future.current.length}>↷</button><button className="button ghost" onClick={() => { const next = autoLayout(nodes, edges); commit(next, edges); }}>Auto-layout</button><button className="button ghost" onClick={duplicate}>Duplicate</button><button className="button ghost" onClick={rename}>Rename</button><button className="button ghost" onClick={remove}>Delete</button><button className="button ghost" onClick={test}>Test</button><button className="button primary" onClick={save}>Save workflow</button></div></div>{message && <div className="editor-message">{message}<button onClick={() => setMessage("")}>×</button></div>}<div className="canvas-wrap"><ReactFlowProvider><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onNodesDelete={onNodesDelete} onNodeDragStart={onNodeDragStart} onNodeDragStop={onNodeDragStop} onEdgesChange={onEdgesChange} onConnect={connect} onReconnect={reconnect} onEdgeDoubleClick={editEdge} onMoveEnd={(_, nextViewport) => setViewport(nextViewport)} onNodeClick={selectNode} fitView proOptions={{ hideAttribution: true }}><Background color="#273244" gap={24} /><Controls /><MiniMap nodeColor={(node) => node.type === "trigger" ? "#8b5cf6" : "#239b8d"} /></ReactFlow></ReactFlowProvider><button className="add-node-button" onClick={() => setPaletteOpen((open) => !open)}>＋ Add node</button>{paletteOpen && <NodePalette schemas={schemas} onAdd={addAction} />}</div>{selectedNode && <PropertyPanel node={selectedNode} nodes={nodes} edges={edges} schemas={schemas} promptFiles={promptFiles} project={project} onChange={updateNode} onActionReferenceChange={updateActionReference} onActionUseChange={changeActionUse} onDelete={deleteNode} onClose={() => setSelectedNode(undefined)} onRaw={() => { setRaw(JSON.stringify(selectedNode.data.config ?? {}, null, 2)); setRawOpen(true); }} onTestAction={testSelectedAction} testingAction={testingAction} actionTest={actionTest} />}{rawOpen && <RawDialog value={raw} onChange={setRaw} onClose={() => setRawOpen(false)} onApply={() => { try { updateNode({ config: JSON.parse(raw) }); setRawOpen(false); setMessage("Node configuration updated"); } catch { setMessage("Invalid JSON configuration"); } }} />}</section>;
-}
-
-function NodePalette({ schemas, onAdd }: { schemas: Record<string, any>; onAdd: (use: string) => void }) {
-  const entries = CANVAS_ACTION_USES.flatMap((use) => {
-    const entry = schemas[`action:${use}`] ?? schemas[use];
-    return entry?.kind === "action" ? [entry as CatalogEntry] : [];
-  });
-  return <div className="node-palette"><span className="eyebrow">NODE CATALOG</span>{entries.length ? entries.map((entry) => <button key={entry.use} title={entry.presentation?.description} onClick={() => onAdd(entry.use!)}><span className="palette-dot" />{entryLabel(entry)}<small>{entry.health || entry.presentation?.category || "action"}</small></button>) : <small className="palette-empty">No actions available in the catalog.</small>}</div>;
-}
-
-function PropertyPanel({ node, nodes, edges, schemas, promptFiles, project, onChange, onActionReferenceChange, onActionUseChange, onDelete, onClose, onRaw, onTestAction, testingAction, actionTest }: { node: GraphNode; nodes: GraphNode[]; edges: Edge[]; schemas: Record<string, any>; promptFiles: string[]; project?: ProjectFolder; onChange: (data: Partial<GraphNodeData>) => void; onActionReferenceChange: (path: string, actionId?: string) => void; onActionUseChange: (use: string) => void; onDelete: () => void; onClose: () => void; onRaw: () => void; onTestAction: () => void; testingAction: boolean; actionTest?: ActionTestResult }) {
-  const key = `${node.data.kind === "trigger" ? "source" : "action"}:${node.data.use}`;
-  const schema = node.data.schema ?? entrySchema(schemas[key] ?? schemas[node.data.use], node.data.kind === "trigger" ? "source" : "action");
-  const properties = schema?.properties ?? {};
-  const config = node.data.config ?? {};
-  const kind = node.data.kind === "trigger" ? "source" : "action";
-  const entries = Object.values(schemas).filter((entry: CatalogEntry, index, all) => entry.kind === kind
-    && (kind !== "action" || canvasActionUses.has(entry.use ?? "") || entry.use === node.data.use)
-    && (kind !== "source" || (entry as CatalogEntry & { configured?: boolean }).configured)
-    && Boolean(entry.use)
-    && all.findIndex((candidate: CatalogEntry) => candidate.kind === kind && (kind !== "source" || (candidate as CatalogEntry & { configured?: boolean }).configured) && candidate.use === entry.use) === index);
-  const fieldValue = (name: string) => node.data.kind === "trigger" ? config[name] : (config.with ?? config)[name];
-  const setField = (name: string, value: any) => { const current = node.data.kind === "trigger" ? config : (config.with ?? {}); const next = { ...current, [name]: value }; if (name === "prompt" && value) delete next.promptFile; if (name === "promptFile" && value) delete next.prompt; onChange({ config: node.data.kind === "trigger" ? next : { ...config, with: next } }); };
-  const setActionField = (name: string, value: any) => onChange({ config: { ...config, [name]: value } });
-  const reference = node.data.kind === "action" ? actionReferenceFor(node.data.use) : undefined;
-  const selectedReference = reference ? actionReferenceValue(config, reference.path, reference.value) : undefined;
-  const referenceCandidates = reference ? upstreamReferenceNodes(nodes, edges, node.id, [reference.upstreamUse, ...(reference.alternateUpstreamUses ?? [])]) : [];
-  const currentReferenceNode = selectedReference ? nodes.find((candidate) => candidate.id === selectedReference) : undefined;
-  const referenceOptions = currentReferenceNode && !referenceCandidates.some((candidate) => candidate.id === currentReferenceNode.id) ? [...referenceCandidates, currentReferenceNode] : referenceCandidates;
-  const referenceRoot = reference?.path.split(".")[0];
-  const visibleProperties = Object.entries(properties).filter(([name]) => name !== reference?.path && name !== referenceRoot);
-  const linearSelector = node.data.kind === "trigger" && ["label", "labels", "statuses", "statusTypes", "assignee"].some((name) => name in properties);
-  const cleanupHelp = node.data.kind === "action" && node.data.use === "cleanup" ? "Cleans all workers for the current source item. This standalone action does not require an upstream dependency." : undefined;
-  return <aside className="property-panel"><div className="panel-title"><h3>{node.data.kind === "trigger" ? "Trigger settings" : "Action settings"}</h3><button className="icon-button" onClick={onClose}>×</button></div><label>Display name<input value={node.data.label} onChange={(e) => onChange({ label: e.target.value })} /></label><label>{node.data.kind === "trigger" ? "Source" : "Action"}<select value={node.data.use} onChange={(e) => node.data.kind === "action" ? onActionUseChange(e.target.value) : onChange({ use: e.target.value, schema: entrySchema(schemas[`${kind}:${e.target.value}`] ?? schemas[e.target.value]), config: {} })}>{entries.map((entry) => <option key={entry.use} value={entry.use}>{entryLabel(entry)}</option>)}</select></label>{reference && <label className="reference-field">{reference.label}<select aria-label={reference.label} value={selectedReference ?? ""} onChange={(e) => onActionReferenceChange(reference.path, e.target.value || undefined)}><option value="">Select a Codex session…</option>{referenceOptions.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.data.label} · {candidate.data.use}{candidate.id === selectedReference && !referenceCandidates.some((entry) => entry.id === candidate.id) ? " (current)" : ""}</option>)}</select><small className="field-help">Choose the started Codex session. Connect nodes with an arrow to express task order.</small></label>}{node.data.kind === "action" && <><label>Run condition (if)<input value={config.if ?? ""} placeholder="${{ item.metadata.priority == 'high' }}" onChange={(e) => setActionField("if", e.target.value || undefined)} /></label><label className="check-label"><input type="checkbox" checked={config.enabled !== false} onChange={(e) => setActionField("enabled", e.target.checked)} /> Enabled</label></>}<div className="property-divider" />{linearSelector ? <LinearTriggerFields sourceId={node.data.use} project={project} value={config} onChange={setField} /> : visibleProperties.length ? visibleProperties.map(([name, definition]: [string, any]) => name === "promptFile" ? <label key={name}>Saved prompt<select value={fieldValue(name) ?? ""} onChange={(e) => setField(name, e.target.value || undefined)}><option value="">Select a file from .task-relay/prompts…</option>{promptFiles.map((file) => <option key={file} value={file}>{file.replace(/^\.task-relay\/prompts\//, "")}</option>)}</select><small className="field-help">Add .md or .txt files under .task-relay/prompts. Ticket variables such as {"{{item.id}}"}, {"{{item.title}}"}, and {"{{item.description}}"} are rendered when it runs.</small></label> : <SchemaField key={name} name={name} definition={definition} value={fieldValue(name)} onChange={(value) => setField(name, value)} />) : !reference && <small className="field-help">No typed fields are provided for this action. Use raw JSON for plugin-specific configuration.</small>}{node.data.kind === "action" && <><button className="button primary full" onClick={onTestAction} disabled={testingAction}>{testingAction ? "Testing action…" : "Test action"}</button>{actionTest && <ActionTestResultPanel result={actionTest} />}</>}<button className="button ghost full" onClick={onRaw}>Edit raw JSON</button>{node.data.kind === "action" && <button className="button danger full" onClick={onDelete}>Delete node</button>}</aside>;
-}
-function ActionTestResultPanel({ result }: { result: ActionTestResult }) { const triggerCount = result.triggerMatchCount; const eligibleCount = result.eligibleCount; const headline = triggerCount !== eligibleCount ? `${eligibleCount} of ${triggerCount} tickets can run this action now` : `${eligibleCount} ticket${eligibleCount === 1 ? "" : "s"} can run this action now`; return <section className="action-test-result" aria-live="polite"><div className="action-test-heading"><span className="eyebrow">DRY RUN</span><b>{headline}</b></div>{result.matches.length > 0 ? <div className="action-test-matches">{result.matches.map((match, index) => { const eligible = match.eligible !== false && match.decision !== "ineligible" && match.decision !== "skipped" && match.decision !== "blocked"; return <div className={`action-test-match ${eligible ? "eligible" : "ineligible"}`} key={`${match.id ?? "match"}-${index}`}><div><b>{match.id || "Untitled ticket"}</b>{match.title && <small>{match.title}</small>}</div><span>{eligible ? "eligible" : "ineligible"}</span>{!eligible && (match.reason || match.decision) && <small className="action-test-reason">{match.reason || match.decision}</small>}</div>; })}</div> : <p className="action-test-empty">No tickets matched the trigger conditions.</p>}{result.reasons.length > 0 && <div className="action-test-reasons"><small>Notes</small>{result.reasons.map((reason, index) => <span key={`${reason}-${index}`}>{reason}</span>)}</div>}</section>; }
-function LinearTriggerFields({ sourceId, project, value, onChange }: { sourceId: string; project?: ProjectFolder; value: Json; onChange: (name: string, value: any) => void }) {
-  const [options, setOptions] = useState<api.LinearTriggerOptions>();
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const reload = useCallback(async () => { if (!project) return; setLoading(true); setError(""); try { setOptions(await api.getLinearTriggerOptions(sourceId, project)); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setLoading(false); } }, [project, sourceId]);
-  useEffect(() => { void reload(); }, [reload]);
-  return <div className="linear-trigger-fields"><div className="field-heading"><span>Linear filters</span><button className="text-button" type="button" onClick={() => void reload()} disabled={loading}>{loading ? "Loading…" : "Refresh"}</button></div>{error && <small className="field-help">Could not load Linear choices: {error}. Existing values are preserved; use raw JSON only if your MCP server has different tool names.</small>}<Select className="linear-search-select" label="Label" placeholder="Any label" data={options?.labels ?? []} value={value.label ?? null} onChange={(next) => onChange("label", next || undefined)} searchable clearable disabled={loading} nothingFoundMessage="No labels found" comboboxProps={{ zIndex: 1000 }} /><MultiSelect className="linear-search-select" label="Workflow status" placeholder="Any status" data={options?.statuses.map((status) => status.name) ?? []} value={value.statuses ?? []} onChange={(next) => onChange("statuses", next)} searchable clearable disabled={loading} nothingFoundMessage="No statuses found" comboboxProps={{ zIndex: 1000 }} /><Select className="linear-search-select" label="Assignee" placeholder="Anyone" data={options?.users.map((user) => ({ value: user.id, label: user.name })) ?? []} value={value.assignee ?? null} onChange={(next) => onChange("assignee", next || undefined)} searchable clearable disabled={loading} nothingFoundMessage="No assignees found" comboboxProps={{ zIndex: 1000 }} /><small className="field-help">{loading ? "Loading Linear data…" : "Type to search. Leave a filter empty to match all."}</small></div>;
-}
-function SchemaField({ name, definition, value, onChange }: { name: string; definition: any; value: any; onChange: (value: any) => void }) { const title = definition.title || name.replace(/[-_]/g, " "); const effectiveValue = value ?? definition.default; if (definition.enum) return <label>{title}<select value={effectiveValue ?? ""} onChange={(e) => onChange(e.target.value)}><option value="">Select…</option>{definition.enum.map((option: string) => <option key={option}>{option}</option>)}</select></label>; if (definition.type === "boolean") return <label className="check-label"><input type="checkbox" checked={Boolean(effectiveValue)} onChange={(e) => onChange(e.target.checked)} /> {title}</label>; if (definition.type === "object" || definition.type === "array") return <label>{title}{definition.description && <small className="field-help">{definition.description}</small>}<textarea className="schema-json-field" value={value === undefined ? "" : JSON.stringify(value, null, 2)} placeholder={definition.type === "array" ? "[]" : "{}"} onChange={(e) => { try { onChange(e.target.value.trim() ? JSON.parse(e.target.value) : undefined); } catch { /* keep editing invalid JSON until it parses */ } }} /></label>; const numeric = definition.type === "integer" || definition.type === "number"; const multiline = name === "prompt"; return <label>{title}{definition.description && <small className="field-help">{definition.description}</small>}{multiline ? <textarea className="schema-json-field" value={value ?? ""} onChange={(e) => onChange(e.target.value)} /> : <input type={numeric ? "number" : "text"} value={value ?? ""} placeholder={definition.default ?? ""} onChange={(e) => onChange(numeric && e.target.value !== "" ? Number(e.target.value) : e.target.value)} />}</label>; }
-function RawDialog({ value, onChange, onClose, onApply }: { value: string; onChange: (value: string) => void; onClose: () => void; onApply: () => void }) { return <div className="modal-backdrop"><div className="modal raw-modal"><div className="modal-head"><h2>Raw node configuration</h2><button className="icon-button" onClick={onClose}>×</button></div><textarea value={value} onChange={(e) => onChange(e.target.value)} spellCheck={false} /><div className="modal-actions"><button className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" onClick={onApply}>Apply</button></div></div></div>; }
-
-function Executions({ executions, workflows, selectedExecutionId, onInspect, onCloseDetail, onRefresh }: { executions: any[]; workflows: WorkflowSummary[]; selectedExecutionId?: string; onInspect: (id: string) => void; onCloseDetail: () => void; onRefresh: () => void }) {
-  const [filter, setFilter] = useState("all"); const [busy, setBusy] = useState(""); const [detail, setDetail] = useState<ExecutionDetail>(); const [inspectError, setInspectError] = useState("");
-  const visible = executions.filter((run) => filter === "all" || run.status === filter);
-  const inspect = async (run: any) => { setInspectError(""); onInspect(run.id); try { setDetail(await api.getExecution(run.id)); } catch (error) { setInspectError(error instanceof Error ? error.message : String(error)); } };
-  useEffect(() => { if (!selectedExecutionId) { setDetail(undefined); return; } const run = executions.find((candidate) => candidate.id === selectedExecutionId); if (run) void inspect(run); else setInspectError(`Execution '${selectedExecutionId}' was not found.`); }, [selectedExecutionId, executions]);
-  const retry = async (run: any) => { setBusy(run.id); try { await api.retryExecution(run.id); onRefresh(); } catch (error) { setInspectError(error instanceof Error ? error.message : String(error)); } finally { setBusy(""); } };
-  return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">GLOBAL EXECUTION LOG</span><p>Live state indexed across every registered repository.</p></div><select className="filter-select" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter executions by status"><option value="all">All statuses</option>{["running", "pending", "succeeded", "failed", "stopped"].map((status) => <option key={status}>{status}</option>)}</select></div>{inspectError && <div className="alert error" role="alert">{inspectError}<button onClick={() => setInspectError("")} aria-label="Dismiss execution error">×</button></div>}<section className="panel table-panel"><table><thead><tr><th>Work item</th><th>Workflow</th><th>Status</th><th>Updated</th><th>Jobs</th><th>Actions</th></tr></thead><tbody>{visible.map((run, index) => <tr key={run.id ?? index}><td><b>{run.item?.id || run.id || "—"}</b><small>{run.item?.title || ""}</small></td><td>{run.identity?.workflowId || run.workflowId || workflows.find((w) => w.runs?.some((item) => item.id === run.id))?.id || "—"}</td><td><span className={statusClass(run.status)}>{run.status || "unknown"}</span></td><td>{time(run.updatedAt || run.startedAt)}</td><td>{run.jobs ? Object.keys(run.jobs).length : "—"}</td><td><button className="small-button" onClick={() => void inspect(run)} aria-label={`Inspect execution ${run.item?.id || run.id || index}`}>Inspect</button>{run.status === "failed" && <button className="small-button" disabled={busy === run.id} onClick={() => void retry(run)} aria-label={`Retry execution ${run.item?.id || run.id || index}`}>Retry</button>}</td></tr>)}</tbody></table>{!visible.length && <Empty text="No executions match this filter." />}</section>{detail && <ExecutionInspector detail={detail} onClose={() => { setDetail(undefined); onCloseDetail(); }} />}</div>;
-}
-
-function ExecutionInspector({ detail, onClose }: { detail: ExecutionDetail; onClose: () => void }) {
-  const execution: ExecutionInspection = detail.inspection ?? detail.execution; const jobs = execution.jobs ?? detail.jobs ?? {}; const decisions = execution.decisions ?? {};
-  const closeButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    closeButton.current?.focus();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
-  return <div className="modal-backdrop execution-inspector-backdrop" role="dialog" aria-modal="true" aria-labelledby="execution-inspector-title">
-    <section className="modal execution-inspector">
-      <div className="modal-head"><div><span className="eyebrow">EXECUTION INSPECTION</span><h2 id="execution-inspector-title">{execution.item?.id ?? execution.id ?? "Execution"}</h2></div><button ref={closeButton} className="icon-button" onClick={onClose} aria-label="Close execution details">×</button></div>
-      <div className="execution-overview"><span className={statusClass(execution.status)}>{execution.status ?? "unknown"}</span><span>{execution.identity?.workflowId ?? execution.workflowId ?? "Workflow"}</span><time>{time(execution.updatedAt ?? execution.startedAt)}</time></div>
-      <div className="execution-meta"><span>Occurrence: {execution.identity?.occurrence ?? "—"}</span><span>Definition revision: {execution.definitionRevision ?? "—"}</span></div>
-      <section className="execution-section"><h3>Jobs</h3>{Object.entries(jobs).length ? <div className="execution-job-list">{Object.entries(jobs).map(([id, raw]) => <article className="execution-job" key={id}><div className="execution-job-head"><b>{id}</b><span className={statusClass(raw.status)}>{raw.status ?? "pending"}</span></div>{(decisions[id]?.reason || raw.waitReason || raw.message) && <p><strong>Wait reason:</strong> {decisions[id]?.reason ?? raw.waitReason ?? raw.message}</p>}{raw.needsAttention && <p className="attention"><strong>Needs attention:</strong> inspect the external operation before retrying.</p>}<DetailBlock label="Attempts" value={raw.attempts ?? raw.attempt ?? raw.attemptId} /><DetailBlock label="Resolved input" value={raw.resolvedInput ?? raw.input ?? raw.inputs} /><DetailBlock label="Output" value={raw.output ?? raw.outputs} /><DetailBlock label="Operation" value={raw.operation ?? raw.operationHandle} /><p className="retry-eligibility"><strong>Retry:</strong> {raw.needsAttention ? "manual review required" : raw.retryAt ? `eligible after ${time(raw.retryAt)}` : raw.status === "failed" ? "eligible" : "not currently eligible"}</p></article>)}</div> : <Empty text="No per-job state was recorded for this execution." />}</section>
-      <DetailBlock label="Plugin revisions" value={execution.pluginRevisions} /><DetailBlock label="Trigger payload" value={execution.trigger ?? execution.item} /><DetailBlock label="Cancellation result" value={execution.cancellationResult ?? execution.cancellation} /><DetailBlock label="Recent events" value={detail.events} />
-    </section>
-  </div>;
-}
-function DetailBlock({ label, value }: { label: string; value: unknown }) { if (value === undefined || value === null) return null; return <details className="execution-detail-block"><summary>{label}</summary><pre>{JSON.stringify(value, null, 2)}</pre></details>; }
-function Workers({ workers, project }: { workers: Worker[]; project?: ProjectFolder }) { const [busy, setBusy] = useState(""); const control = async (worker: Worker, action: "send" | "exec") => { const text = window.prompt(action === "send" ? "Prompt to send" : "Command to execute"); if (!text) return; setBusy(worker.id); try { await api.controlWorker(worker.id, action, action === "send" ? { text } : { command: text }, project); } catch (e) { window.alert(e instanceof Error ? e.message : String(e)); } finally { setBusy(""); } }; return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">WORKER POOL</span><p>Interactive agents launched by Relay workflows.</p></div></div><section className="panel table-panel"><table><thead><tr><th>Worker</th><th>Status</th><th>Task</th><th>Workspace</th><th>Controls</th></tr></thead><tbody>{workers.map((worker, index) => <tr key={worker.id ?? index}><td><b>{worker.id}</b></td><td><span className={statusClass(worker.status)}>{worker.status || "unknown"}</span></td><td>{worker.task || worker.title || "—"}</td><td><code>{worker.workspace?.path || "—"}</code></td><td><button className="small-button" disabled={busy === worker.id} onClick={() => void control(worker, "send")}>Send</button><button className="small-button" disabled={busy === worker.id} onClick={() => void control(worker, "exec")}>Pane</button></td></tr>)}</tbody></table>{!workers.length && <Empty text="No workers indexed yet." />}</section></div>; }
-function Plugins({ plugins, catalog }: { plugins: Json; catalog: Json }) { const installed = plugins.installed ?? []; const referenced = plugins.referenced ?? []; const schemas = catalog.schemas ?? catalog; return <div className="page-stack"><div className="section-intro"><div><span className="eyebrow">EXTENSION CATALOG</span><p>Triggers, actions and harnesses are described by JSON Schema.</p></div><span className="catalog-count">{Object.keys(schemas).length} catalog entries</span></div><div className="two-column"><section className="panel"><PanelTitle title="Installed plugins" />{installed.map((plugin: any) => <div className="list-row" key={plugin.package || plugin.name || plugin.use || plugin.id}><div className="list-icon plugin-icon">⬡</div><div className="row-main"><b>{plugin.package || plugin.name || plugin.use || plugin.id || "Plugin"}</b><small>{plugin.version || plugin.health || "local"}</small></div><span className="status status-succeeded">ready</span></div>)}{!installed.length && <Empty text="No external plugins installed." />}</section><section className="panel"><PanelTitle title="Referenced health" />{referenced.map((plugin: any) => <div className="list-row" key={plugin.use}><div className="list-icon plugin-icon">⬡</div><div className="row-main"><b>{plugin.use}</b><small>{(plugin.locations ?? []).join(", ")}</small></div><span className={statusClass(plugin.state)}>{plugin.state}</span></div>)}{!referenced.length && <Empty text="Only built-in plugins referenced." />}</section></div></div>; }
-
-export default function RootApp() { return <MantineProvider defaultColorScheme="dark"><ReactFlowProvider><App /></ReactFlowProvider></MantineProvider>; }

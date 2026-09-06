@@ -93,6 +93,20 @@ describe("dashboard modular action references", () => {
     expect(edges.find((edge) => edge.target === "codex.start-session-1")).toMatchObject({ source: "tmux.create-window-2", target: "codex.start-session-1", label: "then" });
   });
 
+  it("round-trips an explicit reference dependency condition", () => {
+    const original = {
+      id: "demo",
+      source: "queue",
+      jobs: {
+        window: { use: "tmux.create-window" },
+        session: { use: "codex.start-session", with: { tmux: { action: "window" } }, needs: "window.succeeded" },
+      },
+    };
+    const graph = workflowToGraph(original);
+    expect(graph.edges.find((edge) => edge.target === "session")).toMatchObject({ label: "succeeded" });
+    expect((graphToWorkflow(graph, original).jobs as Record<string, any>).session.needs).toBe("window.succeeded");
+  });
+
   it("resolves dots in job IDs before interpreting a status suffix", () => {
     const graph = workflowToGraph({
       id: "demo", source: "queue", jobs: {

@@ -23,4 +23,12 @@ describe("dashboard client routes", () => {
     expect(parseDashboardRoute("/projects/repo/unknown")).toEqual({ page: "home", projectId: "repo" });
     expect(parseDashboardRoute("/%E0%A4%A")).toEqual({ page: "home" });
   });
+
+  it("preserves execution filters across deep links and reload", () => {
+    const route = { ...routeForPage("executions", "repo/a", "run-1"), filters: { status: "omitted", workflow: "review", ticket: "NOT 12" } };
+    const url = new URL(dashboardRoutePath(route), "http://localhost");
+    expect(parseDashboardRoute(url.pathname, url.search)).toEqual(route);
+    expect(parseDashboardRoute("/settings")).toEqual({ page: "settings" });
+    expect(parseDashboardRoute("/plugins")).toEqual({ page: "plugins" });
+  });
 });

@@ -3,11 +3,11 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import pRetry from "p-retry";
-import type { RelayCommandContext, RelayCommandHandlers, WorkflowActionTestResult } from "./cli/program.js";
+import type { RelayCommandContext, RelayCommandHandlers, WorkflowActionTestResult, WorkflowDraftTestResult } from "./cli/program.js";
 import { loadRelayConfig, type RelayActionReference, type RelayConfigV2, type RelayTriggerV2, type RelayWorkflowJobV2, type RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { AgentLauncher, AgentProfile, AgentResolution, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkerCompletion, WorkerHandle, WorkerRuntime, WorkflowDefinition, WorkflowJobDefinition, WorkflowNeed, Workspace, WorkspaceProvider, WorkItem, WorkSource } from "./domain/index.js";
+import type { AgentLauncher, AgentProfile, AgentResolution, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkerCompletion, WorkerHandle, WorkerRuntime, WorkflowDefinition, WorkflowJobDefinition, WorkflowJobState, WorkflowNeed, Workspace, WorkspaceProvider, WorkItem, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, type AgentModelProfile, type CommandAgentProfile, type ConfiguredHarnessPlugin } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
 import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findInstalledPlugin, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
@@ -19,7 +19,7 @@ import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
 import { tickTable, type TickTableRow } from "./logging/tables.js";
 import { createEventLogger } from "./logging/events.js";
-import { decideJob, jobInstances } from "./workflows/reconciler.js";
+import { decideJob, jobInstances, type JobDecision } from "./workflows/reconciler.js";
 import { resolveStringWorkflowNeed } from "./workflows/needs.js";
 import { GlobalWorkerRegistry, GlobalWorkflowRegistry, type GlobalWorkerRecord } from "./state/global-worker-registry.js";
 import { getRepositoryIdentity } from "./state/repository-identity.js";
@@ -386,7 +386,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
             itemId: item.id,
           });
           const states = existing?.jobs ?? {};
-          const decision = decideJob({ job: action, states, item, known, instances });
+          const decision = previewDecision({ enabled: workflow.enabled, job: action, states, item, known, instances });
           return {
             id: item.id,
             title: item.title,
@@ -407,6 +407,77 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         return {
           workflowId: workflow.id,
           actionId,
+          sourceId: workflow.sourceId,
+          triggerMatchCount: items.length,
+          eligibleCount: items.filter((item) => item.eligible).length,
+          items,
+        };
+      } finally { await runtime.close(); }
+    },
+    workflowDraftTest: async (context, workflowId, options): Promise<WorkflowDraftTestResult> => {
+      // Draft preview uses the same read-only runtime composition and durable
+      // state as action preview, but evaluates every declared job so the editor
+      // can show dependency waits and the first runnable step together.
+      const previewContext = options?.workflow
+        ? {
+          ...context,
+          config: {
+            ...context.config,
+            workflows: { ...context.config.workflows, [workflowId]: options.workflow },
+          },
+        }
+        : context;
+      if (!previewContext.config.workflows[workflowId]) {
+        const known = Object.keys(previewContext.config.workflows);
+        throw new Error(`Unknown workflow '${workflowId}'.${known.length ? ` Configured workflows: ${known.join(", ")}.` : " None are configured."}`);
+      }
+
+      const runtime = await composeRuntime(previewContext, { trigger: workflowId, readOnly: true });
+      try {
+        const workflow = runtime.workflows[0];
+        const source = workflow && runtime.sources.get(workflow.sourceId);
+        if (!workflow || !source) throw new Error(`Workflow ${workflowId} could not be composed.`);
+        const known = new Set(workflow.jobs.flatMap((job) => [job.id, job.group ?? job.id]));
+        const instances = jobInstances(workflow.jobs);
+        const discovered = await source.discover({
+          trigger: { id: workflow.id, sourceId: workflow.sourceId, repository: workflow.repository, enabled: true, selector: workflow.selector },
+        });
+        const items = await Promise.all(discovered.map(async (item) => {
+          const existing = await previewContext.store.latestWorkflowRun({
+            repository: workflow.repository,
+            workflowId: workflow.id,
+            sourceId: item.sourceId,
+            itemId: item.id,
+          });
+          const states = existing?.jobs ?? {};
+          const jobs = workflow.jobs.map((job) => {
+            const decision = previewDecision({ enabled: workflow.enabled, job, states, item, known, instances });
+            return {
+              id: job.id,
+              use: job.use,
+              eligible: decision.action === "run",
+              decision: decision.action,
+              reason: decision.action === "run" ? "would start now" : decision.reason,
+              ...(states[job.id] ? { status: states[job.id]!.status } : {}),
+            };
+          });
+          const firstRunnable = jobs.find((job) => job.eligible);
+          const firstHeld = jobs.find((job) => job.decision === "hold");
+          const decision = firstRunnable ? "run" as const : firstHeld ? "hold" as const : "settle" as const;
+          return {
+            id: item.id,
+            title: item.title,
+            ...(item.url ? { url: item.url } : {}),
+            ...(item.state ? { state: item.state } : {}),
+            eligible: Boolean(firstRunnable),
+            decision,
+            reason: firstRunnable ? "would start now" : firstHeld?.reason ?? jobs[0]?.reason ?? "no jobs are runnable",
+            jobs,
+            run: existing ? { occurrence: existing.identity.occurrence, status: existing.status } : null,
+          };
+        }));
+        return {
+          workflowId: workflow.id,
           sourceId: workflow.sourceId,
           triggerMatchCount: items.length,
           eligibleCount: items.filter((item) => item.eligible).length,
@@ -488,6 +559,30 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       } finally { await runtime.close(); }
     },
   };
+}
+
+/**
+ * Match the execution inspector's durable-state guards before evaluating the
+ * pure DAG decision. `decideJob` intentionally knows nothing about leases or
+ * deferred retries, so previews must fence those states explicitly too.
+ */
+export function previewDecision(input: {
+  enabled: boolean;
+  job: WorkflowJobDefinition;
+  states: Readonly<Record<string, WorkflowJobState>>;
+  item: WorkItem;
+  known: ReadonlySet<string>;
+  instances: ReadonlyMap<string, readonly string[]>;
+}): JobDecision {
+  if (!input.enabled) return { action: "hold", reason: "workflow is disabled" };
+  const state = input.states[input.job.id];
+  if (state?.needsAttention) return { action: "hold", reason: state.message ?? "Previous attempt has an uncertain outcome; inspect before retry." };
+  if (state?.attemptId && state.status === "pending") return { action: "hold", reason: "An attempt owns this job." };
+  if (state?.retryAt) {
+    const retryAt = Date.parse(state.retryAt);
+    if (!Number.isFinite(retryAt) || retryAt > Date.now()) return { action: "hold", reason: `Deferred until ${state.retryAt}` };
+  }
+  return decideJob({ job: input.job, states: input.states, item: input.item, known: input.known, instances: input.instances });
 }
 
 /** A dashboard prompt to this worker must use App Server, never tmux paste. */

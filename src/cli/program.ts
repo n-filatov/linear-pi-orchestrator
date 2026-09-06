@@ -55,6 +55,32 @@ export type WorkflowActionTestResult = {
   }>;
 };
 
+/** Read-only eligibility preview for every job in a workflow draft. */
+export type WorkflowDraftTestResult = {
+  workflowId: string;
+  sourceId: string;
+  triggerMatchCount: number;
+  eligibleCount: number;
+  items: Array<{
+    id: string;
+    title: string;
+    url?: string;
+    state?: string;
+    eligible: boolean;
+    decision: "run" | "hold" | "settle";
+    reason: string;
+    jobs: Array<{
+      id: string;
+      use?: string;
+      eligible: boolean;
+      decision: "run" | "hold" | "settle";
+      reason: string;
+      status?: WorkflowJobStatus;
+    }>;
+    run: { occurrence: string; status: string } | null;
+  }>;
+};
+
 export type RelayCommandHandlers = {
   poll?: (context: RelayCommandContext) => Promise<void>;
   stopPolling?: (projectRoot: string) => Promise<void>;
@@ -74,6 +100,12 @@ export type RelayCommandHandlers = {
     actionId: string,
     options?: { workflow?: RelayWorkflowV2 },
   ) => Promise<WorkflowActionTestResult>;
+  /** Read-only eligibility preview for every job in a workflow draft. */
+  workflowDraftTest?: (
+    context: RelayCommandContext,
+    workflowId: string,
+    options?: { workflow?: RelayWorkflowV2 },
+  ) => Promise<WorkflowDraftTestResult>;
   /** Ad-hoc control of one live worker, used by the dashboard. */
   workerControl?: (context: RelayCommandContext, target: string, action:
     | { type: "send"; text: string; submit?: boolean }

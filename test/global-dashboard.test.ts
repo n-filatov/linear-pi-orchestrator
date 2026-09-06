@@ -121,6 +121,21 @@ logging: { level: silent }
           items: [{ id: "ENG-1", title: "One", eligible: true, decision: "run", reason: "would start now", run: null }],
         };
       },
+      workflowDraftTest: async (_context, workflowId) => ({
+        workflowId,
+        sourceId: "queue",
+        triggerMatchCount: 1,
+        eligibleCount: 1,
+        items: [{
+          id: "ENG-1",
+          title: "One",
+          eligible: true,
+          decision: "run",
+          reason: "one or more jobs would start now",
+          jobs: [{ id: "notify", use: "notify", eligible: true, decision: "run", reason: "would start now" }],
+          run: null,
+        }],
+      }),
     });
     const authenticated = new URL(await server.start(0));
     const request = async (path: string, init?: RequestInit) => fetch(new URL(`${path}${path.includes("?") ? "&" : "?"}token=${authenticated.searchParams.get("token")}`, authenticated), init);
@@ -132,12 +147,20 @@ logging: { level: silent }
 
       const workflowsResponse = await request(`/api/projects/${project.id}/workflows`);
       const workflow = (await workflowsResponse.json() as any).workflows[0];
-      expect(workflow).toMatchObject({ id: "delivery", source: "queue" });
+      expect(workflow).toMatchObject({ id: "delivery", source: "queue", projectFolderId: project.id, repository: project.repository });
 
       const actionPreview = await request(`/api/projects/${project.id}/workflows/delivery/actions/notify/test`, { method: "POST" });
       expect(actionPreview.status).toBe(200);
       expect(await actionPreview.json()).toMatchObject({ ok: true, dryRun: true, result: { triggerMatchCount: 2, eligibleCount: 1 } });
       expect(testedAction).toEqual({ workflowId: "delivery", actionId: "notify" });
+
+      const draftPreview = await request(`/api/projects/${project.id}/workflows/delivery/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow: { enabled: true, on: { source: "queue", match: {}, fire: { policy: "once-per-match" } }, jobs: { notify: { use: "notify" } } } }),
+      });
+      expect(draftPreview.status).toBe(200);
+      expect(await draftPreview.json()).toMatchObject({ ok: true, dryRun: true, draft: true, result: { workflowId: "delivery", eligibleCount: 1, items: [{ jobs: [{ id: "notify", eligible: true }] }] } });
 
       const save = await request(`/api/projects/${project.id}/workflows/delivery`, {
         method: "PUT",

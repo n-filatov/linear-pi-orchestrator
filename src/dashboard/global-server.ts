@@ -19,6 +19,7 @@ import { LinearMcpSource } from "../sources/linear-mcp-source.js";
 import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-client.js";
 import { inspectWorkflowRun } from "../application/execution-inspection.js";
 import type { WorkflowRunRecord } from "../domain/index.js";
+import { ZodError } from "zod";
 
 const MAX_BODY_BYTES = 1_000_000;
 class RequestBodyTooLargeError extends Error {}
@@ -80,7 +81,7 @@ export class GlobalDashboardServer {
     } catch (error) {
       const status = error instanceof WorkflowRevisionConflictError || error instanceof WorkflowAlreadyExistsError ? 409
         : error instanceof WorkflowNotFoundError || error instanceof ProjectNotFoundError ? 404
-        : error instanceof SyntaxError || error instanceof URIError ? 400
+        : error instanceof SyntaxError || error instanceof URIError || error instanceof ZodError ? 400
         : error instanceof RequestBodyTooLargeError ? 413 : 500;
       this.json(response, {
         error: error instanceof Error ? error.message : String(error),
@@ -211,7 +212,13 @@ export class GlobalDashboardServer {
       const inspection = rawInspection && typeof rawInspection === "object"
         ? { ...rawInspection as Record<string, unknown>, definitionRevision, pluginRevisions }
         : rawInspection;
-      return this.json(response, { execution: presentExecution(run), inspection, jobs: this.projects.workflows.listJobs(id), events: this.projects.workflows.listEvents(id) });
+      return this.json(response, {
+        execution: presentExecution(run),
+        inspection,
+        jobs: this.projects.workflows.listJobs(id),
+        events: this.projects.workflows.listEvents(id),
+        retryEligibility: retryEligibility(canonical.jobs ?? {}, undefined, new Date().toISOString()),
+      });
     }
     const retry = /^\/api\/executions\/([^/]+)\/retry$/.exec(url.pathname);
     if (retry) return method === "POST" ? this.retryExecution(decodeURIComponent(retry[1]!), request, response) : this.methodNotAllowed(response);
@@ -230,6 +237,8 @@ export class GlobalDashboardServer {
     const runs = this.projects.workflows.list({ projectFolderId: projectId });
     return (await repository.list()).map((entry) => ({
       id: entry.workflowId,
+      projectFolderId: project.id,
+      repository: project.repository,
       ...entry.workflow,
       source: entry.workflow.on.source,
       fire: entry.workflow.on.fire.policy,
@@ -331,9 +340,16 @@ export class GlobalDashboardServer {
       }
     }
     if (action === "test" && method === "POST") {
+      const context = await this.projects.context(projectId);
+      const body = await optionalJsonBody(request);
+      if (body.workflow !== undefined) {
+        if (!this.handlers.workflowDraftTest) return this.json(response, { error: "Draft workflow preview is not available." }, 501);
+        const draft = workflowValue(body.workflow, workflowId);
+        const result = await this.handlers.workflowDraftTest(context, workflowId, { workflow: draft });
+        return this.json(response, { ok: true, dryRun: true, draft: true, result });
+      }
       if (!this.handlers.workflowTest) return this.json(response, { error: "Workflow test is not available." }, 501);
       const output: string[] = [];
-      const context = await this.projects.context(projectId);
       await this.handlers.workflowTest({ ...context, write: (line) => output.push(line) }, workflowId);
       return this.json(response, { ok: true, output: output.join("\n") });
     }
@@ -349,17 +365,13 @@ export class GlobalDashboardServer {
   private async workflowActionTest(projectId: string, workflowId: string, actionId: string, method: string, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
     if (method !== "POST") return this.methodNotAllowed(response);
     if (!this.handlers.workflowActionTest) return this.json(response, { error: "Workflow action test is not available." }, 501);
-    try {
-      const body = await optionalJsonBody(request);
-      // Validate the draft with the same v2 schema as workflow saves. It is
-      // passed to the handler in memory only; this endpoint never writes YAML.
-      const draft = body.workflow === undefined ? undefined : workflowValue(body.workflow, workflowId);
-      const context = await this.projects.context(projectId);
-      const result = await this.handlers.workflowActionTest(context, workflowId, actionId, draft ? { workflow: draft } : undefined);
-      this.json(response, { ok: true, dryRun: true, result });
-    } catch (error) {
-      this.json(response, { ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
-    }
+    const body = await optionalJsonBody(request);
+    // Validate the draft with the same v2 schema as workflow saves. It is
+    // passed to the handler in memory only; this endpoint never writes YAML.
+    const draft = body.workflow === undefined ? undefined : workflowValue(body.workflow, workflowId);
+    const context = await this.projects.context(projectId);
+    const result = await this.handlers.workflowActionTest(context, workflowId, actionId, draft ? { workflow: draft } : undefined);
+    this.json(response, { ok: true, dryRun: true, result });
   }
 
   private executionList(response: http.ServerResponse, projectId?: string, status?: string): void {
@@ -377,17 +389,29 @@ export class GlobalDashboardServer {
     const context = await this.projects.context(indexed.projectFolderId);
     const repositoryRun = (await context.store.snapshot()).workflows[id];
     if (!repositoryRun) return this.json(response, { error: "Repository execution record was not found." }, 404);
-    const jobIds = Array.isArray(body.jobIds) ? [...new Set(body.jobIds.filter((value): value is string => typeof value === "string" && value.length > 0))] : undefined;
-    if (Array.isArray(body.jobIds) && (!jobIds?.length || jobIds.some((jobId) => !repositoryRun.jobs[jobId]))) {
+    const jobIds = body.jobIds === undefined ? undefined : Array.isArray(body.jobIds)
+      ? [...new Set(body.jobIds.filter((value): value is string => typeof value === "string" && value.length > 0))]
+      : undefined;
+    if (body.jobIds !== undefined && (!jobIds?.length || !Array.isArray(body.jobIds) || jobIds.some((jobId) => !repositoryRun.jobs[jobId]))) {
       return this.json(response, { error: "Retry jobIds must name one or more jobs in this execution." }, 400);
     }
-    const run = await context.store.retryWorkflowJobs(repositoryRun.identity, jobIds, new Date().toISOString());
+    const eligibility = retryEligibility(repositoryRun.jobs, jobIds, new Date().toISOString());
+    // A run-level retry is intentionally narrowed to its failed jobs and may
+    // coexist with completed upstream jobs. An explicit selection is stricter:
+    // never silently drop a completed job the user asked to replay.
+    if (eligibility.eligible.length === 0 || (jobIds !== undefined && eligibility.ineligible.length > 0)) {
+      return this.json(response, {
+        error: eligibility.eligible.length === 0 ? "No jobs in this execution are eligible for retry." : "One or more selected jobs are not eligible for retry.",
+        retryEligibility: eligibility,
+      }, 409);
+    }
+    const run = await context.store.retryWorkflowJobs(repositoryRun.identity, eligibility.eligible, new Date().toISOString());
     if (!run) return this.json(response, { error: "Repository execution record was not found." }, 404);
     const project = await this.requireProject(indexed.projectFolderId);
     this.projects.workflows.syncRun(run, { repository: project.repository });
-    this.projects.workflows.appendEvent(run.id, "workflow.retried", run.updatedAt, { jobIds });
+    this.projects.workflows.appendEvent(run.id, "workflow.retried", run.updatedAt, { jobIds: eligibility.eligible });
     if (this.handlers.once) await this.handlers.once(context, { trigger: run.identity.workflowId, task: run.identity.itemId });
-    this.json(response, { execution: presentExecution(this.projects.workflows.get(id) ?? indexed) });
+    this.json(response, { execution: presentExecution(this.projects.workflows.get(id) ?? indexed), retryEligibility: eligibility });
   }
 
   private async workerAction(projectId: string | undefined, workerId: string, action: "send" | "exec", request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
@@ -495,7 +519,7 @@ function workflowValue(value: unknown, workflowId: string) {
   const workflow = Array.isArray(value.nodes) && Array.isArray(value.edges)
     ? graphToRelayWorkflow({ id: workflowId, ...value } as unknown as WorkflowGraph)
     : (() => {
-      const { id: _id, source: _source, fire: _fire, revision: _revision, graph: _graph, runs: _runs, ...raw } = value;
+      const { id: _id, source: _source, fire: _fire, revision: _revision, graph: _graph, runs: _runs, projectFolderId: _projectFolderId, repository: _repository, ...raw } = value;
       return raw;
     })();
   return workflowSchema.parse(withUsesAlias(workflow));
@@ -503,6 +527,47 @@ function workflowValue(value: unknown, workflowId: string) {
 
 function presentExecution(run: ReturnType<ProjectManager["workflows"]["get"]> extends infer T ? NonNullable<T> : never): Record<string, unknown> {
   return { ...run.snapshot, id: run.id, projectFolderId: run.projectFolderId, workflowId: run.identity.workflowId, status: run.status };
+}
+
+/**
+ * The durable store's low-level retry operation can clear any terminal state
+ * for CLI compatibility. The dashboard exposes a narrower recovery contract:
+ * only failed jobs (plus the historical timed_out marker) may be replayed.
+ * Uncertain attempts are deliberately held for inspection instead.
+ */
+export function retryEligibility(
+  jobs: Record<string, { status?: string; needsAttention?: boolean; retryAt?: string }>,
+  requested?: readonly string[],
+  now = new Date().toISOString(),
+): { eligible: string[]; ineligible: Array<{ id: string; status?: string; reason: string }> } {
+  const ids = requested ? [...requested] : Object.keys(jobs);
+  const eligible: string[] = [];
+  const ineligible: Array<{ id: string; status?: string; reason: string }> = [];
+  for (const id of ids) {
+    const state = jobs[id];
+    if (!state) {
+      ineligible.push({ id, reason: "job is not recorded in this execution" });
+      continue;
+    }
+    if (state.needsAttention) {
+      ineligible.push({ id, status: state.status, reason: "attempt requires manual inspection before retry" });
+      continue;
+    }
+    if (state.retryAt) {
+      const retryAt = Date.parse(state.retryAt);
+      if (!Number.isFinite(retryAt)) {
+        ineligible.push({ id, status: state.status, reason: "job has an invalid scheduled retry time" });
+        continue;
+      }
+      if (retryAt > Date.parse(now)) {
+        ineligible.push({ id, status: state.status, reason: `job is scheduled for retry at ${state.retryAt}` });
+        continue;
+      }
+    }
+    if (state.status === "failed" || state.status === "timed_out") eligible.push(id);
+    else ineligible.push({ id, status: state.status, reason: "only failed or timed_out jobs can be retried" });
+  }
+  return { eligible, ineligible };
 }
 
 /** Stable display fingerprint for legacy definitions that did not persist a revision. */

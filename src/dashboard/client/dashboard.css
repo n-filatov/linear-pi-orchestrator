@@ -1,0 +1,107 @@
+/* Mantine owns page controls; legacy canvas selectors remain in styles.css. */
+html:root {
+  font-size: 16px;
+}
+.mantine-AppShell-root {
+  min-height: 100vh;
+  background: #0d1117;
+}
+.mantine-AppShell-header {
+  background: #101720;
+  border-color: #253143;
+  margin: 0;
+}
+.mantine-AppShell-header > .mantine-Group-root {
+  width: 100%;
+}
+.mantine-AppShell-navbar {
+  background: #101720;
+  border-color: #253143;
+}
+.mantine-AppShell-main {
+  min-width: 0;
+}
+.mantine-NavLink-root {
+  border-radius: 8px;
+  margin: 3px 0;
+}
+.mantine-Paper-root {
+  background-color: #111a24;
+}
+.mantine-Table-table {
+  font-size: 13px;
+}
+.mantine-Table-td {
+  vertical-align: top;
+}
+.mantine-Input-input {
+  font-size: 13px;
+}
+.mantine-Modal-title,
+.mantine-Drawer-title {
+  font-weight: 650;
+}
+.mantine-Modal-content,
+.mantine-Drawer-content {
+  background: #111a24;
+}
+.mantine-Modal-header,
+.mantine-Drawer-header {
+  background: #111a24;
+  margin-bottom: 0;
+}
+.mantine-Checkbox-input {
+  padding: 0;
+}
+.min-width-zero {
+  min-width: 0;
+}
+.break-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mobile-scope {
+  display: none;
+}
+.workflow-layout {
+  height: calc(100vh - 145px);
+  min-height: 620px;
+}
+.editor-toolbar {
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 8px;
+}
+.editor-toolbar > .mantine-Group-root {
+  min-width: 0;
+}
+.editor-toolbar .mantine-InputWrapper-root {
+  min-width: min(18rem, 100%);
+}
+.canvas-wrap .add-node-button {
+  left: 58px;
+}
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid #b6a5ff;
+  outline-offset: 3px;
+}
+@media (max-width: 48em) {
+  .mobile-scope {
+    display: block;
+  }
+  .mantine-AppShell-header h3 {
+    font-size: 16px;
+  }
+  .mantine-AppShell-main {
+    overflow-x: hidden;
+  }
+  .workflow-layout {
+    height: auto;
+    min-height: 740px;
+  }
+  .canvas-wrap {
+    min-height: 520px;
+  }
+}
