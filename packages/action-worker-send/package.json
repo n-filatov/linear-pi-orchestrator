@@ -1,0 +1,22 @@
+{
+  "name": "@task-relay/action-worker-send",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": { "@task-relay/plugin-sdk": "file:../plugin-sdk" },
+  "peerDependencies": {
+    "handlebars": "^4.7.8",
+    "zod": "^3.24.3"
+  },
+  "scripts": {
+    "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/action-worker-send/test",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "build": "npm run build --prefix ../.."
+  }
+}

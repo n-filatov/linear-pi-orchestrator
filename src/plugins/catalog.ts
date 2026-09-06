@@ -1,13 +1,15 @@
 import { z, type ZodTypeAny } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { pluginCatalogEntry } from "@task-relay/plugin-host";
 import type { RelayConfigV2 } from "../config/v2.js";
 import { builtInActionPlugins } from "../actions/builtins.js";
+import { commandSourceConfigSchema, linearMatchSchema, linearSourceConfigSchema } from "../sources/builtins.js";
 import { BUILT_IN_ACTIONS, BUILT_IN_HARNESSES, BUILT_IN_SOURCES } from "./built-ins.js";
 import type { PluginPresentation, RelayPlugin } from "./contracts.js";
 import { loadRelayPlugin } from "./loader.js";
 import { readPluginLock, type InstalledPlugin, type PluginLock } from "./store.js";
 
-export type CatalogPluginKind = "source" | "action" | "harness";
+export type CatalogPluginKind = "source" | "trigger" | "action" | "harness";
 
 /** A data-only description for a canvas or form renderer. */
 export interface PluginCatalogEntry {
@@ -42,24 +44,6 @@ export interface BuildPluginCatalogOptions {
 }
 
 const permissiveSchema = z.object({}).passthrough();
-const invocationSchema = z.object({
-  command: z.string().min(1),
-  args: z.array(z.string()).default([]),
-  cwd: z.string().min(1).optional(),
-  environment: z.record(z.string()).default({}),
-}).strict();
-const commandSourceSchema = z.object({ discover: invocationSchema, report: invocationSchema.optional() }).strict();
-const linearSourceSchema = z.object({
-  mcp: z.unknown().optional(),
-  tools: z.object({ listIssues: z.string().optional(), getIssue: z.string().optional(), saveIssue: z.string().optional(), saveComment: z.string().optional() }).strict().optional(),
-  reporting: z.object({ runningLabel: z.string().optional(), blockedLabel: z.string().optional(), doneLabel: z.string().optional(), inProgressState: z.string().optional(), commentOnLaunch: z.boolean().optional(), commentOnFailure: z.boolean().optional() }).strict().optional(),
-}).strict();
-const linearMatchSchema = z.object({
-  label: z.string().optional(),
-  labels: z.object({ all: z.array(z.string()).optional(), any: z.array(z.string()).optional(), none: z.array(z.string()).optional() }).strict().optional(),
-  statuses: z.array(z.string()).optional(), statusTypes: z.array(z.string()).optional(), assignee: z.string().optional(),
-  limit: z.number().int().positive().optional(), includeArchived: z.boolean().optional(), orderBy: z.string().optional(), excludeLabels: z.array(z.string()).optional(),
-}).strict();
 const commandHarnessSchema = z.object({
   command: z.string().min(1).optional(), args: z.array(z.string()).optional(), interactiveArgs: z.array(z.string()).optional(),
   environment: z.record(z.string()).optional(), models: z.array(z.string()).optional(), defaultModel: z.string().optional(),
@@ -75,12 +59,12 @@ interface BuiltInCatalogDescription extends Omit<PluginCatalogEntry, "configSche
 const builtInEntries: readonly BuiltInCatalogDescription[] = [
   {
     id: "source:linear", kind: "source", use: "linear", aliases: [], health: "built-in",
-    configSchema: linearSourceSchema, matchSchema: linearMatchSchema,
+    configSchema: linearSourceConfigSchema, matchSchema: linearMatchSchema,
     presentation: { name: "Linear", description: "Poll Linear work items through an MCP connection.", category: "Sources", icon: "linear", color: "#5e6ad2" },
   },
   {
     id: "source:command", kind: "source", use: "command", aliases: [], health: "built-in",
-    configSchema: commandSourceSchema, matchSchema: permissiveSchema,
+    configSchema: commandSourceConfigSchema, matchSchema: permissiveSchema,
     presentation: { name: "Command source", description: "Discover canonical work items from a command.", category: "Sources", icon: "terminal", color: "#475569" },
   },
   ...["codex", "claude", "pi", "opencode", "command"].map((use): BuiltInCatalogDescription => ({
@@ -103,17 +87,10 @@ function fallbackPresentation(plugin: Pick<RelayPlugin, "kind" | "use" | "presen
 }
 
 function entryFor(plugin: RelayPlugin, aliases: readonly string[] = [], installed?: InstalledPlugin): PluginCatalogEntry {
-  return {
-    id: `${plugin.kind}:${plugin.use}`,
-    kind: plugin.kind,
-    use: plugin.use,
-    configSchema: toSchema(plugin.configSchema),
-    ...(plugin.kind === "source" ? { matchSchema: toSchema(plugin.matchSchema) } : {}),
-    presentation: fallbackPresentation(plugin),
-    aliases: [...new Set(aliases.filter((alias) => alias !== plugin.use))].sort(),
+  return pluginCatalogEntry(plugin, {
+    aliases,
     ...(installed ? { version: installed.version, installed: true } : {}),
-    health: installed ? "ok" : "built-in",
-  };
+  });
 }
 
 function configuredExternalUses(config: RelayConfigV2): Set<string> {

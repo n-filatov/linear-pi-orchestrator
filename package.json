@@ -22,7 +22,14 @@
     "bin",
     "src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "packages"
+  ],
+  "bundledDependencies": [
+    "@task-relay/domain",
+    "@task-relay/plugin-host",
+    "@task-relay/plugin-sdk",
+    "zod"
   ],
   "bin": {
     "relay": "./bin/relay.js",
@@ -31,7 +38,9 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-declarations.mjs && npm run dashboard:build",
+    "boundaries": "node scripts/check-import-boundaries.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-declarations.mjs && node scripts/smoke-built-packages.mjs && node scripts/build-compatibility.mjs && npm run dashboard:build",
+    "package:smoke": "npm run build && node scripts/smoke-packed-plugin.mjs",
     "prepare": "npm run build",
     "test": "vitest run",
     "start": "tsx src/cli/main.ts",
@@ -54,6 +63,11 @@
     "@inquirer/prompts": "^7.5.0",
     "@mantine/core": "^9.6.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@task-relay/domain": "file:packages/domain",
+    "@task-relay/plugin-host": "file:packages/plugin-host",
+    "@task-relay/plugin-sdk": "file:packages/plugin-sdk",
+    "@nestjs/common": "^11.2.3",
+    "@nestjs/core": "^11.2.3",
     "@xyflow/react": "^12.11.5",
     "cli-table3": "^0.6.5",
     "commander": "^13.1.0",
@@ -67,10 +81,15 @@
     "proper-lockfile": "^4.1.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
     "tsx": "^4.19.3",
     "write-file-atomic": "^6.0.0",
     "yaml": "^2.7.1",
     "zod": "^3.24.3",
     "zod-to-json-schema": "^3.25.2"
-  }
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }

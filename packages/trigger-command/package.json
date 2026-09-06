@@ -1,0 +1,21 @@
+{
+  "name": "@task-relay/trigger-command",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": { "@task-relay/domain": "file:../domain" },
+  "peerDependencies": {
+    "execa": "^9.5.2"
+  },
+  "scripts": {
+    "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/trigger-command/test",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "build": "npm run build --prefix ../.."
+  }
+}

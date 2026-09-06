@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import * as http from "node:http";
@@ -17,6 +17,8 @@ import { WorkflowAlreadyExistsError, WorkflowConfigRepository, WorkflowNotFoundE
 import { listPromptFiles, PROMPTS_DIRECTORY } from "../prompts/library.js";
 import { LinearMcpSource } from "../sources/linear-mcp-source.js";
 import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-client.js";
+import { inspectWorkflowRun } from "../application/execution-inspection.js";
+import type { WorkflowRunRecord } from "../domain/index.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 class RequestBodyTooLargeError extends Error {}
@@ -195,7 +197,18 @@ export class GlobalDashboardServer {
       if (method !== "GET") return this.methodNotAllowed(response);
       const id = decodeURIComponent(execution[1]!);
       const run = this.projects.workflows.get(id);
-      return run ? this.json(response, { execution: presentExecution(run), jobs: this.projects.workflows.listJobs(id), events: this.projects.workflows.listEvents(id) }) : this.json(response, { error: "Execution not found" }, 404);
+      if (!run) return this.json(response, { error: "Execution not found" }, 404);
+      const canonical = run.snapshot as WorkflowRunRecord;
+      const rawInspection = canonical && typeof canonical === "object" && canonical.jobs && canonical.item
+        ? inspectWorkflowRun(canonical)
+        : presentExecution(run);
+      const definitionMetadata = canonical.definition?.metadata;
+      const definitionRevision = definitionMetadata?.revision ?? (canonical.definition ? definitionFingerprint(canonical.definition) : undefined);
+      const pluginRevisions = recordOfStrings(definitionMetadata?.pluginRevisions);
+      const inspection = rawInspection && typeof rawInspection === "object"
+        ? { ...rawInspection as Record<string, unknown>, definitionRevision, pluginRevisions }
+        : rawInspection;
+      return this.json(response, { execution: presentExecution(run), inspection, jobs: this.projects.workflows.listJobs(id), events: this.projects.workflows.listEvents(id) });
     }
     const retry = /^\/api\/executions\/([^/]+)\/retry$/.exec(url.pathname);
     if (retry) return method === "POST" ? this.retryExecution(decodeURIComponent(retry[1]!), request, response) : this.methodNotAllowed(response);
@@ -482,6 +495,20 @@ function workflowValue(value: unknown, workflowId: string) {
 
 function presentExecution(run: ReturnType<ProjectManager["workflows"]["get"]> extends infer T ? NonNullable<T> : never): Record<string, unknown> {
   return { ...run.snapshot, id: run.id, projectFolderId: run.projectFolderId, workflowId: run.identity.workflowId, status: run.status };
+}
+
+/** Stable display fingerprint for legacy definitions that did not persist a revision. */
+function definitionFingerprint(definition: unknown): string {
+  const normalize = (value: unknown): unknown => Array.isArray(value) ? value.map(normalize) : value && typeof value === "object"
+    ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, normalize(entry)]))
+    : value;
+  return createHash("sha256").update(JSON.stringify(normalize(definition))).digest("hex").slice(0, 12);
+}
+
+function recordOfStrings(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 function presentCatalog(entries: readonly PluginCatalogEntry[]): Record<string, unknown> {

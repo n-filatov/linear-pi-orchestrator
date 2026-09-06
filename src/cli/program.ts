@@ -1,3 +1,4 @@
+import { inspectWorkflowRun, redactExecution } from "../application/execution-inspection.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, watch } from "node:fs";
 import { Command } from "commander";
@@ -55,6 +56,8 @@ export type WorkflowActionTestResult = {
 };
 
 export type RelayCommandHandlers = {
+  poll?: (context: RelayCommandContext) => Promise<void>;
+  stopPolling?: (projectRoot: string) => Promise<void>;
   once?: (context: RelayCommandContext, options: { trigger?: string; task?: string }) => Promise<void>;
   watch?: (context: RelayCommandContext, options: { trigger?: string }) => Promise<void>;
   daemon?: (context: RelayCommandContext, action: "start" | "stop" | "status") => Promise<void>;
@@ -63,6 +66,7 @@ export type RelayCommandHandlers = {
   attach?: (context: RelayCommandContext, target: string) => Promise<void>;
   signal?: (context: RelayCommandContext, target: string, outcome: "done" | "failed", options: { outputs: Record<string, string>; message?: string }) => Promise<void>;
   workflowTest?: (context: RelayCommandContext, id: string) => Promise<void>;
+  workflowAdopt?: (context: RelayCommandContext, id: string, task: string, occurrence?: string) => Promise<void>;
   /** Read-only eligibility preview for one workflow action/job. */
   workflowActionTest?: (
     context: RelayCommandContext,
@@ -313,7 +317,25 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
     print(statusTable(rows));
   });
 
-  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Workflows", Object.values(context.config.workflows).filter((workflow) => workflow.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.file], ["Log", eventLogPath(context.projectRoot)]])); });
+  const stateCommand = program.command("state").description("Manage the local execution ledger.");
+  stateCommand.command("migrate").description("Import legacy JSON state into SQLite after stopping old Relay processes.").action(async () => {
+    const loaded = await loadRelayConfig(cwd());
+    const { RepositoryDaemon } = await import("../daemon.js");
+    if ((await new RepositoryDaemon(loaded.projectRoot).status()).includes("is running")) {
+      throw new Error("Stop the repository daemon before migrating execution state.");
+    }
+    if (existsSync(resolve(stateDirectory(loaded.projectRoot), "supervisor.lease.lock"))) {
+      throw new Error("Stop dashboard supervision before migrating execution state.");
+    }
+    const store = new RepositoryStateStore(loaded.projectRoot, { migrateLegacy: true });
+    try {
+      const snapshot = await store.snapshot();
+      print(`Execution ledger: ${store.databaseFile}`);
+      print(`Verified ${Object.keys(snapshot.runs).length} workers, ${Object.keys(snapshot.workflows).length} workflows, ${Object.keys(snapshot.actions).length} action records.`);
+      print("Legacy JSON, when present, was preserved with a pre-sqlite backup. Use this Relay version for future execution.");
+    } finally { store.close(); }
+  });
+  program.command("status").description("Show repository relay state.").action(async () => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); print(statusTable([["Project", context.config.project.name || context.projectRoot], ["Sources", Object.keys(context.config.sources).length], ["Harnesses", Object.keys(context.config.harnesses).length], ["Actions", Object.keys(context.config.actions).length], ["Triggers", context.config.triggers.filter((trigger) => trigger.enabled).length], ["Workflows", Object.values(context.config.workflows).filter((workflow) => workflow.enabled).length], ["Active runs", runs.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status)).length], ["State", context.store.databaseFile], ["Log", eventLogPath(context.projectRoot)]])); });
 
   program.command("runs").description("List persisted runs.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => { const context = await resolveContext(cwd, print); const runs = await context.store.listRuns(); if (flags.json) print(JSON.stringify(runs, null, 2)); else print(eventsTable(runs.map((run) => ({ project: context.config.project.name || context.projectRoot, timestamp: run.claimedAt, level: run.status === "failed" ? "error" : "info", task: run.item.id, trigger: run.trigger.id, agent: run.agent.agentId, model: run.agent.model, runId: run.id, event: run.status, error: run.error })))); });
 
@@ -405,12 +427,28 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
     });
 
   const workflow = program.command("workflow").description("Inspect workflow runs and their job graphs.");
+  workflow.command("inspect <id> <task>").description("Inspect inputs, outputs, attempts and dependency wait reasons.")
+    .option("--occurrence <name>", "inspect one occurrence")
+    .action(async (id: string, task: string, flags: { occurrence?: string }) => {
+      const context = await resolveContext(cwd, print);
+      const repository = { id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot };
+      const run = (await context.store.listWorkflowRuns(repository)).filter((run) => run.identity.workflowId === id && run.identity.itemId.toLowerCase() === task.toLowerCase() && (!flags.occurrence || flags.occurrence === run.identity.occurrence)).sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
+      if (!run) throw new Error(`No workflow '${id}' found for '${task}'.`);
+      print(JSON.stringify(inspectWorkflowRun(run), null, 2));
+    });
   workflow.command("test <id>").description("Preview a workflow's items, jobs, and what would start now.").action(async (id: string) => {
     const context = await resolveContext(cwd, print);
     if (!context.config.workflows[id]) throw new Error(`Unknown workflow '${id}'.`);
     if (!options.handlers?.workflowTest) noHandler("workflow test");
     await options.handlers.workflowTest(context, id);
   });
+  workflow.command("adopt <id> <task>").description("Adopt the validated current definition for an imported workflow run.")
+    .option("--occurrence <name>", "target a specific run; defaults to the most recent")
+    .action(async (id: string, task: string, flags: { occurrence?: string }) => {
+      const context = await resolveContext(cwd, print);
+      if (!options.handlers?.workflowAdopt) noHandler("workflow adoption");
+      await options.handlers.workflowAdopt(context, id, task, flags.occurrence);
+    });
   workflow.command("retry <id> <task>")
     .description("Clear settled jobs so a workflow run advances again on the next poll.")
     .option("--job <name>", "retry only this job (repeatable)", (value: string, previous: string[]) => [...previous, value], [])
@@ -435,12 +473,12 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
   workflow.command("runs").description("Show persisted workflow runs and each job's state.").option("--json", "emit JSON").action(async (flags: { json?: boolean }) => {
     const context = await resolveContext(cwd, print);
     const runs = await context.store.listWorkflowRuns({ id: context.config.project.name || resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot });
-    if (flags.json) { print(JSON.stringify(runs, null, 2)); return; }
+    if (flags.json) { print(JSON.stringify(redactExecution(runs), null, 2)); return; }
     if (runs.length === 0) { print("No workflow runs recorded."); return; }
     for (const run of runs) {
       print(`${run.identity.workflowId}  ${run.item.id}  ${run.status}  (${run.identity.occurrence})`);
       for (const [jobId, job] of Object.entries(run.jobs)) {
-        print(`    ${jobId.padEnd(20)} ${job.status.padEnd(10)} ${job.message || job.error || ""}`);
+        print(`    ${jobId.padEnd(20)} ${job.status.padEnd(10)} ${job.needsAttention ? "needs attention: " : ""}${job.message || job.error || ""}`);
       }
     }
   });

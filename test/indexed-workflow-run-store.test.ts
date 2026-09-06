@@ -55,4 +55,37 @@ describe("IndexedWorkflowRunStore", () => {
     expect((await repositoryStore.findWorkflowRun(identity))?.id).toBeTruthy();
     expect(errors).toHaveLength(1);
   });
+
+  it("replays a raw-ledger workflow projection exactly once after index recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "relay-indexed-outbox-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-indexed-outbox-state-"));
+    process.env.XDG_STATE_HOME = stateHome;
+    const store = new RepositoryStateStore(root);
+    const repository = { id: "repo", root };
+    const identity = { repository, workflowId: "ship", sourceId: "queue", itemId: "T-3", occurrence: "one" };
+
+    // This intentionally bypasses IndexedWorkflowRunStore: state and its
+    // outbox must commit together before a projector is available.
+    const opened = await store.openWorkflowRun({ identity, item: { sourceId: "queue", id: "T-3", title: "Ship" }, startedAt: "2026-01-01T00:00:00.000Z" });
+    expect(await store.pendingProjections()).toHaveLength(1);
+
+    const unavailable = {
+      syncRun: () => { throw new Error("index unavailable"); },
+      appendProjectedEvent: () => { throw new Error("index unavailable"); },
+      appendEvent: () => { throw new Error("index unavailable"); },
+      importRuns: () => { throw new Error("index unavailable"); },
+    } as unknown as GlobalWorkflowRegistry;
+    const errors: unknown[] = [];
+    await new IndexedWorkflowRunStore(store, unavailable, repository, (error) => errors.push(error)).listWorkflowRuns(repository);
+    expect(await store.pendingProjections()).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+
+    const registry = new GlobalWorkflowRegistry({ stateHome });
+    const recovered = new IndexedWorkflowRunStore(store, registry, repository);
+    await recovered.listWorkflowRuns(repository);
+    await recovered.listWorkflowRuns(repository);
+    expect(await store.pendingProjections()).toHaveLength(0);
+    expect(registry.listEvents(opened.id).map((event) => event.type)).toEqual(["workflow.opened"]);
+    registry.close();
+  });
 });

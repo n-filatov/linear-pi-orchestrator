@@ -89,6 +89,7 @@ export class GlobalRuntimeSupervisor {
     if (!controller) return { projectId, state: "stopped" };
     controller.stopped = true;
     if (controller.timer) clearTimeout(controller.timer);
+    await this.handlers.stopPolling?.(controller.project.root);
     await controller.ticking;
     await controller.releaseLease?.();
     controller.releaseLease = undefined;
@@ -111,13 +112,16 @@ export class GlobalRuntimeSupervisor {
     controller.ticking = (async () => {
       try {
         const context = await this.projects.context(controller.project.id);
-        await this.handlers.once!(context, {});
+        if (this.handlers.poll) await this.handlers.poll(context);
+        else await this.handlers.once!(context, {});
         controller.status = { projectId: controller.project.id, state: "running", lastTickAt: new Date().toISOString() };
-        const interval = pollingInterval(context);
+        if (controller.stopped) return;
+        const interval = this.handlers.poll ? Math.min(1_000, pollingInterval(context)) : pollingInterval(context);
         const next = Date.now() + interval;
         controller.status.nextTickAt = new Date(next).toISOString();
         controller.timer = setTimeout(() => { void this.tick(controller); }, interval);
       } catch (error) {
+        if (controller.stopped) return;
         const interval = 30_000;
         controller.status = {
           projectId: controller.project.id,

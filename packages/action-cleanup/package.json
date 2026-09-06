@@ -1,0 +1,18 @@
+{
+  "name": "@task-relay/action-cleanup",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": { "@task-relay/domain": "file:../domain", "@task-relay/plugin-sdk": "file:../plugin-sdk" },
+  "scripts": {
+    "test": "vitest run --config ../../vitest.config.ts --root ../.. packages/action-cleanup/test",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "build": "npm run build --prefix ../.."
+  }
+}

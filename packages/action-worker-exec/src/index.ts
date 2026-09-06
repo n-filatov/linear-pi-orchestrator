@@ -1,0 +1,8 @@
+import Handlebars from "handlebars";
+import { z } from "zod";
+import type { ActionContext, ActionPlugin } from "@task-relay/plugin-sdk";
+const ref = z.union([z.object({ action:z.string().min(1) }).strict(), z.object({ workerId:z.string().min(1) }).strict(), z.object({ sourceItem:z.literal("current"), runs:z.enum(["latest","active","all"]).default("latest") }).strict()]).default({ sourceItem:"current", runs:"latest" });
+export const workerExecConfigSchema = z.object({ worker:ref, open:z.enum(["pane","window"]).default("pane"), direction:z.enum(["horizontal","vertical"]).default("vertical"), name:z.string().min(1).optional(), command:z.string().min(1), args:z.array(z.string()).default([]), cwd:z.string().min(1).optional(), environment:z.record(z.string(),z.string()).default({}) }).strict();
+export type WorkerExecActionConfig=z.infer<typeof workerExecConfigSchema>;
+const render=(c:ActionContext,v:string)=>c.inputsResolved ? v : Handlebars.compile(v,{noEscape:true})({item:c.item,worker:c.worker,run:c.run,actions:c.outputs,repository:c.repository});
+export function createWorkerExecAction(): ActionPlugin<WorkerExecActionConfig> { return { kind:"action",use:"worker-exec",target:"worker",configSchema:workerExecConfigSchema,presentation:{name:"Run beside worker",description:"Open a command pane or window in a worker workspace.",category:"Workers",icon:"terminal-square",color:"#7c3aed"},execute(c,x){return c.workers.exec(x.worker,{command:render(c,x.command),args:x.args.map(v=>render(c,v)),cwd:x.cwd?render(c,x.cwd):undefined,env:Object.fromEntries(Object.entries(x.environment).map(([k,v])=>[k,render(c,v)])),name:x.name?render(c,x.name):undefined,open:x.open,direction:x.direction});} }; }

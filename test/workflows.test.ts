@@ -520,7 +520,7 @@ describe("workflow runs end to end", () => {
       trigger: { id: "feature:one", sourceId: "queue", repository, enabled: true },
     });
     claimed!.status = "running";
-    claimed!.worker = { id: "ENG-1:codex", startedAt: "2026-08-19T09:00:00.000Z", metadata: { workspace: projectRoot } };
+    claimed!.worker = { id: "ENG-1:codex", startedAt: "2026-08-19T09:00:00.000Z", metadata: { workspace: projectRoot, pid: process.pid } };
     await store.update(claimed!);
     const workflowIdentity = { repository, workflowId: "feature", sourceId: "queue", itemId: "ENG-1", occurrence: "item" };
     await store.openWorkflowRun({ identity: workflowIdentity, item, startedAt: "2026-08-19T09:00:00.000Z" });
@@ -596,7 +596,7 @@ describe("workflow runs end to end", () => {
     expect(runs.find((entry) => entry.identity.itemId === "ENG-1")!.status).toBe("succeeded");
   });
 
-  it("reopens a finished run so a retried job can advance again", async () => {
+  it("keeps an unsafe failed effect fenced until an explicit retry", async () => {
     const root = await project({ one: fail, two: { ...echo("after"), needs: "one" } });
     const projectRoot = (await loadRelayConfig(root)).projectRoot;
     const store = new RepositoryStateStore(projectRoot);
@@ -604,9 +604,11 @@ describe("workflow runs end to end", () => {
 
     await run(root, "once", "--trigger", "feature");
     let [workflowRun] = await store.listWorkflowRuns(repository);
-    expect(workflowRun.status).toBe("failed");
-    expect(workflowRun.jobs.one.status).toBe("failed");
-    expect(workflowRun.jobs.two.status).toBe("omitted");
+    // A command can exit after an external effect. The executor records that
+    // uncertainty on the durable attempt instead of silently retrying it.
+    expect(workflowRun.status).toBe("running");
+    expect(workflowRun.jobs.one).toMatchObject({ status: "started", needsAttention: true });
+    expect(workflowRun.jobs.two?.status).not.toBe("succeeded");
 
     const retried = await run(root, "workflow", "retry", "feature", "ENG-1");
     expect(retried.errors).toBe("");
@@ -615,14 +617,16 @@ describe("workflow runs end to end", () => {
     expect(workflowRun.status).toBe("running");
     expect(workflowRun.jobs.one.status).toBe("pending");
 
-    // The job still fails, but the retry genuinely re-ran it.
+    // The explicit command clears the fence, so this is the only allowed
+    // second invocation. It becomes uncertain again when the command exits.
     await run(root, "once", "--trigger", "feature");
     [workflowRun] = await store.listWorkflowRuns(repository);
     expect(workflowRun.jobs.one.attempts).toBe(2);
-    expect(workflowRun.status).toBe("failed");
+    expect(workflowRun.jobs.one).toMatchObject({ status: "started", needsAttention: true });
+    expect(workflowRun.status).toBe("running");
   });
 
-  it("omits a job after its dependency fails, and always() still runs", async () => {
+  it("holds dependent jobs after an uncertain effect", async () => {
     const root = await project({
       one: fail,
       two: { ...echo("never"), needs: "one" },
@@ -631,17 +635,17 @@ describe("workflow runs end to end", () => {
 
     const tick = await run(root, "once", "--trigger", "feature");
     expect(tick.errors).toBe("");
-    expect(tick.output).toContain("1 action failures");
+    expect(tick.output).toContain("0 action failures");
 
     const projectRoot = (await loadRelayConfig(root)).projectRoot;
     const runs = await new RepositoryStateStore(projectRoot).listWorkflowRuns({ id: "workflow-test", root: projectRoot });
-    expect(runs[0].jobs.one.status).toBe("failed");
-    expect(runs[0].jobs.two).toMatchObject({ status: "omitted", message: "one.Succeeded can no longer be satisfied" });
-    expect(runs[0].jobs.three.status).toBe("succeeded");
-    expect(runs[0].status).toBe("failed");
+    expect(runs[0].jobs.one).toMatchObject({ status: "started", needsAttention: true });
+    expect(runs[0].jobs.two?.status).not.toBe("succeeded");
+    expect(runs[0].jobs.three?.status).not.toBe("succeeded");
+    expect(runs[0].status).toBe("running");
 
     const listed = await run(root, "workflow", "runs");
-    expect(listed.output).toContain("feature  ENG-1  failed");
-    expect(listed.output).toContain("omitted");
+    expect(listed.output).toContain("feature  ENG-1  running");
+    expect(listed.output).toContain("Execution outcome is uncertain");
   });
 });

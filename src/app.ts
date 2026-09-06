@@ -1,3 +1,4 @@
+import { pollingTriggerSource } from "./application/poll-trigger.js";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
@@ -13,7 +14,7 @@ import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findI
 import { loadReusableWorkflow } from "./config/reusable.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter, TmuxWindowHarness, TMUX_WINDOW_HARNESS_ID } from "./runtime/index.js";
 import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
-import { CommandWorkSource, LinearMcpSource, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
+import { builtInSourcePlugins, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
 import { tickTable, type TickTableRow } from "./logging/tables.js";
@@ -28,6 +29,7 @@ import { CODEX_APP_SERVER_HARNESS_ID, CodexAppServerHarness } from "./codex/inde
 
 type RuntimeComposition = {
   relay: TaskRelay;
+  close(): Promise<void>;
   sources: Map<string, WorkSource>;
   triggers: TriggerDefinition[];
   workflows: WorkflowDefinition[];
@@ -132,7 +134,29 @@ async function contextForRegistryRecord(context: RelayCommandContext, record: Gl
 }
 
 export function createRuntimeHandlers(): RelayCommandHandlers {
+  const polling = new Map<string, { config: string; runtime: RuntimeComposition }>();
   return {
+    poll: async (context) => {
+      const key = path.resolve(context.projectRoot);
+      const config = JSON.stringify(context.config);
+      let existing = polling.get(key);
+      if (existing && existing.config !== config) {
+        await existing.runtime.close();
+        polling.delete(key);
+        existing = undefined;
+      }
+      if (!existing) {
+        existing = { config, runtime: await composeRuntime(context, { scheduled: true }) };
+        polling.set(key, existing);
+      }
+      await writeTickSummary(context, await existing.runtime.relay.tick());
+    },
+    stopPolling: async (projectRoot) => {
+      const key = path.resolve(projectRoot);
+      const existing = polling.get(key);
+      polling.delete(key);
+      await existing?.runtime.close();
+    },
     update: async (options) => {
       const result = options.check
         ? await checkRelayUpdate({ version: options.version })
@@ -149,29 +173,30 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
     once: async (context, options) => {
       const runtime = await composeRuntime(context, options);
       try { await writeTickSummary(context, await runtime.relay.tick()); }
-      finally { await runtime.relay.stop(); }
+      finally { await runtime.close(); }
     },
     watch: async (context, options) => {
-      const runtime = await composeRuntime(context, options);
-      const interval = pollingInterval(context.config, options.trigger);
+      const runtime = await composeRuntime(context, { ...options, scheduled: true });
+      const interval = Math.min(1_000, pollingInterval(context.config, options.trigger));
       let stopping = false;
-      const stop = () => { stopping = true; };
+      const shutdown = new AbortController();
+      const stop = () => { stopping = true; shutdown.abort(); void runtime.close(); };
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
       context.write(`Watching ${context.config.project.name || context.projectRoot} every ${interval}ms. Press Ctrl-C to stop.`);
       try {
         while (!stopping) {
           await writeTickSummary(context, await runtime.relay.tick());
-          if (!stopping) await delay(interval);
+          if (!stopping) await delay(interval, undefined, { signal: shutdown.signal }).catch(() => undefined);
         }
       } finally {
         process.off("SIGINT", stop);
         process.off("SIGTERM", stop);
-        await runtime.relay.stop();
+        await runtime.close();
       }
     },
     triggerTest: async (context, selected) => {
-      const runtime = await composeRuntime(context, { trigger: selected.id });
+      const runtime = await composeRuntime(context, { trigger: selected.id, readOnly: true });
       try {
         const trigger = runtime.triggers[0];
         const source = trigger && runtime.sources.get(trigger.sourceId);
@@ -180,7 +205,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         context.write(`Trigger: ${trigger.id}\nSource: ${trigger.sourceId}\nActions: ${(trigger.actions ?? []).map((action) => `${action.id} (${action.use})`).join(", ")}\nMatches: ${items.length}`);
         for (const item of items) context.write(`  ${item.id}  ${item.title}${item.terminal ? "  [terminal]" : ""}`);
         context.write("Dry run only; no action, source, workspace, or worker changes were made.");
-      } finally { await runtime.relay.stop(); }
+      } finally { await runtime.close(); }
     },
     signal: async (context, target, outcome, options) => {
       const candidates = (await context.store.listRuns())
@@ -209,7 +234,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       try {
         const source = runtime.sources.get(run.identity.sourceId);
         if (source) await source.report({ type: status, sourceId: source.id, run: finished, occurredAt: at, error: finished.error });
-      } finally { await runtime.relay.stop(); }
+      } finally { await runtime.close(); }
       context.write(`${run.item.id}: recorded ${status}${Object.keys(outputs).length ? ` with ${Object.keys(outputs).length} output(s)` : ""}.`);
     },
     workerControl: async (context, target, action) => {
@@ -267,7 +292,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         const known = Object.keys(context.config.workflows);
         throw new Error(`Unknown workflow '${id}'.${known.length ? ` Configured workflows: ${known.join(", ")}.` : " None are configured."}`);
       }
-      const runtime = await composeRuntime(context, { trigger: id });
+      const runtime = await composeRuntime(context, { trigger: id, readOnly: true });
       try {
         const workflow = runtime.workflows[0];
         const source = workflow && runtime.sources.get(workflow.sourceId);
@@ -286,7 +311,28 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
           }
         }
         context.write("Dry run only; no action, source, workspace, or worker changes were made.");
-      } finally { await runtime.relay.stop(); }
+      } finally { await runtime.close(); }
+    },
+    workflowAdopt: async (context, id, task, occurrence) => {
+      // Imported runs retain the identity that was recorded by the legacy
+      // ledger. Use the resolved repository identity so adoption can find runs
+      // even when the config project name differs from that stable id.
+      const repository = { id: context.repositoryIdentity?.id || context.config.project.name || path.basename(context.projectRoot), root: context.projectRoot };
+      const candidates = (await context.store.listWorkflowRuns(repository))
+        .filter((run) => run.identity.workflowId === id && run.identity.itemId.toLowerCase() === task.toLowerCase())
+        .filter((run) => !occurrence || run.identity.occurrence === occurrence)
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+      const target = candidates[0];
+      if (!target) throw new Error(`No workflow '${id}' found for '${task}'.`);
+      if (!target.needsAttention || target.definition) throw new Error(`Workflow run ${target.identity.occurrence} is not awaiting definition adoption.`);
+      const runtime = await composeRuntime(context, { trigger: id, readOnly: true });
+      try {
+        const definition = runtime.workflows.find((workflow) => workflow.id === id);
+        if (!definition) throw new Error(`Current workflow '${id}' could not be validated.`);
+        const adopted = await context.store.adoptWorkflowDefinition(target.identity, definition, new Date().toISOString());
+        if (!adopted) throw new Error(`Workflow run ${target.identity.occurrence} changed before adoption.`);
+        context.write(`Adopted current definition for ${id} ${task} (${target.identity.occurrence}).`);
+      } finally { await runtime.close(); }
     },
     workflowActionTest: async (context, workflowId, actionId, options): Promise<WorkflowActionTestResult> => {
       // Canvas edits are tested before save. The draft replaces only this
@@ -308,7 +354,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         throw new Error(`Unknown workflow '${workflowId}'.${known.length ? ` Configured workflows: ${known.join(", ")}.` : " None are configured."}`);
       }
 
-      const runtime = await composeRuntime(previewContext, { trigger: workflowId });
+      const runtime = await composeRuntime(previewContext, { trigger: workflowId, readOnly: true });
       try {
         const workflow = runtime.workflows[0];
         const source = workflow && runtime.sources.get(workflow.sourceId);
@@ -366,7 +412,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
           eligibleCount: items.filter((item) => item.eligible).length,
           items,
         };
-      } finally { await runtime.relay.stop(); }
+      } finally { await runtime.close(); }
     },
     daemon: async (context, action) => {
       const daemon = new RepositoryDaemon(context.projectRoot);
@@ -439,7 +485,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         const source = runtime.sources.get(run.identity.sourceId);
         if (source && stopped) await source.report({ type: "stopped", sourceId: source.id, run: stopped, occurredAt: stopped.completedAt! });
         targetContext.write(`Cleaned ${run.item.id}: ${stopped ? "worker stopped and " : ""}workspace removed.`);
-      } finally { await runtime.relay.stop(); }
+      } finally { await runtime.close(); }
     },
   };
 }
@@ -452,7 +498,7 @@ function isCodexAppServerWorker(worker: WorkerHandle): boolean {
     && typeof (metadata as Record<string, unknown>).threadId === "string";
 }
 
-async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string } = {}): Promise<RuntimeComposition> {
+async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string; scheduled?: boolean; readOnly?: boolean } = {}): Promise<RuntimeComposition> {
   const { registry, repository, registryRepository } = await ensureRegistryContext(context);
   const codexAppServer = sharedCodexAppServer(context.projectRoot);
   const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger, codexAppServer);
@@ -474,17 +520,17 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   }
   if (filters.trigger && triggers.length === 0 && workflows.length === 0) throw new Error(`Unknown trigger or workflow '${filters.trigger}'.`);
   for (const trigger of triggers) {
-    for (const action of trigger.actions ?? []) plugins.parseActionConfig(action.use, action.config ?? {});
+    for (const action of trigger.actions ?? []) if (!JSON.stringify(action.config ?? {}).includes("${{")) plugins.parseActionConfig(action.use, action.config ?? {});
   }
   for (const workflow of workflows) {
-    for (const job of workflow.jobs) plugins.parseActionConfig(job.use, job.config ?? {});
+    for (const job of workflow.jobs) if (!JSON.stringify(job.config ?? {}).includes("${{")) plugins.parseActionConfig(job.use, job.config ?? {});
   }
 
   const sources = new Map<string, WorkSource>();
   for (const sourceId of new Set([...triggers.map((trigger) => trigger.sourceId), ...workflows.map((workflow) => workflow.sourceId)])) {
     const definition = context.config.sources[sourceId];
     if (!definition?.enabled) continue;
-    let source = await createSource(sourceId, definition, context.projectRoot, repository, plugins);
+    let source = await createSource(sourceId, definition, context.projectRoot, repository, plugins, context.store, { readOnly: filters.readOnly });
     if (filters.task) source = filterSource(source, filters.task);
     if (context.config.execution.retries > 0) source = retrySource(source, context.config.execution.retries);
     sources.set(sourceId, source);
@@ -513,7 +559,8 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const workflowRegistry = context.workflowRegistry ?? new GlobalWorkflowRegistry();
   context.workflowRegistry = workflowRegistry;
   const workflowRuns = new IndexedWorkflowRunStore(context.store, workflowRegistry, registryRepository);
-  const relay = new TaskRelay({
+  const { createRelayApplication } = await import("./application/relay-module.js");
+  const application = await createRelayApplication({
     triggers: triggerProvider,
     workflows: { list: async () => workflows },
     workflowRuns,
@@ -525,9 +572,10 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
     actionExecutions: context.store,
     validateLaunch: (request, where) => validateLaunchRequest(context.config, request, `Action '${where.actionId}' in trigger '${where.triggerId}'`),
     oneWorkerPerItem: context.config.execution.oneWorkerPerItem,
+    pollInterval: filters.scheduled ? (id) => context.config.sources[id]?.pollIntervalMs ?? 30_000 : undefined,
     logger: relayLogger(context.logger, repository.id),
   });
-  return { relay, sources, triggers, workflows, launcher, workspace, runStore: eventStore, plugins };
+  return { ...application, sources, triggers, workflows, launcher, workspace, runStore: eventStore, plugins };
 }
 
 function domainTrigger(config: RelayConfigV2, trigger: RelayTriggerV2, repository: RepositoryScope): TriggerDefinition {
@@ -674,7 +722,7 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
       resolved = { id: reference, use: definition.use, config: definition.with };
     } else {
       if (!reference.enabled) throw new Error(`Inline action '${reference.id ?? reference.use}' is disabled.`);
-      resolved = { id: reference.id ?? `${index + 1}-${reference.use}`, use: reference.use, config: reference.with, continueOnError: reference.continueOnError };
+      resolved = { id: reference.id ?? `${index + 1}-${reference.use}`, use: reference.use, config: reference.with, if: reference.if, continueOnError: reference.continueOnError };
     }
     // Built-in launch config is known statically, so its errors surface at
     // config-load time. Every other action goes through the same rules at
@@ -768,6 +816,13 @@ async function pluginRegistry(config: RelayConfigV2, projectRoot: string, select
   if (codexAppServer) registry.registerHarness(codexAppServer);
   registry.registerHarness(new TmuxWindowHarness(new TmuxExecutionAdapter({ session: "task-relay" })));
   for (const plugin of builtInActionPlugins({ codexAppServer })) registry.register(plugin);
+  for (const plugin of builtInSourcePlugins({
+    commandInvocation: (value) => invocation(value, projectRoot),
+    connectLinear: async (_sourceId, value) => {
+      const mcp = requiredRecord(value, "sources.*.with.mcp");
+      return await SdkMcpToolClient.connect({ clientName: "task-relay", clientVersion: "0.2.0", transport: mcpTransport(mcp, projectRoot) });
+    },
+  })) registry.register(plugin);
   const externalUses = new Set<string>();
 
   const triggers = config.triggers.filter((trigger) => !selected || trigger.id === selected);
@@ -784,20 +839,17 @@ async function pluginRegistry(config: RelayConfigV2, projectRoot: string, select
   for (const trigger of triggers) for (const action of trigger.actions) if (typeof action !== "string" && !registry.action(action.use)) externalUses.add(action.use);
   // Read the managed lockfile once, not once per plugin.
   const lock = externalUses.size > 0 ? await readPluginLock() : undefined;
-  for (const use of externalUses) registry.registerAs(use, await loadRelayPlugin(use, projectRoot, lock));
+  for (const use of externalUses) {
+    registry.registerAs(use, await loadRelayPlugin(use, projectRoot, lock));
+    const installed = lock && findInstalledPlugin(lock, use);
+    registry.setRevision(use, installed ? `${installed.version}:${installed.integrity}` : `external:${use}`);
+  }
   return registry;
 }
 
-async function createSource(sourceId: string, definition: RelayConfigV2["sources"][string], projectRoot: string, repository: RepositoryScope, plugins: RelayPluginRegistry): Promise<WorkSource> {
-  const config = asRecord(definition.with);
-  if (definition.use === "command") {
-    return new CommandWorkSource({ id: sourceId, discover: invocation(requiredRecord(config.discover, `sources.${sourceId}.with.discover`), projectRoot), report: config.report ? invocation(requiredRecord(config.report, `sources.${sourceId}.with.report`), projectRoot) : undefined });
-  }
-  if (definition.use === "linear") {
-    const mcp = requiredRecord(config.mcp, `sources.${sourceId}.with.mcp`);
-    const client = await SdkMcpToolClient.connect({ clientName: "task-relay", clientVersion: "0.2.0", transport: mcpTransport(mcp, projectRoot) });
-    return new LinearMcpSource({ id: sourceId, client, tools: asRecord(config.tools), reporting: asRecord(config.reporting) });
-  }
+async function createSource(sourceId: string, definition: RelayConfigV2["sources"][string], projectRoot: string, repository: RepositoryScope, plugins: RelayPluginRegistry, store: RepositoryStateStore, options: { readOnly?: boolean } = {}): Promise<WorkSource> {
+  const triggerPlugin = plugins.trigger(definition.use);
+  if (triggerPlugin) return pollingTriggerSource(sourceId, triggerPlugin, plugins.parseTriggerConfig(definition.use, definition.with ?? {}), repository, store, options);
   const plugin = plugins.source(definition.use);
   if (!plugin) throw new Error(`Unknown source plugin '${definition.use}'.`);
   const pluginConfig = plugins.parseSourceConfig(definition.use, definition.with);
@@ -809,7 +861,7 @@ function pluginWorkSource(sourceId: string, plugin: SourcePlugin, config: unknow
     id: sourceId,
     discover: async ({ trigger, signal }) => {
       const match = registry.parseSourceMatch(use, trigger.selector ?? {});
-      const context = { sourceId, config, match, repository, signal };
+      const context = { sourceId, config, match, repository, signal, trigger };
       const items = await plugin.discover(context);
       if (!plugin.matches) return items;
       const matched = await Promise.all(items.map(async (item) => await plugin.matches!(item, match, { sourceId, config, repository, signal }) ? item : undefined));
@@ -852,17 +904,20 @@ function mcpTransport(value: Record<string, unknown>, projectRoot: string): McpT
 }
 
 function filterSource(source: WorkSource, task: string): WorkSource {
-  return { id: source.id, discover: async (options) => (await source.discover(options)).filter((item) => item.id.toLowerCase() === task.toLowerCase()), report: (event) => source.report(event), close: () => source.close?.() ?? Promise.resolve() };
+  return { id: source.id, acknowledge: source.acknowledge?.bind(source), discover: async (options) => (await source.discover(options)).filter((item) => item.id.toLowerCase() === task.toLowerCase()), report: (event) => source.report(event), close: () => source.close?.() ?? Promise.resolve() };
 }
 
 function retrySource(source: WorkSource, retries: number): WorkSource {
-  return { id: source.id, discover: (options) => pRetry(() => source.discover(options), { retries, signal: options.signal }), report: (event) => source.report(event), close: () => source.close?.() ?? Promise.resolve() };
+  return { id: source.id, acknowledge: source.acknowledge?.bind(source), discover: (options) => pRetry(() => source.discover(options), { retries, signal: options.signal }), report: (event) => source.report(event), close: () => source.close?.() ?? Promise.resolve() };
 }
 
 function pollingInterval(config: RelayConfigV2, triggerId?: string): number {
-  const sourceIds = new Set(config.triggers.filter((trigger) => !triggerId || trigger.id === triggerId).map((trigger) => trigger.source));
+  const sourceIds = new Set([
+    ...config.triggers.filter((trigger) => !triggerId || trigger.id === triggerId).map((trigger) => trigger.source),
+    ...Object.entries(config.workflows).filter(([id]) => !triggerId || id === triggerId).map(([, workflow]) => workflow.on.source),
+  ]);
   const intervals = [...sourceIds].map((id) => config.sources[id]?.pollIntervalMs).filter((value): value is number => typeof value === "number");
-  return Math.min(...intervals, 30_000);
+  return intervals.length ? Math.min(...intervals) : 30_000;
 }
 
 function relayLogger(logger: Logger, project: string): RelayLogger {

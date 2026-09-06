@@ -6,6 +6,9 @@ export interface ProjectFolder { id: string; repositoryId?: string; root: string
 export interface WorkflowSummary { id: string; enabled?: boolean; source?: string; fire?: string; timeoutMinutes?: number; jobs?: JobSummary[] | Record<string, JobSummary>; runs?: WorkflowRun[]; revision?: string | number; [key: string]: any; }
 export interface JobSummary { id?: string; use: string; needs?: string[]; enabled?: boolean; [key: string]: any; }
 export interface WorkflowRun { id: string; status: string; item?: { id?: string; title?: string }; jobs?: Record<string, any>; updatedAt?: string; [key: string]: any; }
+export interface ExecutionJobInspection { status?: string; attempts?: number; attempt?: unknown; attemptId?: string; waitReason?: string; message?: string; needsAttention?: boolean; retryAt?: string; resolvedInput?: unknown; input?: unknown; inputs?: unknown; output?: unknown; outputs?: unknown; operation?: unknown; operationHandle?: unknown; [key: string]: unknown; }
+export interface ExecutionInspection { id?: string; status?: string; item?: { id?: string; title?: string }; identity?: { workflowId?: string; occurrence?: string }; workflowId?: string; definitionRevision?: string | number; pluginRevisions?: Record<string, string>; trigger?: unknown; jobs?: Record<string, ExecutionJobInspection>; decisions?: Record<string, { reason?: string }>; updatedAt?: string; startedAt?: string; cancellation?: unknown; cancellationResult?: unknown; [key: string]: unknown; }
+export interface ExecutionDetail { execution: ExecutionInspection; inspection?: ExecutionInspection; jobs?: Record<string, ExecutionJobInspection>; events?: unknown; }
 export interface Worker { id: string; status?: string; task?: string; title?: string; workspace?: { path?: string }; [key: string]: any; }
 export interface ActionTestMatch { id?: string; title?: string; eligible?: boolean; decision?: string; reason?: string; [key: string]: any; }
 export interface ActionTestResult { workflowId?: string; actionId?: string; matches: ActionTestMatch[]; count: number; triggerMatchCount: number; eligibleCount: number; reasons: string[]; [key: string]: any; }
@@ -92,7 +95,7 @@ export async function getExecutions(project?: ProjectFolder): Promise<any[]> {
     catch { return []; }
   }
 }
-export async function getExecution(id: string): Promise<Json> { return request(`/api/executions/${encodeURIComponent(id)}`); }
+export async function getExecution(id: string): Promise<ExecutionDetail> { return request(`/api/executions/${encodeURIComponent(id)}`); }
 export async function retryExecution(id: string, jobIds?: string[]): Promise<Json> { return request(`/api/executions/${encodeURIComponent(id)}/retry`, { method: "POST", body: JSON.stringify({ jobIds }) }); }
 export async function getWorkers(project?: ProjectFolder): Promise<Worker[]> {
   try {

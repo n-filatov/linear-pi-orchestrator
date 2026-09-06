@@ -266,13 +266,13 @@ describe("RepositoryStateStore", () => {
         status: "succeeded",
         completedAt: "2026-01-01T00:01:00.000Z",
         output: { messageId: "slack-42", delivered: true },
-      });
+      }, execution!.attemptId);
       expect(finished).toMatchObject({ status: "succeeded", output: { messageId: "slack-42", delivered: true } });
       expect(await store.finishActionExecution(claim.idempotencyKey, claim.claimedAt, {
         status: "failed",
         completedAt: "2026-01-01T00:02:00.000Z",
         error: { message: "late result" },
-      })).toBeUndefined();
+      }, execution!.attemptId)).toBeUndefined();
       expect(await store.claimAction(claim)).toBeUndefined();
       expect(await store.listActionExecutions({ sourceId: "linear", statuses: ["succeeded"] })).toHaveLength(1);
     } finally {

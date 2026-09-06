@@ -3,10 +3,22 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "@task-relay/*": ["packages/*/src/index.ts"]
+    },
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "index.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts"
+  ]
 }

@@ -26,6 +26,8 @@ export const actionDefinitionV2Schema = pluginDefinitionSchema.extend({
 export const inlineActionV2Schema = actionDefinitionV2Schema.extend({
   /** Stable key for action output references within this trigger. */
   id: identifier.optional(),
+  /** Optional job condition retained by the legacy pipeline adapter. */
+  if: z.string().min(1).optional(),
   continueOnError: z.boolean().default(false),
 }).strict();
 

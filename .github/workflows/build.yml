@@ -58,17 +58,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify npm package compatibility
+        run: npm run package:smoke
+
       - name: Compile binary
         run: |
           bun build \
             --compile \
             --target=${{ matrix.bun-target }} \
+            --external @nestjs/microservices \
+            --external @nestjs/platform-express \
+            --external @nestjs/websockets \
+            --external class-transformer \
+            --external class-validator \
             --outfile=${{ matrix.artifact }} \
             src/cli/main.ts
 
       - name: Smoke test
         if: matrix.bun-target == 'bun-linux-x64' || matrix.bun-target == 'bun-darwin-arm64'
-        run: ./${{ matrix.artifact }} --help
+        run: |
+          ./${{ matrix.artifact }} --help
+          node scripts/smoke-compiled-cli.mjs ./${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:
