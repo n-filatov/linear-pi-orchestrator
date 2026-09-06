@@ -15,6 +15,7 @@ import { GlobalRuntimeSupervisor } from "./runtime-supervisor.js";
 import { closeCodexAppServers } from "../app.js";
 import { WorkflowAlreadyExistsError, WorkflowConfigRepository, WorkflowNotFoundError, WorkflowRevisionConflictError } from "./workflow-config-repository.js";
 import { listPromptFiles, PROMPTS_DIRECTORY } from "../prompts/library.js";
+import { getEditablePrompt, saveEditablePrompt, PromptEditorError } from "../prompts/editor.js";
 import { LinearMcpSource } from "../sources/linear-mcp-source.js";
 import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-client.js";
 import { inspectWorkflowRun } from "../application/execution-inspection.js";
@@ -79,7 +80,7 @@ export class GlobalDashboardServer {
       if (!this.authorized(request, url)) return this.json(response, { error: "Unauthorized" }, 401);
       await this.api(request, response, url);
     } catch (error) {
-      const status = error instanceof WorkflowRevisionConflictError || error instanceof WorkflowAlreadyExistsError ? 409
+      const status = error instanceof PromptEditorError ? error.status : error instanceof WorkflowRevisionConflictError || error instanceof WorkflowAlreadyExistsError ? 409
         : error instanceof WorkflowNotFoundError || error instanceof ProjectNotFoundError ? 404
         : error instanceof SyntaxError || error instanceof URIError || error instanceof ZodError ? 400
         : error instanceof RequestBodyTooLargeError ? 413 : 500;
@@ -162,7 +163,15 @@ export class GlobalDashboardServer {
       }
       if (resource === "prompts" && method === "GET") {
         const folder = await this.requireProject(projectId);
+        if (url.searchParams.has("path")) return this.json(response, await getEditablePrompt(folder.root, url.searchParams.get("path")!));
         return this.json(response, { directory: PROMPTS_DIRECTORY, prompts: await listPromptFiles(folder.root) });
+      }
+      if (resource === "prompts" && method === "PUT") {
+        const folder = await this.requireProject(projectId);
+        const body = await jsonBody(request);
+        if (typeof body.path !== "string" || typeof body.content !== "string" || !(body.revision === null || typeof body.revision === "string"))
+          return this.json(response, { error: "Prompt path, content, and revision are required." }, 400);
+        return this.json(response, await saveEditablePrompt(folder.root, body.path, body.content, body.revision));
       }
       if ((resource === "catalog" || resource === "plugins") && method === "GET") {
         const context = await this.projects.context(projectId);

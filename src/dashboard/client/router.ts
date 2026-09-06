@@ -4,6 +4,7 @@ export type DashboardPage =
   | "workflows"
   | "executions"
   | "workers"
+  | "prompts"
   | "plugins"
   | "settings";
 
@@ -21,6 +22,7 @@ const pages = new Set<DashboardPage>([
   "workflows",
   "executions",
   "workers",
+  "prompts",
   "plugins",
   "settings",
 ]);

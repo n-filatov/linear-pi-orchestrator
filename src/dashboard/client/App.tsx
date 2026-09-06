@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { House, Workflow, Terminal, FolderGit2, RefreshCw, type LucideIcon } from "lucide-react";
+import { House, Workflow, Terminal, FileText, FolderGit2, RefreshCw, type LucideIcon } from "lucide-react";
 import {
   Alert,
   AppShell,
@@ -43,11 +43,13 @@ import { Repositories, RegisterDialog } from "./pages/Repositories";
 import Workflows from "./pages/Workflows";
 import { Executions } from "./pages/Executions";
 import { Workers } from "./pages/Workers";
+import { Prompts } from "./pages/Prompts";
 
 const navigation: { page: DashboardPage; label: string; icon: LucideIcon }[] = [
   { page: "home", label: "Overview", icon: House },
   { page: "workflows", label: "Workflows", icon: Workflow },
   { page: "workers", label: "Workers", icon: Terminal },
+  { page: "prompts", label: "Prompts", icon: FileText },
   { page: "repositories", label: "Repositories", icon: FolderGit2 },
 ];
 
@@ -154,12 +156,12 @@ function Dashboard() {
     (next: DashboardRoute, replace = false) => {
       if (
         operationBusy &&
-        (next.page !== "workflows" || next.projectId !== route.projectId)
+        (next.page !== route.page || next.projectId !== route.projectId)
       )
         return;
       if (
         dirty.current &&
-        (next.page !== "workflows" || next.projectId !== route.projectId)
+        (next.page !== route.page || next.projectId !== route.projectId)
       ) {
         setPendingRoute(next);
         return;
@@ -222,7 +224,7 @@ function Dashboard() {
       }
       if (
         dirty.current &&
-        (next.page !== "workflows" || next.projectId !== route.projectId)
+        (next.page !== route.page || next.projectId !== route.projectId)
       ) {
         window.history.pushState({}, "", dashboardRoutePath(route));
         setPendingRoute(next);
@@ -531,6 +533,7 @@ function Dashboard() {
               onRefresh={() => void workers.refresh()}
             />
           )}
+          {page === "prompts" && (project ? <Prompts key={project.id} project={project} onWorkflow={(id) => navigate(routeForPage("workflows", project.id, id))} onDirtyChange={onDirtyChange} onBusyChange={setOperationBusy} /> : <Alert title="Choose a repository">Select a repository in the sidebar to manage its prompt files.</Alert>)}
         </Stack>
       </AppShell.Main>
       <RegisterDialog
@@ -546,11 +549,11 @@ function Dashboard() {
       <Modal
         opened={Boolean(pendingRoute)}
         onClose={() => setPendingRoute(undefined)}
-        title="Unsaved workflow changes"
+        title="Unsaved changes"
       >
         <Stack>
           <Text size="sm">
-            Leave this workflow and discard its unsaved changes?
+            Leave this page and discard its unsaved changes?
           </Text>
           <Group justify="flex-end">
             <Button

@@ -470,6 +470,13 @@ export async function getPrompts(
     project ? `/api/projects/${idFor(project)}/prompts` : "/api/prompts",
   );
 }
+export interface EditablePrompt { path: string; content: string; revision: string }
+export function getPrompt(project: ProjectFolder, path: string) {
+  return request<EditablePrompt>(`/api/projects/${idFor(project)}/prompts?path=${encodeURIComponent(path)}`);
+}
+export function savePrompt(project: ProjectFolder, path: string, content: string, revision: string | null) {
+  return request<EditablePrompt>(`/api/projects/${idFor(project)}/prompts`, { method: "PUT", body: JSON.stringify({ path, content, revision }) });
+}
 export async function getLinearTriggerOptions(
   sourceId: string,
   project?: ProjectFolder,
