@@ -109,6 +109,8 @@ function Dashboard() {
       : undefined,
   }));
   const project = projects.find((project) => project.id === route.projectId);
+  const stoppedProjects = (project ? [project] : route.projectId ? [] : projects)
+    .filter((entry) => entry.enabled && entry.watcher?.state === "stopped");
   const requestedProject: ProjectFolder | undefined =
     route.projectId && page !== "repositories"
       ? (project ?? { id: route.projectId, root: "" })
@@ -401,6 +403,19 @@ function Dashboard() {
               Scope: {scopeName} · change scope in navigation
             </Text>
           </div>
+          {stoppedProjects.length > 0 && page !== "repositories" && (
+            <Alert color="yellow" title="Watching is stopped">
+              <Text size="sm">
+                {stoppedProjects.map(repositoryName).join(", ")}: issue changes
+                will not start workers. Start the watcher in Repositories;
+                reopening the dashboard does not resume watching.
+              </Text>
+              <Button variant="light" color="yellow" size="xs" mt="sm"
+                onClick={() => navigatePage("repositories")}>
+                Open watcher controls
+              </Button>
+            </Alert>
+          )}
           {route.projectId && folders.data && !project && (
             <Alert color="red" title="Repository not found">
               Repository '{route.projectId}' is not registered. Select another

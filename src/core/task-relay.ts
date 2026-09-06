@@ -203,7 +203,7 @@ export class TaskRelay {
     // set cannot strand an active workflow deadline.
     const engine = this.workflowEngine(result);
     const active = (await runs.listWorkflowRuns(workflow.repository)).filter((run) => run.identity.workflowId === workflow.id && run.status === "running");
-    const observed = new Set(active.map((run) => occurrenceKey(run.item, run.identity.occurrence)));
+    const observed = new Set(active.map((run) => occurrenceKey(run.item, run.definition ?? workflow)));
     for (const run of active) {
       if (this.stopController.signal.aborted) return;
       await engine.execute({ workflow: run.definition ?? workflow, item: run.item, result, persisted: run });
@@ -220,7 +220,7 @@ export class TaskRelay {
     result.itemsDiscovered += items.length;
     const queue = new PQueue({ concurrency: workflow.concurrency ? 1 : normaliseConcurrency(workflow.maxConcurrent) });
     for (const item of items) {
-      if (observed.has(occurrenceKey(item))) continue;
+      if (observed.has(occurrenceKey(item, workflow))) continue;
       void queue.add(async () => engine.execute({ workflow, item, result })).catch((error: unknown) => {
         this.dependencies.logger.error("Workflow reconciliation failed unexpectedly", { workflowId: workflow.id, itemId: item.id, title: item.title, error: messageFor(error) });
       });
@@ -537,7 +537,7 @@ export class TaskRelay {
       const active = (await this.workflowRunStore.listWorkflowRuns(legacyWorkflow.repository))
         .filter((run) => run.identity.workflowId === legacyWorkflow.id && run.status === "running");
       for (const run of active) {
-        observedLegacyOccurrences.add(occurrenceKey(run.item, run.identity.occurrence));
+        observedLegacyOccurrences.add(occurrenceKey(run.item, run.definition ?? legacyWorkflow));
         await workflowEngine!.execute({ workflow: legacyWorkflow, item: run.item, result, persisted: run });
       }
     }
@@ -596,7 +596,7 @@ export class TaskRelay {
     for (const item of eligible) {
       void queue.add(async () => {
         if (legacyWorkflow) {
-          if (observedLegacyOccurrences.has(occurrenceKey(item))) return;
+          if (observedLegacyOccurrences.has(occurrenceKey(item, legacyWorkflow))) return;
           await workflowEngine!.execute({ workflow: legacyWorkflow, item, result });
         }
         else {
@@ -837,10 +837,13 @@ function renderGroup(template: string, item: WorkItem): string {
 }
 
 /** Earlier job results, shaped as action outputs so `{ action: <id> }` refs work. */
-function occurrenceKey(item: WorkItem, persistedOccurrence?: string): string {
-  // Versioned trigger events carry their own occurrence identity. Legacy
-  // sources have no event id and retain subject-level active-run coalescing.
-  return item.triggerEvent?.id ? `${item.id}\u0000${item.triggerEvent.id}` : item.id;
+function occurrenceKey(item: WorkItem, workflow: WorkflowDefinition): string {
+  if (item.triggerEvent?.id) return `${item.id}\u0000event-${item.triggerEvent.id}`;
+  // Match the engine's on-change identity using the saved item snapshot, even
+  // for migrated runs whose occurrence IDs used an older hash format. A hold
+  // on an earlier revision must not swallow a newly reopened source item.
+  if (workflow.firePolicy === "on-change") return `${item.id}\u0000change-${JSON.stringify(item)}`;
+  return item.id;
 }
 
 function actionOutputsOf(run: WorkflowRunRecord): Record<string, ActionResult> {

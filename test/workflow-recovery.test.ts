@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import { TaskRelay } from "../src/core/task-relay.js";
 import { RepositoryStateStore } from "../src/state/store.js";
 import { RelayPluginRegistry, type VersionedActionPlugin } from "../src/plugins/index.js";
 import type { WorkItem, WorkflowDefinition } from "../src/domain/index.js";
+import { stateDirectory } from "../src/logging/events.js";
 
 const originalHome = process.env.XDG_STATE_HOME;
 const stores: RepositoryStateStore[] = [];
@@ -16,11 +17,20 @@ afterEach(() => {
   else process.env.XDG_STATE_HOME = originalHome;
 });
 
-async function fixture() {
+async function fixture(legacyItem?: WorkItem) {
   const root = await mkdtemp(join(tmpdir(), "relay-recovery-"));
   process.env.XDG_STATE_HOME = root;
   const repository = { id: "recovery", root };
-  const store = new RepositoryStateStore(root);
+  if (legacyItem) {
+    const directory = stateDirectory(root);
+    await mkdir(directory, { recursive: true });
+    const identity = { repository, workflowId: "flow", sourceId: "fixture", itemId: legacyItem.id, occurrence: "change-legacy-hash" };
+    const id = JSON.stringify([repository.id, root, "flow", "fixture", legacyItem.id, identity.occurrence]);
+    await writeFile(join(directory, "state.json"), JSON.stringify({ version: 1, runs: {}, actions: {}, workflows: {
+      [id]: { id, identity, item: legacyItem, status: "running", jobs: { one: { status: "started", attempts: 1 } }, startedAt: "2026-09-04T10:00:00Z", updatedAt: "2026-09-04T10:00:00Z" },
+    } }));
+  }
+  const store = new RepositoryStateStore(root, { migrateLegacy: Boolean(legacyItem) });
   stores.push(store);
   const item: WorkItem = { id: "T-1", sourceId: "fixture", title: "Task", description: "Details" };
   let discover: () => Promise<readonly WorkItem[]> = async () => [item];
@@ -43,6 +53,38 @@ function action(use: string, execute: VersionedActionPlugin["execute"]): Version
 }
 
 describe("durable workflow execution", () => {
+  it("launches a reopened on-change item once despite an older migration-held run", async () => {
+    const oldItem: WorkItem = { id: "T-1", sourceId: "fixture", title: "Task", metadata: { linearStatus: "In Progress", linearUpdatedAt: "2026-09-04T10:00:00Z" } };
+    const f = await fixture(oldItem);
+    let calls = 0;
+    f.registry.register(action("count", async () => { calls++; return { status: "succeeded" }; }));
+    f.workflow.firePolicy = "on-change";
+    f.workflow.jobs = [{ id: "one", use: "count" }];
+    f.setDiscovery(async () => [oldItem]);
+    await f.create().tick();
+    expect(calls).toBe(0); // The same held revision still requires inspection.
+    f.setDiscovery(async () => [{ ...oldItem, metadata: { ...oldItem.metadata, linearUpdatedAt: "2026-09-05T10:00:00Z" } }]);
+    await f.create().tick();
+    await f.create().tick();
+    expect(calls).toBe(1);
+    const runs = await f.store.listWorkflowRuns(f.repository);
+    expect(runs).toHaveLength(2);
+    expect(runs.find((run) => run.identity.occurrence === "change-legacy-hash"))
+      .toMatchObject({ status: "running", needsAttention: true, jobs: { one: { attempts: 1 } } });
+    expect(runs.filter((run) => run.status === "succeeded")).toHaveLength(1);
+  });
+
+  it.each(["every-poll", "once-per-match"] as const)("retains active subject coalescing for %s", async (policy) => {
+    const f = await fixture({ id: "T-1", sourceId: "fixture", title: "Old title" });
+    let calls = 0;
+    f.registry.register(action("count", async () => { calls++; return { status: "succeeded" }; }));
+    f.workflow.firePolicy = policy;
+    f.workflow.jobs = [{ id: "one", use: "count" }];
+    await f.create().tick();
+    expect(calls).toBe(0);
+    expect(await f.store.listWorkflowRuns(f.repository)).toHaveLength(1);
+  });
+
   it("resumes deferred work from the saved definition after discovery fails", async () => {
     const f = await fixture();
     let calls = 0;
