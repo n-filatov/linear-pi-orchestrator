@@ -8,6 +8,7 @@ import {
   Title,
 } from "@mantine/core";
 import type { ProjectFolder } from "../api";
+import { ArrowRight } from "lucide-react";
 import {
   EmptyState,
   formatTime,
@@ -33,12 +34,25 @@ export function Overview({
   return (
     <Stack gap="lg">
       <div>
-        <Title order={2}>Work</Title>
+        <Title order={2}>Overview</Title>
         <Text c="dimmed" size="sm">
           {scope ? repositoryName(scope) : "All repositories"} · latest
-          actionable run per ticket
+          workflow activity and work that needs your attention
         </Text>
       </div>
+      <div className="overview-metrics">
+        {[
+          ["Executions", executions.length],
+          ["Failed executions", executions.filter((run) => run.status === "failed").length],
+          ["Failure rate", executions.length ? `${Math.round(executions.filter((run) => run.status === "failed").length / executions.length * 100)}%` : "—"],
+          ["Needs attention", items.length],
+          ["Repositories", scope ? 1 : projects.length],
+        ].map(([label, value]) => <div key={label}><Text size="sm" c="dimmed">{label}</Text><Text className="metric-value">{value}</Text></div>)}
+      </div>
+      <Group className="overview-section" justify="space-between">
+        <Text fw={600}>Work requiring attention</Text>
+        <Button variant="default" onClick={onWorkflows} rightSection={<ArrowRight size={16} aria-hidden />}>Open workflows</Button>
+      </Group>
       {!items.length ? (
         <EmptyState title="No work needs attention">
           Review workflows or wait for the next matching ticket change.

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Search, Terminal, Send } from "lucide-react";
 import {
   Alert,
   Button,
@@ -53,7 +54,8 @@ export function Workers({
         candidate.root === worker.repository?.root ||
         candidate.id === worker.repository?.id,
     );
-  const visible = workers.filter((worker) =>
+  const running = workers.filter((worker) => worker.status === "running");
+  const visible = running.filter((worker) =>
     JSON.stringify([
       worker.id,
       worker.issueKey,
@@ -114,8 +116,7 @@ export function Workers({
       <div>
         <Title order={2}>Workers</Title>
         <Text size="sm" c="dimmed">
-          Identify the repository, ticket, workspace, and terminal before
-          interacting.
+          Currently running workers{project ? ` in ${repositoryName(project)}` : " across all repositories"}. Refreshes every 5 seconds.
         </Text>
       </div>
       {feedback && (
@@ -126,14 +127,19 @@ export function Workers({
           {feedback.text}
         </Alert>
       )}
+      <Group justify="space-between">
+        <Text size="sm" c="dimmed">{running.length} running {running.length === 1 ? "worker" : "workers"}</Text>
       <TextInput
-        label="Find worker"
+        w={300}
+        aria-label="Find running worker"
+        leftSection={<Search size={16} aria-hidden />}
         placeholder="Worker ID, ticket, or workspace"
         value={search}
         onChange={(event) => setSearch(event.currentTarget.value)}
       />
+      </Group>
       <Table.ScrollContainer minWidth={760}>
-        <Table striped withTableBorder>
+        <Table className="workers-table" withTableBorder>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Worker / ticket</Table.Th>
@@ -155,9 +161,7 @@ export function Workers({
                   <Text size="xs" c="dimmed" className="break-text">
                     {worker.id}
                   </Text>
-                  <Text size="xs">
-                    Execution: {worker.runId || "Not recorded"}
-                  </Text>
+                  <DetailBlock label="Execution identifier" value={worker.runId || "Not recorded"} />
                 </Table.Td>
                 <Table.Td>
                   <Text size="sm">
@@ -184,6 +188,7 @@ export function Workers({
                       <Button
                         size="xs"
                         variant="light"
+                        leftSection={<Send size={14} aria-hidden />}
                         disabled={!canControl(worker)}
                         onClick={() => {
                           setTarget({ worker, action: "send" });
@@ -196,6 +201,7 @@ export function Workers({
                       <Button
                         size="xs"
                         variant="default"
+                        leftSection={<Terminal size={14} aria-hidden />}
                         disabled={!canControl(worker)}
                         onClick={() => {
                           setTarget({ worker, action: "exec" });
@@ -219,8 +225,8 @@ export function Workers({
         </Table>
       </Table.ScrollContainer>
       {!visible.length && (
-        <EmptyState title="No matching workers">
-          Workers appear after a workflow starts them.
+        <EmptyState title={search ? "No matching running workers" : "No running workers"}>
+          {search ? "Try a different worker ID, ticket, or workspace." : "Workers appear here when they enter the running state."}
         </EmptyState>
       )}
       <Modal

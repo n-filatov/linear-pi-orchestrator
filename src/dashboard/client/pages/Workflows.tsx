@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Zap, Terminal, Bot, Send, BrushCleaning, Plus, ArrowLeft, ArrowRight, Ellipsis, FlaskConical, Search, Save } from "lucide-react";
 import {
   ActionIcon,
   Alert,
@@ -25,7 +26,6 @@ import {
   ReactFlow,
   Background,
   Controls,
-  MiniMap,
   ReactFlowProvider,
   Handle,
   Position,
@@ -144,20 +144,21 @@ function TriggerNode({ data, selected }: NodeProps<GraphNode>) {
   return (
     <div className={`flow-node trigger-node ${selected ? "selected" : ""}`}>
       <Handle type="source" position={Position.Right} />
-      <span className="node-kicker">TRIGGER</span>
+      <Zap className="node-symbol" size={44} strokeWidth={1.7} aria-hidden />
       <strong>{data.label}</strong>
-      <small>{data.use || "source"}</small>
+      <small>{data.use || "source"} trigger</small>
     </div>
   );
 }
 function ActionNode({ data, selected }: NodeProps<GraphNode>) {
+  const Icon = data.use === "tmux.create-window" ? Terminal : data.use === "cleanup" ? BrushCleaning : data.use === "codex.send-prompt" ? Send : Bot;
   return (
     <div className={`flow-node action-node ${selected ? "selected" : ""}`}>
       <Handle type="target" position={Position.Left} />
       <Handle type="source" position={Position.Right} />
-      <span className="node-kicker">ACTION</span>
-      <strong>{data.label}</strong>
-      <small>{data.use}</small>
+      <Icon className="node-symbol" size={40} strokeWidth={1.7} aria-hidden />
+      <strong>{labelFor(data.use)}</strong>
+      <small>{data.label}</small>
       {data.status && (
         <span className={statusClass(data.status)}>{data.status}</span>
       )}
@@ -182,7 +183,7 @@ export function Workflows(props: WorkflowsProps) {
     onBusyChange,
   } = props;
   const [selected, setSelected] = useState(
-    selectedWorkflowId ?? workflows[0]?.id ?? "",
+    selectedWorkflowId ?? "",
   );
   const [drafts, setDrafts] = useState<Record<string, WorkflowDraft>>({});
   const [reloadKey, setReloadKey] = useState(0);
@@ -207,10 +208,8 @@ export function Workflows(props: WorkflowsProps) {
   }, [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   useEffect(() => {
-    if (selectedWorkflowId && selectedWorkflowId !== selected)
-      setSelected(selectedWorkflowId);
-    if (!selectedWorkflowId && !selected && workflows[0])
-      setSelected(workflows[0].id);
+    if ((selectedWorkflowId ?? "") !== selected)
+      setSelected(selectedWorkflowId ?? "");
   }, [selected, selectedWorkflowId, workflows]);
   // The shell owns route changes and may refuse them while a different draft is
   // dirty. Do not show a different editor until it confirms the route change.
@@ -264,7 +263,7 @@ export function Workflows(props: WorkflowsProps) {
     workflow.id.toLowerCase().includes(query.toLowerCase()),
   );
   return (
-    <div className="workflow-layout">
+    <div className={`workflow-layout ${selectedWorkflowId ? "workflow-detail" : "workflow-index"}`}>
       <aside className="workflow-list" inert={editorBusy}>
         {persistenceWarning && (
           <Alert
@@ -277,15 +276,16 @@ export function Workflows(props: WorkflowsProps) {
         )}
         <Stack gap="xs">
           <Group justify="space-between">
-            <Text fw={700}>Workflows</Text>
-            <Button size="xs" onClick={() => setCreateOpen(true)}>
-              New
+            <div><Text className="workflow-page-title" fw={700}>Workflows</Text><Text size="sm" c="dimmed">Build and manage your repository automations</Text></div>
+            <Button leftSection={<Plus size={17} aria-hidden />} onClick={() => setCreateOpen(true)}>
+              Create workflow
             </Button>
           </Group>
           <TextInput
             size="xs"
             aria-label="Search workflows"
             placeholder="Search workflows"
+            leftSection={<Search size={16} aria-hidden />}
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
           />
@@ -300,15 +300,16 @@ export function Workflows(props: WorkflowsProps) {
             }
             onClick={() => choose(workflow.id)}
           >
-            <span className="workflow-status" />
+            <span className={`workflow-status ${workflow.enabled === false ? "disabled" : ""}`} />
             <span>
               <b>{workflow.id}</b>
               <small>
-                {Object.keys(workflow.jobs ?? {}).length} jobs ·{" "}
+                {Object.keys(workflow.jobs ?? {}).length} {Object.keys(workflow.jobs ?? {}).length === 1 ? "step" : "steps"} ·{" "}
                 {workflow.enabled === false ? "disabled" : "enabled"}
                 {drafts[workflow.id]?.dirty ? " · unsaved" : ""}
               </small>
             </span>
+            <ArrowRight className="workflow-row-arrow" size={19} aria-hidden />
           </button>
         ))}
         {Object.values(drafts)
@@ -339,7 +340,8 @@ export function Workflows(props: WorkflowsProps) {
           </Text>
         )}
       </aside>
-      {current ? (
+      {selectedWorkflowId && <div className="editor-navigation"><Button variant="subtle" color="gray" leftSection={<ArrowLeft size={16} aria-hidden />} onClick={() => choose(undefined)}>Workflows</Button><span>Editor</span><Text size="xs" c="dimmed">Select a node to configure it</Text></div>}
+      {selectedWorkflowId && (current ? (
         <WorkflowEditor
           key={`${current.id}:${drafts[current.id]?.base.revision ?? current.revision ?? "new"}:${reloadKey}`}
           workflow={current}
@@ -369,7 +371,7 @@ export function Workflows(props: WorkflowsProps) {
           </Text>
           <Button onClick={() => setCreateOpen(true)}>Create workflow</Button>
         </Stack>
-      )}
+      ))}
       <Modal
         opened={createOpen}
         onClose={() => setCreateOpen(false)}
@@ -1048,20 +1050,13 @@ function WorkflowEditor({
             </Badge>
           </Group>
           <Group gap="xs">
-            <Button
-              variant="default"
-              loading={testingWorkflow}
-              onClick={previewWorkflow}
-            >
-              Preview current draft
-            </Button>
-            <Button loading={saving} onClick={save}>
+            <Button loading={saving} onClick={save} leftSection={<Save size={16} aria-hidden />}>
               Save
             </Button>
             <Menu shadow="md">
               <Menu.Target>
                 <ActionIcon variant="default" aria-label="Workflow actions">
-                  •••
+                  <Ellipsis size={19} aria-hidden />
                 </ActionIcon>
               </Menu.Target>
               <Menu.Dropdown>
@@ -1242,9 +1237,9 @@ function WorkflowEditor({
               setEdgeEditing(edge);
               setEdgeCondition(String(edge.label || "succeeded"));
             }}
-            onMoveEnd={(_, next) => {
+            onMoveEnd={(event, next) => {
               setViewport(next);
-              if (viewportReady.current) publish(nodes, edges, base, next);
+              if (event && viewportReady.current) publish(nodes, edges, base, next);
               else viewportReady.current = true;
             }}
             onNodeClick={(_, node) => {
@@ -1259,22 +1254,20 @@ function WorkflowEditor({
             fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
             proOptions={{ hideAttribution: true }}
           >
-            <Background color="#273244" gap={24} />
-            <Controls />
-            <MiniMap
-              nodeColor={(node) =>
-                node.type === "trigger" ? "#8b5cf6" : "#239b8d"
-              }
-            />
+            <Background color="#c4c4c8" gap={24} size={1} />
+            <Controls orientation="horizontal" />
           </ReactFlow>
         </ReactFlowProvider>
         <Button
           className="add-node-button"
+          variant="default"
+          leftSection={<Plus size={18} aria-hidden />}
           onClick={() => setPaletteOpen((open) => !open)}
         >
           Add node
         </Button>
         {paletteOpen && <NodePalette schemas={schemas} onAdd={addAction} />}
+        <Button className="canvas-preview" leftSection={<FlaskConical size={18} aria-hidden />} loading={testingWorkflow} onClick={previewWorkflow}>Preview workflow</Button>
       </div>
       {selectedNode && (
         <PropertyPanel

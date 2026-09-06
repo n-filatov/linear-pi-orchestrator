@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { House, Workflow, Terminal, FolderGit2, RefreshCw, type LucideIcon } from "lucide-react";
 import {
   Alert,
   AppShell,
@@ -17,8 +18,10 @@ import {
 import { ReactFlowProvider } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "@mantine/core/styles.css";
+import "./styles.css";
 import "./canvas-overrides.css";
 import "./dashboard.css";
+import "./n8n-layout.css";
 import * as api from "./api";
 import type { ProjectFolder } from "./api";
 import {
@@ -39,11 +42,13 @@ import { Overview } from "./pages/Overview";
 import { Repositories, RegisterDialog } from "./pages/Repositories";
 import Workflows from "./pages/Workflows";
 import { Executions } from "./pages/Executions";
+import { Workers } from "./pages/Workers";
 
-const navigation: { page: DashboardPage; label: string; icon: string }[] = [
-  { page: "home", label: "Work", icon: "⌂" },
-  { page: "workflows", label: "Workflows", icon: "◇" },
-  { page: "repositories", label: "Repositories", icon: "▣" },
+const navigation: { page: DashboardPage; label: string; icon: LucideIcon }[] = [
+  { page: "home", label: "Overview", icon: House },
+  { page: "workflows", label: "Workflows", icon: Workflow },
+  { page: "workers", label: "Workers", icon: Terminal },
+  { page: "repositories", label: "Repositories", icon: FolderGit2 },
 ];
 
 const selectedRepositoryStorageKey = "task-relay:selected-repository";
@@ -80,7 +85,6 @@ function Dashboard() {
   // Legacy detail-only pages remain addressable in old browser history, but
   // deliberately do not compete with the three daily work surfaces.
   const page =
-    route.page === "workers" ||
     route.page === "plugins" ||
     route.page === "settings" ||
     (route.page === "executions" && route.executionId)
@@ -108,6 +112,11 @@ function Dashboard() {
       ? (project ?? { id: route.projectId, root: "" })
       : undefined;
   const scopeKey = requestedProject?.id || "all";
+  const workers = useResource(
+    `workers:${page === "workers" ? scopeKey : "inactive"}`,
+    () => page === "workers" ? api.getWorkers(requestedProject) : Promise.resolve([]),
+    5000,
+  );
   const workflows = useResource(
     `workflows:${page === "workflows" ? scopeKey : "inactive"}`,
     () =>
@@ -238,6 +247,7 @@ function Dashboard() {
       watchers.refresh(),
       workflows.refresh(),
       executions.refresh(),
+      workers.refresh(),
       catalog.refresh(),
       config.refresh(),
     ]);
@@ -247,6 +257,7 @@ function Dashboard() {
     watchers,
     workflows,
     executions,
+    ...(page === "workers" ? [workers] : []),
     ...(route.projectId ? [catalog, config] : []),
   ];
   const errors = resources.filter((resource) => resource.error);
@@ -275,14 +286,18 @@ function Dashboard() {
             ["Configuration", config],
             ["Plugin catalog", catalog],
           ] as const)
+        : page === "workers"
+          ? ([["Workers", workers]] as const)
         : page === "executions"
           ? ([["Executions", executions]] as const)
           : ([["Executions", executions]] as const);
   return (
     <AppShell
-      header={{ height: 72 }}
+      className={page === "workflows" && route.workflowId ? "relay-shell canvas-page" : "relay-shell"}
+      layout="alt"
+      header={{ height: 68 }}
       navbar={{
-        width: 240,
+        width: 224,
         breakpoint: "sm",
         collapsed: { mobile: !mobileOpened },
       }}
@@ -300,10 +315,10 @@ function Dashboard() {
             />
             <div>
               <Text size="xs" c="dimmed">
-                TASK RELAY / {scopeName}
+                {scopeName}
               </Text>
               <Title order={3}>
-                {navigation.find((item) => item.page === page)?.label}
+                {route.workflowId || navigation.find((item) => item.page === page)?.label}
               </Title>
             </div>
           </Group>
@@ -313,6 +328,7 @@ function Dashboard() {
               onClick={() => void refresh()}
               loading={resources.some((resource) => resource.refreshing)}
               aria-label="Refresh dashboard"
+              leftSection={<RefreshCw size={16} aria-hidden />}
             >
               Refresh
             </Button>
@@ -322,11 +338,11 @@ function Dashboard() {
       <AppShell.Navbar p="md">
         <Stack h="100%" gap="lg">
           <Group gap="sm">
-            <span className="brand-mark">◆</span>
+            <span className="brand-mark"><Workflow size={23} aria-hidden /></span>
             <div>
               <Text fw={650}>task relay</Text>
               <Text size="xs" c="dimmed">
-                Developer control plane
+                Workspace
               </Text>
             </div>
           </Group>
@@ -352,7 +368,7 @@ function Dashboard() {
                 key={item.page}
                 active={page === item.page}
                 label={item.label}
-                leftSection={<span aria-hidden>{item.icon}</span>}
+                leftSection={<item.icon size={20} strokeWidth={1.7} aria-hidden />}
                 onClick={() => navigatePage(item.page)}
               />
             ))}
@@ -506,6 +522,15 @@ function Dashboard() {
               onRefresh={() => void executions.refresh()}
             />
           )}
+          {page === "workers" && workers.data && (
+            <Workers
+              key={scopeKey}
+              workers={workers.data}
+              projects={projects}
+              project={project}
+              onRefresh={() => void workers.refresh()}
+            />
+          )}
         </Stack>
       </AppShell.Main>
       <RegisterDialog
@@ -554,7 +579,7 @@ function Dashboard() {
 
 export default function App() {
   return (
-    <MantineProvider theme={dashboardTheme} defaultColorScheme="dark">
+    <MantineProvider theme={dashboardTheme} forceColorScheme="light">
       <ReactFlowProvider>
         <Dashboard />
       </ReactFlowProvider>

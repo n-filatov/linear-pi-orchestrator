@@ -1,8 +1,9 @@
 import { createTheme } from "@mantine/core";
 
 export const dashboardTheme = createTheme({
-  primaryColor: "violet",
-  defaultRadius: "md",
+  primaryColor: "orange",
+  primaryShade: 7,
+  defaultRadius: "sm",
   fontFamily:
     "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
   headings: { fontWeight: "650" },
