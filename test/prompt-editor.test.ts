@@ -21,7 +21,10 @@ describe("repository prompt editing", () => {
     const dir = await root(); const path = ".task-relay/prompts/review.md";
     const created = await saveEditablePrompt(dir, path, "original", null);
     const results = await Promise.allSettled([saveEditablePrompt(dir, path, "first", created.revision), saveEditablePrompt(dir, path, "second", created.revision)]);
-    expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({ reason: { status: 409 } });
+    const winner = results.findIndex((result) => result.status === "fulfilled");
+    expect(await readFile(join(dir, path), "utf8")).toBe(["first", "second"][winner]);
     await writeFile(join(dir, path), "external");
     await expect(saveEditablePrompt(dir, path, "stale", created.revision)).rejects.toMatchObject({ status: 409 });
     expect(await readFile(join(dir, path), "utf8")).toBe("external");
