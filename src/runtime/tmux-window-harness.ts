@@ -34,7 +34,8 @@ export class TmuxWindowHarness implements HarnessPlugin<z.infer<typeof configSch
       args: ["-l"],
       cwd: request.workspace.path,
       env: {},
-      workerName: request.item.id,
+      workerName: typeof request.harnessInput?.windowName === "string" && request.harnessInput.windowName.trim()
+        ? request.harnessInput.windowName : request.item.id,
       workerId: request.workerId,
       issue: request.item.id,
     });

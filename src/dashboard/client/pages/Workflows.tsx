@@ -63,6 +63,7 @@ import {
   type GraphNode,
   type GraphNodeData,
 } from "../graph";
+import { CodexPermissions } from "../components/CodexPermissions";
 import { setPromptInput, templateFor } from "../workflow-templates";
 
 const CANVAS_ACTION_USES = [
@@ -892,7 +893,7 @@ function WorkflowEditor({
                 schemas[`action:${use}`] ?? schemas[use],
                 "action",
               ),
-              config: { use, with: {} },
+              config: { use, with: use === "codex.start-session" ? { permissions: { sandbox: "workspace-write", approvals: "on-request" } } : {} },
             },
           }
         : node,
@@ -997,7 +998,7 @@ function WorkflowEditor({
         label: id,
         use,
         kind: "action",
-        config: { use, with: {} },
+        config: { use, with: use === "codex.start-session" ? { permissions: { sandbox: "workspace-write", approvals: "on-request" } } : {} },
         schema: (schemas[`action:${use}`] ?? schemas[use])?.schema,
       },
     };
@@ -1720,7 +1721,9 @@ function PropertyPanel({
                 name !== ref?.path && name !== ref?.path.split(".")[0],
             )
             .map(([name, definition]: [string, any]) =>
-              name === "promptFile" ? (
+              name === "permissions" && node.data.use === "codex.start-session" ? (
+                <CodexPermissions key={name} value={field(name)} onChange={(value) => setField(name, value)} />
+              ) : name === "promptFile" ? (
                 <Select
                   key={name}
                   searchable
@@ -1893,6 +1896,13 @@ function SchemaField({
   onChange: (value: any) => void;
 }) {
   const label = definition.title || name.replace(/[-_]/g, " ");
+  if (name === "windowNameTemplate") return <TextInput
+    label="Window name template"
+    description={definition.description}
+    placeholder="{{item.id}}-{{item.title}}"
+    value={value ?? ""}
+    onChange={event => onChange(event.currentTarget.value.trim() ? event.currentTarget.value : undefined)}
+  />;
   if (name === "prompt") return <Textarea label={label} description={definition.description} value={value ?? ""} onChange={event => onChange(event.currentTarget.value)} autosize minRows={3} />;
   if (definition.enum)
     return (

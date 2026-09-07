@@ -43,6 +43,7 @@ import { Repositories, RegisterDialog } from "./pages/Repositories";
 import Workflows from "./pages/Workflows";
 import { Executions } from "./pages/Executions";
 import { Workers } from "./pages/Workers";
+import { CodexApprovals } from "./components/CodexApprovals";
 import { Prompts } from "./pages/Prompts";
 
 const navigation: { page: DashboardPage; label: string; icon: LucideIcon }[] = [
@@ -398,6 +399,7 @@ function Dashboard() {
       </AppShell.Navbar>
       <AppShell.Main>
         <Stack gap="md">
+          <CodexApprovals />
           <div className="mobile-scope">
             <Text size="xs" c="dimmed">
               Scope: {scopeName} · change scope in navigation

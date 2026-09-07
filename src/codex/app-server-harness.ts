@@ -1,3 +1,5 @@
+import { attachCodexApprovals } from "./approvals.js";
+import { sessionPermissions, threadPermissions, turnPermissions, codexPermissionCapabilities, type CodexSessionPermissions } from "./permissions.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { WorkerCompletion, WorkerHandle } from "../domain/index.js";
@@ -10,10 +12,12 @@ export const CODEX_APP_SERVER_HARNESS_ID = "__codex_app_server";
 export type CodexAppServerWorkerMetadata = {
   transport: "stdio" | "websocket";
   threadId: string;
-  turnId: string;
+  turnId?: string;
+  rolloutPath?: string;
   workspace: string;
   model?: string;
   effort?: string;
+  permissions?: CodexSessionPermissions;
   /** Loopback-only endpoint used by the visible `codex --remote` tmux TUI. */
   endpoint?: string;
   tmux?: { action: string; workerId: string; session: string; target: string };
@@ -33,6 +37,9 @@ type Session = {
   threadId: string;
   activeTurnId?: string;
   lastTurn?: CodexTurn;
+  permissions: CodexSessionPermissions;
+  workspace: string;
+  detachApprovals: () => void;
 };
 
 const harnessConfigSchema = z.object({
@@ -61,6 +68,8 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
 
   async launch(request: HarnessLaunchRequest<z.infer<typeof harnessConfigSchema>>): Promise<WorkerHandle> {
     const tmux = remoteTui(request.harnessInput);
+    const permissions = sessionPermissions(request.harnessInput?.permissions);
+    await this.validatePermissions(permissions, request.config.command);
     const remote = tmux
       ? await CodexAppServerClient.startRemote({
         command: request.config.command,
@@ -75,27 +84,27 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
       cwd: request.workspace.path,
       initialize: { clientInfo: { name: "task_relay", title: "Task Relay", version: "0.1.0" } },
     });
+    const detachApprovals = attachCodexApprovals(client, request.workerId, request.repository.root);
     try {
       const started = await client.startThread({
         cwd: request.workspace.path,
         ...(request.model ? { model: request.model } : {}),
-        approvalPolicy: "never",
-        // The installed Codex App Server accepts CLI-style sandbox variants.
-        // Keep this aligned with its runtime schema (`workspace-write`).
-        sandbox: "workspace-write",
+        ...threadPermissions(permissions),
       });
       const threadId = started.thread.id;
-      const turn = await client.requestTurn({
+      const turn = request.harnessInput?.startOnly ? undefined : await client.requestTurn({
         threadId,
         cwd: request.workspace.path,
+        ...turnPermissions(permissions, request.workspace.path),
         ...(request.model ? { model: request.model } : {}),
         ...(request.reasoningEffort ? { effort: request.reasoningEffort } : {}),
         input: [{ type: "text", text: request.prompt }],
       });
-      const turnId = turn.turn.id;
-      this.sessions.set(request.workerId, { client, threadId, activeTurnId: turnId });
-      return this.worker(request, threadId, turnId, remote?.endpoint, tmux);
+      const turnId = turn?.turn.id;
+      this.sessions.set(request.workerId, { client, threadId, activeTurnId: turnId, permissions, workspace: request.workspace.path, detachApprovals });
+      return this.worker(request, threadId, turnId, remote?.endpoint, tmux, permissions, typeof started.thread.path === "string" ? started.thread.path : undefined);
     } catch (error) {
+      detachApprovals();
       await client.stop().catch(() => undefined);
       throw error;
     }
@@ -121,6 +130,7 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
       }
       const started = await session.client.requestTurn({
         threadId: session.threadId,
+        ...turnPermissions(session.permissions, session.workspace),
         ...(options.model ? { model: options.model } : {}),
         ...(options.effort ? { effort: options.effort } : {}),
         input: [{ type: "text", text: options.prompt }],
@@ -167,6 +177,7 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
       if (turnId) await session.client.interruptTurn({ threadId: session.threadId, turnId }).catch(() => undefined);
     } finally {
       this.sessions.delete(worker.id);
+      session.detachApprovals();
       await session.client.stop();
     }
   }
@@ -174,15 +185,19 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
   private worker(
     request: HarnessLaunchRequest<z.infer<typeof harnessConfigSchema>>,
     threadId: string,
-    turnId: string,
+    turnId: string | undefined,
     endpoint?: string,
     tmux?: NonNullable<ReturnType<typeof remoteTui>>,
+    permissions?: CodexSessionPermissions,
+    rolloutPath?: string,
   ): WorkerHandle {
     const codex: CodexAppServerWorkerMetadata = {
       transport: "stdio",
       threadId,
       turnId,
       workspace: request.workspace.path,
+      permissions,
+      rolloutPath,
       ...(request.model ? { model: request.model } : {}),
       ...(request.reasoningEffort ? { effort: request.reasoningEffort } : {}),
       ...(endpoint ? { endpoint } : {}),
@@ -204,6 +219,8 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
     const metadata = codexMetadata(worker);
     if (!metadata) throw new Error(`Worker ${worker.id} does not contain resumable Codex App Server metadata.`);
 
+    const permissions = sessionPermissions(metadata.permissions);
+    await this.validatePermissions(permissions);
     // App Server threads are durable even though their JSONL connection is
     // not. A fresh Relay process can therefore create a new stdio client and
     // resume the persisted thread by id instead of declaring the worker lost.
@@ -217,26 +234,34 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
         cwd: metadata.workspace,
         initialize: { clientInfo: { name: "task_relay", title: "Task Relay", version: "0.1.0" } },
       });
+    const detachApprovals = attachCodexApprovals(client, worker.id, metadata.workspace);
     try {
       const resumed = await client.resumeThread({
         threadId: metadata.threadId,
         cwd: metadata.workspace,
         ...(metadata.model ? { model: metadata.model } : {}),
-        approvalPolicy: "never",
-        sandbox: "workspace-write",
+        ...threadPermissions(permissions),
       });
       const lastTurn = resumed.thread.turns?.at(-1);
       const session: Session = {
         client,
         threadId: metadata.threadId,
+        permissions, workspace: metadata.workspace, detachApprovals,
         ...(lastTurn ? { lastTurn } : {}),
         ...(lastTurn?.status === "inProgress" ? { activeTurnId: lastTurn.id } : {}),
       };
       this.sessions.set(worker.id, session);
       return session;
     } catch (error) {
+      detachApprovals();
       await client.stop().catch(() => undefined);
       throw new Error(`Could not resume Codex thread ${metadata.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async validatePermissions(permissions: CodexSessionPermissions, command?: string): Promise<void> {
+    if (permissions.approvals === "auto-review" && !(await codexPermissionCapabilities(command)).automaticReview) {
+      throw new Error("The installed Codex does not advertise automatic approval review. Update Codex or choose on-request / never.");
     }
   }
 
@@ -247,6 +272,7 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
       const session = this.sessions.get(workerId);
       if (!session) return;
       this.sessions.delete(workerId);
+      session.detachApprovals();
       const lifecycle = session.client.lifecycle(session.threadId);
       const turnId = lifecycle?.activeTurnId ?? session.activeTurnId;
       if (turnId) await session.client.interruptTurn({ threadId: session.threadId, turnId }).catch(() => undefined);
@@ -280,7 +306,7 @@ function codexMetadata(worker: WorkerHandle): CodexAppServerWorkerMetadata | und
   const metadata = value as Partial<CodexAppServerWorkerMetadata>;
   return (metadata.transport === "stdio" || metadata.transport === "websocket")
     && typeof metadata.threadId === "string"
-    && typeof metadata.turnId === "string"
+    && (metadata.turnId === undefined || typeof metadata.turnId === "string")
     && typeof metadata.workspace === "string"
     && (metadata.transport !== "websocket" || typeof metadata.endpoint === "string")
     ? metadata as CodexAppServerWorkerMetadata

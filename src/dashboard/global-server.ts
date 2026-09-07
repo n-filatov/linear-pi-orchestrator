@@ -1,3 +1,4 @@
+import { WorkflowValidationError } from "./workflow-validation.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -21,6 +22,8 @@ import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-c
 import { inspectWorkflowRun } from "../application/execution-inspection.js";
 import type { WorkflowRunRecord } from "../domain/index.js";
 import { ZodError } from "zod";
+import { listCodexApprovals, resolveCodexApproval } from "../codex/approvals.js";
+import { codexPermissionCapabilities } from "../codex/permissions.js";
 import { embeddedDashboardAssets } from "./embedded-assets.js";
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -83,7 +86,7 @@ export class GlobalDashboardServer {
     } catch (error) {
       const status = error instanceof PromptEditorError ? error.status : error instanceof WorkflowRevisionConflictError || error instanceof WorkflowAlreadyExistsError ? 409
         : error instanceof WorkflowNotFoundError || error instanceof ProjectNotFoundError ? 404
-        : error instanceof SyntaxError || error instanceof URIError || error instanceof ZodError ? 400
+        : error instanceof WorkflowValidationError || error instanceof SyntaxError || error instanceof URIError || error instanceof ZodError ? 400
         : error instanceof RequestBodyTooLargeError ? 413 : 500;
       this.json(response, {
         error: error instanceof Error ? error.message : String(error),
@@ -94,6 +97,16 @@ export class GlobalDashboardServer {
 
   private async api(request: http.IncomingMessage, response: http.ServerResponse, url: URL): Promise<void> {
     const method = request.method ?? "GET";
+    if (method === "GET" && url.pathname === "/api/codex/permissions/capabilities") return this.json(response, await codexPermissionCapabilities());
+    if (method === "GET" && url.pathname === "/api/codex/approvals") return this.json(response, { approvals: listCodexApprovals() });
+    const approval = /^\/api\/codex\/approvals\/([^/]+)$/.exec(url.pathname);
+    if (approval) {
+      if (method !== "POST") return this.methodNotAllowed(response);
+      const body = await jsonBody(request);
+      if (body.decision !== "accept" && body.decision !== "decline") return this.json(response, { error: "Choose accept or decline." }, 400);
+      const resolved = resolveCodexApproval(decodeURIComponent(approval[1]!), body.decision);
+      return this.json(response, resolved ? { resolved: true } : { error: "This approval is no longer pending." }, resolved ? 200 : 409);
+    }
     if (method === "GET" && url.pathname === "/api/projects") return this.json(response, { projects: await this.projects.listProjects() });
     if (method === "POST" && url.pathname === "/api/projects") {
       const body = await jsonBody(request);

@@ -52,3 +52,9 @@ status is `failed` or the historical `timed_out` marker. `succeeded`,
 `needsAttention` require manual inspection and remain blocked. A run-level retry
 selects only eligible jobs; a future `retryAt` remains authoritative and blocks
 manual replay until that time. If none are eligible the endpoint returns `409`.
+
+### Codex permissions
+
+- `GET /api/codex/permissions/capabilities`: reports installed Codex automatic-review support.
+- `GET /api/codex/approvals`: pending command, file, and permission requests for this Relay process.
+- `POST /api/codex/approvals/:id`: `{ "decision": "accept" | "decline" }`; resolves once, returns 409 for expired/resolved requests. Uses the dashboard authentication and origin checks.
