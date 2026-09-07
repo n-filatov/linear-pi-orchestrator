@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type {
   RepositoryScope,
@@ -23,13 +24,15 @@ type SqliteDatabase = {
 };
 type SqliteDatabaseConstructor = new (file: string) => SqliteDatabase;
 
-// Release artifacts run under Bun, while npm development and CI run under
-// Node. Both expose the synchronous SQLite API, under different built-in
-// module/class names. Keeping the specifier dynamic lets each runtime load only
-// the driver it implements and avoids shipping a native dependency.
+// Keep SQLite initialization synchronous: Bun's compiled module graph can skip
+// top-level-await initialization when this package is reached through re-exports.
+// createRequire loads only the current runtime's built-in driver.
 const sqliteModuleName = process.versions.bun ? "bun:sqlite" : "node:sqlite";
-const sqliteModule = await import(sqliteModuleName) as Record<string, unknown>;
+const sqliteModule = createRequire(import.meta.url)(sqliteModuleName) as Record<string, unknown>;
 const RuntimeDatabase = (sqliteModule.DatabaseSync ?? sqliteModule.Database) as SqliteDatabaseConstructor;
+if (typeof RuntimeDatabase !== "function") {
+  throw new Error(`SQLite driver ${sqliteModuleName} did not expose a database constructor.`);
+}
 
 /**
  * The global registry is deliberately separate from RepositoryStateStore.
