@@ -953,3 +953,16 @@ npm run dashboard:dev
 npm test
 npm start -- doctor
 ```
+
+To build a standalone native executable, build the dashboard first and use the
+compiler script so its HTML, JavaScript, and CSS are embedded in the binary:
+
+```bash
+npm run build
+bun scripts/compile-cli.mjs --target bun-darwin-arm64 --outfile dist/relay
+node scripts/smoke-compiled-cli.mjs dist/relay
+```
+
+Use `bun-linux-x64` or `bun-darwin-x64` for the other release targets. The smoke
+test copies only the executable to a temporary folder and checks its dashboard
+page, assets, routes, authenticated APIs, plugin execution, and persisted state.

@@ -63,16 +63,9 @@ jobs:
 
       - name: Compile binary
         run: |
-          bun build \
-            --compile \
+          bun scripts/compile-cli.mjs \
             --target=${{ matrix.bun-target }} \
-            --external @nestjs/microservices \
-            --external @nestjs/platform-express \
-            --external @nestjs/websockets \
-            --external class-transformer \
-            --external class-validator \
-            --outfile=${{ matrix.artifact }} \
-            src/cli/main.ts
+            --outfile=${{ matrix.artifact }}
 
       - name: Smoke test
         if: matrix.bun-target == 'bun-linux-x64' || matrix.bun-target == 'bun-darwin-arm64'

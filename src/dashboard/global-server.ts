@@ -21,6 +21,7 @@ import { SdkMcpToolClient, type McpTransportConfig } from "../sources/mcp-tool-c
 import { inspectWorkflowRun } from "../application/execution-inspection.js";
 import type { WorkflowRunRecord } from "../domain/index.js";
 import { ZodError } from "zod";
+import { embeddedDashboardAssets } from "./embedded-assets.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 class RequestBodyTooLargeError extends Error {}
@@ -482,13 +483,21 @@ export class GlobalDashboardServer {
     const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
     const candidate = resolve(this.staticRoot, relative);
     if (!candidate.startsWith(`${this.staticRoot}/`) && candidate !== resolve(this.staticRoot, "index.html")) return this.json(response, { error: "Not found" }, 404);
+    if (embeddedDashboardAssets.size > 0) {
+      const name = embeddedDashboardAssets.has(relative) ? relative : pathLooksLikeAsset(relative) ? undefined : "index.html";
+      const content = name === undefined ? undefined : embeddedDashboardAssets.get(name);
+      if (!name || !content) return this.json(response, { error: "Not found" }, 404);
+      response.writeHead(200, { "Content-Type": mimeType(name), "Cache-Control": name === "index.html" ? "no-store" : "public, max-age=31536000, immutable", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" });
+      response.end(content);
+      return;
+    }
     const file = existsSync(candidate)
       ? candidate
       : pathLooksLikeAsset(relative)
         ? undefined
         : resolve(this.staticRoot, "index.html");
     if (!file) return this.json(response, { error: "Not found" }, 404);
-    if (!existsSync(file)) return this.json(response, { error: "Dashboard assets are missing. Run 'npm run build:dashboard'." }, 503);
+    if (!existsSync(file)) return this.json(response, { error: "Dashboard assets are missing. Run 'npm run dashboard:build'." }, 503);
     response.writeHead(200, { "Content-Type": mimeType(file), "Cache-Control": file.endsWith("index.html") ? "no-store" : "public, max-age=31536000, immutable", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" });
     response.end(await readFile(file));
   }
