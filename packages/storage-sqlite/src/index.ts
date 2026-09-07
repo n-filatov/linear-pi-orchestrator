@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
 import { basename, join, resolve } from "node:path";
 import { createRunKey, createWorkflowRunKey, isActiveRun, isTerminalJobStatus, workerChildren, type RepositoryScope, type RunClaim, type RunIdentity, type RunRecord, type RunStore, type RunTerminalTransition, type WorkerChildHandle, type WorkflowDefinition, type WorkflowJobState, type WorkflowJobTransition, type WorkflowRunIdentity, type WorkflowRunRecord, type WorkflowRunStore, type WorkItem } from "@task-relay/domain";
 type Stmt = {
@@ -14,8 +15,13 @@ type Db = {
     close(): void;
 };
 type DbCtor = new (file: string) => Db;
-const sqlite = await import(process.versions.bun ? "bun:sqlite" : "node:sqlite") as Record<string, unknown>;
+// Avoid top-level await in the compiled CLI's SQLite initialization.
+const sqliteModuleName = process.versions.bun ? "bun:sqlite" : "node:sqlite";
+const sqlite = createRequire(import.meta.url)(sqliteModuleName) as Record<string, unknown>;
 const Database = (sqlite.DatabaseSync ?? sqlite.Database) as DbCtor;
+if (typeof Database !== "function") {
+    throw new Error(`SQLite driver ${sqliteModuleName} did not expose a database constructor.`);
+}
 export type JsonValue = null | boolean | number | string | JsonValue[] | {
     [key: string]: JsonValue;
 };

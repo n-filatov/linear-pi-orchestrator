@@ -3,11 +3,11 @@
  *
  * It creates an isolated project, loads a local action plugin by path, polls a
  * no-shell command source once, then reads the persisted workflow result with
- * a fresh CLI process. Nothing is registered with the dashboard or written to
- * a user repository.
+ * a fresh CLI process. It also starts the dashboard and reads both global
+ * registries. All state and project registration stay inside the temporary folder.
  */
-import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -16,10 +16,51 @@ const run = promisify(execFile);
 const binary = process.argv[2];
 if (!binary) throw new Error("Usage: node scripts/smoke-compiled-cli.mjs <compiled-relay-binary>");
 const executable = resolve(binary);
-const project = await mkdtemp(join(tmpdir(), "relay-compiled-smoke-"));
+const project = await realpath(await mkdtemp(join(tmpdir(), "relay-compiled-smoke-")));
 const marker = join(project, "plugin-ran.json");
 const environment = { ...process.env, XDG_STATE_HOME: join(project, "state") };
 const sourceProgram = "process.stdout.write(JSON.stringify({items:[{sourceId:'queue',id:'SMOKE-1',title:'Compiled CLI'}]}))";
+
+async function checkDashboard() {
+  const child = spawn(executable, ["dashboard", "--port", "0", "--no-open"], {
+    cwd: project, env: environment, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const closed = new Promise((resolveClose) => child.once("close", resolveClose));
+  let output = "";
+  try {
+    const address = await new Promise((resolveAddress, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Dashboard startup timed out: ${output}`)), 15_000);
+      const finish = (error, url) => {
+        clearTimeout(timer);
+        if (error) reject(error); else resolveAddress(url);
+      };
+      child.once("error", (error) => finish(error));
+      child.once("exit", (code, signal) => finish(new Error(`Dashboard exited (${code ?? signal}): ${output}`)));
+      child.stderr.on("data", (data) => { output += data.toString(); });
+      child.stdout.on("data", (data) => {
+        output += data.toString();
+        const match = output.match(/Dashboard running at (http:\/\/\S+)/);
+        if (match) finish(null, new URL(match[1]));
+      });
+    });
+    for (const key of ["projects", "workers", "runs"]) {
+      const url = new URL(`/api/${key}`, address);
+      url.search = address.search;
+      const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`Dashboard ${key}: HTTP ${response.status}`);
+      const body = await response.json();
+      if (!Array.isArray(body[key])) throw new Error(`Dashboard ${key} did not return an array.`);
+      if (key === "projects" && !body.projects.some((entry) => entry.root === project)) {
+        throw new Error("Dashboard did not register the disposable project.");
+      }
+    }
+  } finally {
+    child.kill("SIGTERM");
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    await closed;
+    clearTimeout(timer);
+  }
+}
 
 try {
   await writeFile(join(project, "plugin.mjs"), [
@@ -36,6 +77,8 @@ try {
     "logging: { level: silent, pretty: false }",
   ].join("\n"));
 
+  await checkDashboard();
+
   await run(executable, ["once"], { cwd: project, timeout: 30_000, env: environment });
   const markerValue = JSON.parse(await readFile(marker, "utf8"));
   if (markerValue.item !== "SMOKE-1") throw new Error("The local plugin did not receive the discovered item.");
@@ -44,7 +87,7 @@ try {
   if (!Array.isArray(runs) || !runs.some((entry) => entry.identity?.workflowId === "compiled" && entry.jobs?.plugin?.outputs?.verified === true)) {
     throw new Error("The workflow output was not persisted and readable after the compiled CLI restarted.");
   }
-  console.log(JSON.stringify({ project: "disposable", dynamicPlugin: true, persistedWorkflow: true }));
+  console.log(JSON.stringify({ project: "disposable", dynamicPlugin: true, persistedWorkflow: true, dashboardRegistries: true }));
 } finally {
   await rm(project, { recursive: true, force: true });
 }
