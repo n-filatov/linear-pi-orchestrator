@@ -587,11 +587,29 @@ The canvas includes three independent built-in actions:
   and returns the Relay worker id plus verified tmux metadata. Cleanup owns that
   window just like any other Relay worker.
 - `codex.start-session` starts the installed Codex CLI through its JSONL stdio
-  App Server, creates a durable thread, and sends the first prompt. It uses the
+  App Server, creates a thread without sending a prompt. It uses the
   current Codex login; it does not need a configured tmux harness or API key.
 - `codex.send-prompt` selects a preceding `codex.start-session` node. `idle`
   waits for the active turn before starting another; `immediate` steers the
   active turn. By default the job remains running until that turn completes.
+
+The `tmux.create-window` node accepts an optional **Window name template**:
+
+```yaml
+use: tmux.create-window
+with:
+  windowNameTemplate: "{{item.id}}-{{item.title}}"
+```
+
+This shows the ticket ID and the beginning of the title. Window names are
+normalized to letters, numbers, dots, underscores, and hyphens and shortened to
+48 characters. Omitting the setting keeps the ticket ID. It applies to new
+windows; worker ownership and cleanup still use the stable tmux window ID.
+
+The start node has no prompt fields; put the initial instructions in a following
+`codex.send-prompt` node. Legacy prompt fields on start nodes are ignored. The terminal waits until the
+first prompt starts before attaching, because Codex persists the thread then.
+Send the first prompt before restarting Relay; an empty thread is not yet resumable.
 
 The dashboard **Workers → Send** control also recognizes App Server workers.
 It starts a follow-up turn on the same durable Codex thread (waiting for the
@@ -620,7 +638,6 @@ workflows:
         with:
           model: gpt-5.6-terra
           effort: high
-          prompt: "Implement {{item.id}}: {{item.title}}"
       follow-up:
         # Started allows immediate steering. The delivery option below decides
         # whether to steer now or wait until the current turn is idle.
@@ -631,8 +648,42 @@ workflows:
           delivery: idle
           waitForCompletion: true
           timeoutMs: 300000
-          prompt: "Run the relevant tests and fix any failures."
+          prompt: "Implement {{item.id}}: {{item.title}}. Run the relevant tests."
 ```
+
+The start node's **Permissions** settings apply to the initial turn, follow-up
+prompts, and resumed workers. For unrestricted local access, configure:
+
+```yaml
+permissions:
+  sandbox: danger-full-access
+  approvals: never
+```
+
+For a sandbox that can request additional access:
+
+```yaml
+permissions:
+  sandbox: workspace-write
+  approvals: on-request
+  networkAccess: true
+  writableRoots:
+    - /absolute/path/to/another/workspace
+```
+
+Sandbox choices are `read-only`, `workspace-write`, and `danger-full-access`.
+Approvals can be `on-request`, `never`, or `auto-review` when the installed
+Codex advertises automatic review. Full access permits commands outside the
+workspace and network access; it does not use the network or writable-root
+settings. Read-only mode does not accept writable roots.
+
+New dashboard nodes default to workspace-write with on-request approvals.
+Existing workflows without `permissions` retain workspace-write with approvals
+set to never. Saving these settings affects newly started sessions; it does not
+change a running session. Requested command, file, and permission approvals
+appear in the authenticated dashboard with **Allow once** and **Decline**.
+Unanswered requests are declined after ten minutes. Automatic review uses
+Codex's reviewer; Relay does not silently fall back if it is unavailable.
 
 The tmux window is intentionally not the transport for Codex: App Server owns
 the Codex process and thread lifecycle, while tmux remains available for an

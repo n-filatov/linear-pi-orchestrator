@@ -1,3 +1,4 @@
+import { validateWorkflowActions } from "./workflow-validation.js";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -69,7 +70,7 @@ export class WorkflowConfigRepository {
   async save(workflowId: string, workflow: unknown, expectedRevision?: string): Promise<WorkflowConfigSnapshot> {
     return this.mutate(expectedRevision, (document) => {
       document.setIn(["workflows", workflowId], normalizeLegacyCodexTmuxNeeds(workflow));
-    }).then(async () => this.get(workflowId));
+    }, workflowId).then(async () => this.get(workflowId));
   }
 
   /** Creates a workflow atomically; unlike save it never overwrites an existing id. */
@@ -77,7 +78,7 @@ export class WorkflowConfigRepository {
     await this.mutate(expectedRevision, (document) => {
       if (document.hasIn(["workflows", workflowId])) throw new WorkflowAlreadyExistsError(workflowId);
       document.setIn(["workflows", workflowId], normalizeLegacyCodexTmuxNeeds(workflow));
-    });
+    }, workflowId);
     return this.get(workflowId);
   }
 
@@ -100,7 +101,7 @@ export class WorkflowConfigRepository {
     return this.get(nextWorkflowId);
   }
 
-  private async mutate(expectedRevision: string | undefined, operation: (document: Document) => void): Promise<{ revision: string }> {
+  private async mutate(expectedRevision: string | undefined, operation: (document: Document) => void, workflowId?: string): Promise<{ revision: string }> {
     if (!existsSync(this.configPath)) throw new Error(`No ${CONFIG_FILE} found in ${this.projectRoot}.`);
     const release = await lockfile.lock(this.configPath, {
       retries: { retries: 6, factor: 1.4, minTimeout: 25, maxTimeout: 500 },
@@ -115,6 +116,7 @@ export class WorkflowConfigRepository {
       operation(document);
       normalizeDocumentLegacyNeeds(document);
       assertValidDocument(document);
+      if (workflowId) await validateWorkflowActions(normalizeRelayConfig(document.toJS()), workflowId, this.projectRoot);
       const rendered = document.toString({ lineWidth: 0 });
       await writeFileAtomic(this.configPath, rendered);
       return { revision: revisionOf(rendered) };

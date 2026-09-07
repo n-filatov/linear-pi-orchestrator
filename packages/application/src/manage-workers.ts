@@ -195,6 +195,7 @@ export class ManageWorkers {
     return { result: { status: "succeeded", output: { runId: dispatch.run?.id, workerId: dispatch.run?.worker?.id,
       ...(typeof codexSession?.threadId === "string" ? { threadId: codexSession.threadId } : {}),
       ...(typeof codexSession?.turnId === "string" ? { turnId: codexSession.turnId } : {}),
+      ...(typeof codexSession?.rolloutPath === "string" ? { rolloutPath: codexSession.rolloutPath } : {}),
       ...(typeof codexSession?.endpoint === "string" ? { endpoint: codexSession.endpoint } : {}),
     } }, dispatch, trigger: derived };
   }

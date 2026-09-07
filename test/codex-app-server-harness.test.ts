@@ -145,4 +145,43 @@ describe("CodexAppServerHarness", () => {
     await expect(sent).resolves.toMatchObject({ turnId: "turn-1", turnStatus: "completed" });
     await harness.closeAll();
   });
+  it.each([
+    { sandbox: "danger-full-access", approvals: "never" },
+    { sandbox: "workspace-write", approvals: "on-request", networkAccess: true, writableRoots: ["/repo/shared"] },
+  ])("preserves configured permissions through follow-up turns and reconnect: %j", async (permissions) => {
+    const process = new FakeAppServer() as FakeAppServer & CodexAppServerProcess;
+    vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(new CodexAppServerClient(process));
+    const harness = new CodexAppServerHarness();
+    const worker = await harness.launch({ workerId: "permission-worker", repository: { id: "repo", root: "/repo" },
+      item: { sourceId: "queue", id: "P-1", title: "Permissions" }, workspace: { path: "/repo/work" },
+      prompt: "Start", config: { args: [] }, harnessInput: { permissions },
+    });
+    expect(worker.metadata?.codexAppServer).toMatchObject({ permissions });
+    const initial = process.messages.find((entry) => entry.method === "thread/start")!.params;
+    const initialTurn = process.messages.find((entry) => entry.method === "turn/start")!.params as Record<string, unknown>;
+    process.notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
+    await harness.sendPrompt(worker, { prompt: "Follow up", delivery: "idle", timeoutMs: 1_000 });
+    expect(process.messages.filter((entry) => entry.method === "turn/start").at(-1)?.params).toMatchObject({ sandboxPolicy: initialTurn.sandboxPolicy, approvalPolicy: permissions.approvals });
+    await harness.closeAll();
+    const resumedProcess = new FakeAppServer() as FakeAppServer & CodexAppServerProcess;
+    vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(new CodexAppServerClient(resumedProcess));
+    const resumedHarness = new CodexAppServerHarness();
+    await resumedHarness.sendPrompt(JSON.parse(JSON.stringify(worker)), { prompt: "After restart", delivery: "idle", timeoutMs: 1_000 });
+    expect(resumedProcess.messages.find((entry) => entry.method === "thread/resume")!.params).toMatchObject(initial as object);
+    expect(resumedProcess.messages.find((entry) => entry.method === "turn/start")!.params).toMatchObject({ sandboxPolicy: initialTurn.sandboxPolicy });
+    await resumedHarness.closeAll();
+  });
+
+});
+
+it('creates an idle session and starts the first turn only when send-prompt arrives', async () => {
+  const process = new FakeAppServer() as FakeAppServer & CodexAppServerProcess;
+  vi.spyOn(CodexAppServerClient, 'start').mockResolvedValue(new CodexAppServerClient(process));
+  const harness = new CodexAppServerHarness();
+  const worker = await harness.launch({ workerId: 'idle', repository: { id: 'repo', root: '/repo' }, item: { sourceId: 'linear', id: 'REL-1', title: 'Relay' }, workspace: { path: '/repo/work' }, prompt: '', config: { args: [] }, harnessInput: { startOnly: true, permissions: { sandbox: 'danger-full-access', approvals: 'never' } } });
+  expect(process.messages.filter((message) => message.method === 'turn/start')).toHaveLength(0);
+  expect((worker.metadata?.codexAppServer as any).turnId).toBeUndefined();
+  await expect(harness.sendPrompt(worker, { prompt: 'Implement the task', delivery: 'idle', timeoutMs: 1000 })).resolves.toMatchObject({ turnId: 'turn-1' });
+  expect(process.messages.find((message) => message.method === 'turn/start')?.params).toMatchObject({ sandboxPolicy: { type: 'dangerFullAccess' }, input: [{ type: 'text', text: 'Implement the task' }] });
+  await harness.closeAll();
 });

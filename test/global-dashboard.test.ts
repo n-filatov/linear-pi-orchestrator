@@ -14,6 +14,45 @@ afterEach(() => {
 });
 
 describe("GlobalDashboardServer", () => {
+  it("returns a node-specific validation error without writing an invalid workflow", async () => {
+    const root = await mkdtemp(join(tmpdir(), "relay-save-validation-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-save-validation-state-"));
+    const file = join(root, ".task-relay.yaml");
+    await writeFile(file, stringify({ version: 2, project: { name: "validation" }, sources: { queue: { use: "command" } }, workflows: {} }));
+    const before = await readFile(file, "utf8");
+    const projects = new ProjectManager({ stateHome });
+    const project = await projects.register(root);
+    const server = new GlobalDashboardServer(projects, {});
+    const base = new URL(await server.start(0));
+    try {
+      for (const method of ["POST", "PUT"]) {
+        const route = `/api/projects/${project.id}/workflows${method === "PUT" ? "/broken" : ""}?token=${base.searchParams.get("token")}`;
+        const response = await fetch(new URL(route, base), { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "broken", workflow: { on: { source: "queue" }, jobs: { start: { use: "codex.send-prompt", with: { codex: { action: "session" } } } } } }) });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error).toContain("Workflow 'broken', node 'start' (codex.send-prompt): Specify exactly one");
+        expect(await readFile(file, "utf8")).toBe(before);
+      }
+    } finally { await server.stop(); projects.close(); }
+  });
+
+  it("authenticates approval endpoints and rejects invalid or stale decisions", async () => {
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-approval-api-"));
+    const projects = new ProjectManager({ stateHome });
+    const server = new GlobalDashboardServer(projects, {});
+    const base = new URL(await server.start(0));
+    const token = base.searchParams.get("token")!;
+    try {
+      expect((await fetch(new URL("/api/codex/approvals", base))).status).toBe(401);
+      const list = await fetch(new URL(`/api/codex/approvals?token=${token}`, base));
+      expect(await list.json()).toEqual({ approvals: [] });
+      const decide = (decision: string) => fetch(new URL(`/api/codex/approvals/missing?token=${token}`, base), {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision }),
+      });
+      expect((await decide("accept-all")).status).toBe(400);
+      expect((await decide("accept")).status).toBe(409);
+    } finally { await server.stop(); projects.close(); }
+  });
+
   it("keeps dotted client-route IDs on the SPA fallback while missing assets return 404", async () => {
     const stateHome = await mkdtemp(join(tmpdir(), "relay-global-dashboard-static-state-"));
     process.env.XDG_STATE_HOME = stateHome;

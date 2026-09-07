@@ -111,3 +111,34 @@ describe("WorkflowConfigRepository", () => {
     expect(workflow.jobs.cleanup.needs).toEqual({ job: "tmux.create-window-1", status: "succeeded" });
   });
 });
+
+it.each([{}, { prompt: 'hello', promptFile: '.task-relay/prompts/implement.md' }])('rejects invalid Codex prompts before saving: %j', async (inputs) => {
+  const root = await project();
+  const file = join(root, '.task-relay.yaml');
+  const before = await readFile(file, 'utf8');
+  const repository = new WorkflowConfigRepository(root);
+  const workflow = { on: { source: 'queue' }, jobs: { 'codex.send-prompt-2': { use: 'codex.send-prompt', with: { codex: { action: "session" }, ...inputs } } } };
+  for (const operation of ['save', 'create'] as const) {
+    await expect(repository[operation]('invalid', workflow)).rejects.toThrow("Workflow 'invalid', node 'codex.send-prompt-2' (codex.send-prompt): Specify exactly one");
+    expect(await readFile(file, 'utf8')).toBe(before);
+  }
+});
+
+it('checks static fields even when another field contains an expression', async () => {
+  const root = await project();
+  await expect(new WorkflowConfigRepository(root).save('invalid', {
+    on: { source: 'queue' }, jobs: { start: { use: 'codex.send-prompt', with: { codex: { action: "session" }, workspace: { fromAction: '${{ jobs.setup.outputs.worker }}' } } } },
+  })).rejects.toThrow('Specify exactly one');
+});
+
+it('validates merged reusable action inputs and accepts a valid prompt', async () => {
+  const root = await project();
+  const file = join(root, '.task-relay.yaml');
+  const config = parse(await readFile(file, 'utf8'));
+  config.actions.start = { use: 'codex.send-prompt', with: { codex: { action: 'session' }, prompt: 'Wait for the implementation prompt.' } };
+  const { stringify } = await import('yaml');
+  await writeFile(file, stringify(config));
+  const repository = new WorkflowConfigRepository(root);
+  await expect(repository.save('valid', { on: { source: 'queue' }, jobs: { start: { use: 'start' } } })).resolves.toBeDefined();
+  await expect(repository.save('invalid', { on: { source: 'queue' }, jobs: { start: { use: 'start', with: { promptFile: '.task-relay/prompts/implement.md' } } } })).rejects.toThrow('Specify exactly one');
+});

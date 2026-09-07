@@ -41,8 +41,7 @@ export function templateFor(
           needs: ["tmux-window.started"],
           with: {
             tmux: { action: "tmux-window" },
-            prompt:
-              "Read the repository instructions and inspect the context for {{item.id}}: {{item.title}}. Prepare a brief implementation plan.",
+            permissions: { sandbox: "workspace-write", approvals: "on-request" },
           },
         },
         "agent-task": {
@@ -59,7 +58,7 @@ export function templateFor(
   return base;
 }
 
-/** Both Codex actions require exactly one prompt representation. */
+/** Send-prompt requires exactly one prompt representation. */
 export function setPromptInput(
   config: Json,
   name: "prompt" | "promptFile",
