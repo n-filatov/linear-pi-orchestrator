@@ -187,6 +187,22 @@ describe("ClaudeSessionHarness", () => {
       expect(secondArgs).not.toContain("--name");
     });
 
+    it("passes --allowedTools with each tool as separate args and prompt as final argument", async () => {
+      writeFakeClaude(binDir, argvLog, succeedBody);
+      const instance = harness();
+      const worker = await instance.launch(launchRequest({ harnessInput: { worktree: "REL-1", name: "REL-1 Relay task", permissionMode: "auto", allowedTools: ["mcp__linear__*", "Bash(pnpm)"] } }));
+
+      const started = await instance.sendPrompt(worker, { prompt: "Implement" });
+      await waitFor(async () => (await instance.turn(worker, started.turnId)).status !== "running");
+
+      const args = readArgvLines()[0]!;
+      expect(args).toContain("--allowedTools");
+      const allowedToolsIndex = args.indexOf("--allowedTools");
+      expect(args[allowedToolsIndex + 1]).toBe("mcp__linear__*");
+      expect(args[allowedToolsIndex + 2]).toBe("Bash(pnpm)");
+      expect(args[args.length - 1]).toBe("Implement");
+    });
+
     it("reports a failed turn from an error result line", async () => {
       writeFakeClaude(binDir, argvLog, failBody);
       const instance = harness();

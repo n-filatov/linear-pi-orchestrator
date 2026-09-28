@@ -27,7 +27,7 @@ describe("Claude start-session action", () => {
       workers: { launch },
     } as unknown as ActionContext;
     const action = createClaudeStartSessionAction({ harnessId: "__claude_session" });
-    const config = claudeStartSessionConfigSchema.parse({ model: "opus", effort: "high" });
+    const config = claudeStartSessionConfigSchema.parse({ model: "opus", effort: "high", allowedTools: ["mcp__linear__*", "Bash(pnpm *)"] });
     const result = await action.execute(context, config);
     expect(result).toMatchObject({ status: "succeeded" });
     expect(launch.mock.calls[0]?.[0]).toMatchObject({
@@ -40,6 +40,7 @@ describe("Claude start-session action", () => {
         permissionMode: "auto",
         model: "opus",
         effort: "high",
+        allowedTools: ["mcp__linear__*", "Bash(pnpm *)"],
       },
     });
   });

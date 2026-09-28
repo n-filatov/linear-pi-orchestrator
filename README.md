@@ -762,6 +762,13 @@ workflows:
 
 Prompt files are Handlebars templates (`{{item.id}}`, `{{item.title}}`). Inline values under a workflow job's `with:` are resolved first, so write `${{ item.id }}` there; a bare `{{item.id}}` in `with.prompt` or `with.name` is rejected.
 
+`claude.start-session` options:
+
+- `permissionMode`: How Claude handles tool use approval (`auto`, `default`, `dontAsk`, `acceptEdits`, `plan`, `bypassPermissions`). Defaults to `auto`.
+- `model`: Claude model to use (e.g., `claude-opus-5`, `claude-sonnet-4`).
+- `effort`: Reasoning effort level (e.g., `low`, `medium`, `high`).
+- `allowedTools`: Tools the headless turns may use without approval. Pass as a list of tool identifiers, e.g., `["mcp__linear__*", "Bash(pnpm *)"]`. Note: `--permission-prompts none` denies any tool not in this list.
+
 `if: ${{ always() }}` on the last job matters: the session should be handed
 off for human review even when an earlier turn failed, not left stranded on a
 locked worktree. `claude.open-in-app` records its result (`link`,

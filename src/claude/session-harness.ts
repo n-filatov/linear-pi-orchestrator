@@ -23,6 +23,7 @@ type ClaudeHarnessInput = {
   permissionMode?: string;
   model?: string;
   effort?: string;
+  allowedTools?: string[];
 };
 
 type ClaudeTurnRecord = {
@@ -50,6 +51,7 @@ type ClaudeSessionRecord = {
   permissionMode?: string;
   model?: string;
   effort?: string;
+  allowedTools?: string[];
   /** Working directory every turn is spawned from (the repository root). */
   cwd: string;
   itemId?: string;
@@ -153,6 +155,7 @@ export class ClaudeSessionHarness implements HarnessPlugin<z.infer<typeof harnes
       permissionMode: input.permissionMode,
       model: input.model ?? request.model,
       effort: input.effort ?? request.reasoningEffort,
+      allowedTools: input.allowedTools,
       cwd: request.workspace.path,
       itemId: request.item.id,
       repository: request.repository.id,
@@ -178,6 +181,7 @@ export class ClaudeSessionHarness implements HarnessPlugin<z.infer<typeof harnes
           permissionMode: record.permissionMode,
           model: record.model,
           effort: record.effort,
+          allowedTools: record.allowedTools,
           cwd: record.cwd,
         },
       },
@@ -421,6 +425,8 @@ export class ClaudeSessionHarness implements HarnessPlugin<z.infer<typeof harnes
     if (effort) args.push("--effort", effort);
     if (record.permissionMode) args.push("--permission-mode", record.permissionMode);
     args.push("--permission-prompts", "none");
+    // `--allowedTools` is variadic: it must be followed by another option, never by the prompt.
+    if (record.allowedTools && record.allowedTools.length > 0) args.push("--allowedTools", ...record.allowedTools);
     args.push("--output-format", "stream-json", "--verbose");
     if (spec.jsonSchema) args.push("--json-schema", JSON.stringify(spec.jsonSchema));
     args.push(spec.prompt);
@@ -474,6 +480,7 @@ function parseHarnessInput(value: Record<string, unknown> | undefined): ClaudeHa
     permissionMode: typeof value.permissionMode === "string" ? value.permissionMode : undefined,
     model: typeof value.model === "string" ? value.model : undefined,
     effort: typeof value.effort === "string" ? value.effort : undefined,
+    allowedTools: Array.isArray(value.allowedTools) && value.allowedTools.every((v) => typeof v === "string") ? value.allowedTools : undefined,
   };
 }
 
