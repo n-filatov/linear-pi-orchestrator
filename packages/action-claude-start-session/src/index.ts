@@ -13,6 +13,8 @@ export const claudeStartSessionConfigSchema = z.object({
   permissionMode: claudePermissionModeSchema.default("auto"),
   model: z.string().min(1).optional(),
   effort: z.string().min(1).optional(),
+  /** Tools the headless turns may use without approval, passed as --allowedTools, e.g. mcp__linear__*, Bash(pnpm *). */
+  allowedTools: z.array(z.string().min(1)).optional(),
 }).strict();
 
 const DEFAULT_WORKTREE_TEMPLATE = "{{item.id}}";
@@ -66,6 +68,7 @@ export function createClaudeStartSessionAction(options: ClaudeStartSessionDepend
           permissionMode: config.permissionMode,
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
+          ...(config.allowedTools ? { allowedTools: config.allowedTools } : {}),
         },
       });
     },
