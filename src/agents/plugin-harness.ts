@@ -8,7 +8,11 @@ import type {
   WorkItem,
   WorkerCompletion,
   WorkerHandle,
+  WorkerHandoffResult,
+  WorkerHandoffSpec,
+  WorkerPromptSpec,
   WorkerRuntime,
+  WorkerTurn,
 } from "../domain/index.js";
 import type { HarnessPlugin } from "../plugins/contracts.js";
 import { renderTemplate, templateValues } from "./templates.js";
@@ -129,6 +133,36 @@ export class CompositeAgentLauncher implements AgentLauncher {
     if (!harness) { await this.commands.stop?.(worker, run); return; }
     if (!harness.plugin.stop) throw new Error(`Harness '${harness.id}' cannot stop a worker.`);
     await harness.plugin.stop(worker);
+  }
+
+  async sendPrompt(worker: WorkerHandle, run: RunRecord, spec: WorkerPromptSpec): Promise<WorkerTurn> {
+    const harness = this.harnessFor(worker, run);
+    if (!harness) {
+      if (!this.commands.sendPrompt) throw new Error("The configured agent launcher cannot send a prompt to a worker.");
+      return this.commands.sendPrompt(worker, run, spec);
+    }
+    if (!harness.plugin.sendPrompt) throw new Error(`Harness '${harness.id}' cannot send a prompt to a worker.`);
+    return harness.plugin.sendPrompt(worker, spec);
+  }
+
+  async turn(worker: WorkerHandle, run: RunRecord, turnId: string): Promise<WorkerTurn> {
+    const harness = this.harnessFor(worker, run);
+    if (!harness) {
+      if (!this.commands.turn) throw new Error("The configured agent launcher cannot read a worker turn.");
+      return this.commands.turn(worker, run, turnId);
+    }
+    if (!harness.plugin.turn) throw new Error(`Harness '${harness.id}' cannot read a worker turn.`);
+    return harness.plugin.turn(worker, turnId);
+  }
+
+  async handoff(worker: WorkerHandle, run: RunRecord, spec?: WorkerHandoffSpec): Promise<WorkerHandoffResult> {
+    const harness = this.harnessFor(worker, run);
+    if (!harness) {
+      if (!this.commands.handoff) throw new Error("The configured agent launcher cannot hand off a worker.");
+      return this.commands.handoff(worker, run, spec);
+    }
+    if (!harness.plugin.handoff) throw new Error(`Harness '${harness.id}' cannot hand off a worker.`);
+    return harness.plugin.handoff(worker, spec);
   }
 
   async attach(worker: WorkerHandle): Promise<void> {

@@ -7,13 +7,13 @@ import type { RelayCommandContext, RelayCommandHandlers, WorkflowActionTestResul
 import { loadRelayConfig, type RelayActionReference, type RelayConfigV2, type RelayTriggerV2, type RelayWorkflowJobV2, type RelayWorkflowV2 } from "./config/index.js";
 import type { RelayConfig as LegacyRelayConfig } from "./config/schema.js";
 import { TaskRelay, type TickResult, type TriggerProvider } from "./core/index.js";
-import type { AgentLauncher, AgentProfile, AgentResolution, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkerCompletion, WorkerHandle, WorkerRuntime, WorkflowDefinition, WorkflowJobDefinition, WorkflowJobState, WorkflowNeed, Workspace, WorkspaceProvider, WorkItem, WorkSource } from "./domain/index.js";
+import type { AgentLauncher, AgentProfile, AgentResolution, RelayLogger, RepositoryScope, RunClaim, RunIdentity, RunRecord, RunStore, RunTerminalTransition, TriggerActionDefinition, TriggerDefinition, WorkerChildHandle, WorkerCompletion, WorkerHandle, WorkerHandoffResult, WorkerHandoffSpec, WorkerPromptSpec, WorkerRuntime, WorkerTurn, WorkflowDefinition, WorkflowJobDefinition, WorkflowJobState, WorkflowNeed, Workspace, WorkspaceProvider, WorkItem, WorkSource } from "./domain/index.js";
 import { builtInHarnessProfile, CommandAgentLauncher, CompositeAgentLauncher, type AgentModelProfile, type CommandAgentProfile, type ConfiguredHarnessPlugin } from "./agents/index.js";
 import { builtInActionPlugins } from "./actions/index.js";
 import { BUILT_IN_HARNESS_PROFILES, BUILT_IN_SOURCES, RelayPluginRegistry, findInstalledPlugin, loadRelayPlugin, readPluginLock, type LaunchWorkerActionRequest, type SourcePlugin } from "./plugins/index.js";
 import { loadReusableWorkflow } from "./config/reusable.js";
 import { DirectProcessAdapter, TmuxExecutionAdapter, TmuxWindowHarness, TMUX_WINDOW_HARNESS_ID } from "./runtime/index.js";
-import { GitWorktreeProvider, WtWorkspaceProvider } from "./workspaces/index.js";
+import { GitWorktreeProvider, ProjectWorkspaceProvider, WtWorkspaceProvider } from "./workspaces/index.js";
 import { builtInSourcePlugins, SdkMcpToolClient, isLinearTriggerSelector, type CommandInvocation, type McpTransportConfig } from "./sources/index.js";
 import { RepositoryDaemon } from "./daemon.js";
 import { checkRelayUpdate, updateRelay } from "./updater.js";
@@ -26,6 +26,8 @@ import { getRepositoryIdentity } from "./state/repository-identity.js";
 import { RepositoryStateStore } from "./state/store.js";
 import { IndexedWorkflowRunStore } from "./state/indexed-workflow-run-store.js";
 import { CODEX_APP_SERVER_HARNESS_ID, CodexAppServerHarness } from "./codex/index.js";
+import { CLAUDE_SESSION_HARNESS_ID, ClaudeSessionHarness } from "./claude/index.js";
+import { stateDirectory } from "./logging/events.js";
 
 type RuntimeComposition = {
   relay: TaskRelay;
@@ -65,6 +67,22 @@ export async function closeCodexAppServers(projectRoot?: string): Promise<void> 
     codexAppServerHarnesses.delete(key);
     await harness.closeAll();
   }));
+}
+
+// A Claude session's process exits at the end of every turn, so this harness
+// holds no live child to reattach to; the shared instance exists purely so a
+// later `claude.send-prompt`/`claude.open-in-app` addresses the same on-disk
+// session state an earlier `claude.start-session` created within this poll.
+const claudeSessionHarnesses = new Map<string, ClaudeSessionHarness>();
+
+function sharedClaudeSession(projectRoot: string): ClaudeSessionHarness {
+  const key = path.resolve(projectRoot);
+  let harness = claudeSessionHarnesses.get(key);
+  if (!harness) {
+    harness = new ClaudeSessionHarness({ stateDirectory: stateDirectory(projectRoot) });
+    claudeSessionHarnesses.set(key, harness);
+  }
+  return harness;
 }
 
 async function ensureRegistryContext(context: RelayCommandContext): Promise<{ registry: GlobalWorkerRegistry; repository: RepositoryScope; registryRepository: RepositoryScope }> {
@@ -237,6 +255,35 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       } finally { await runtime.close(); }
       context.write(`${run.item.id}: recorded ${status}${Object.keys(outputs).length ? ` with ${Object.keys(outputs).length} output(s)` : ""}.`);
     },
+    handoff: async (context, target, options) => {
+      const candidates = (await context.store.listRuns())
+        .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
+        .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
+      if (candidates.length === 0) throw new Error(`No worker found for '${target}'.`);
+      const active = candidates.filter((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
+      const selectable = active.length > 0 ? active : candidates;
+      if (selectable.length > 1) throw new Error(`More than one worker matches '${target}'. Use the exact worker id from 'relay runs --json'.`);
+      const run = selectable[0]!;
+      if (!run.worker) throw new Error(`No worker found for '${target}'.`);
+      if (!run.worker.metadata?.claudeSession) throw new Error(`Worker for '${target}' is not a Claude Code session; nothing to hand off.`);
+      const result = await sharedClaudeSession(context.projectRoot).handoff(run.worker, { target: "claude-app", force: options.force });
+      const at = new Date().toISOString();
+      // Outputs are recorded before the terminal transition, matching `signal`:
+      // a workflow job reading needs.<job>.outputs must never see a finished
+      // job without them, and the Linear source's own handoff comment reads
+      // this same output shape.
+      await context.store.recordWorkerOutputs(run.identity, run.claimedAt, { claudeSession: result }, at);
+      const status = result.chainStatus === "succeeded" ? "succeeded" : "failed";
+      const finished = await context.store.finishActive(run.identity, run.claimedAt, { status, completedAt: at, ...(status === "failed" ? { error: result.lastResult ?? "The Claude session's chain finished with a failure." } : {}) });
+      if (!finished) throw new Error(`Worker for ${run.item.id} changed before its result could be recorded.`);
+      const runtime = await composeRuntime(context);
+      try {
+        const source = runtime.sources.get(run.identity.sourceId);
+        if (source) await source.report({ type: status, sourceId: source.id, run: finished, occurredAt: at, error: finished.error });
+      } finally { await runtime.close(); }
+      context.write(result.link ? `${run.item.id}: handed off to the Claude app — ${result.link}` : `${run.item.id}: handed off to the Claude app (${result.chainStatus}).`);
+      return result;
+    },
     workerControl: async (context, target, action) => {
       const { registry, registryRepository } = await ensureRegistryContext(context);
       const candidates = (await context.store.listRuns())
@@ -255,7 +302,7 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       // first turn must remain usable for a later dashboard prompt.
       if (action.type === "send" && isCodexAppServerWorker(run.worker)) {
         if (action.submit === false) throw new Error("A Codex App Server prompt cannot be staged; submit it to start the next turn.");
-        const sent = await sharedCodexAppServer(context.projectRoot).sendPrompt(run.worker, {
+        const sent = await sharedCodexAppServer(context.projectRoot).sendCodexPrompt(run.worker, {
           prompt: action.text,
           // Waiting for idle makes the dashboard safe both after completion
           // and when the user sends the next instruction slightly early.
@@ -332,6 +379,25 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
         const adopted = await context.store.adoptWorkflowDefinition(target.identity, definition, new Date().toISOString());
         if (!adopted) throw new Error(`Workflow run ${target.identity.occurrence} changed before adoption.`);
         context.write(`Adopted current definition for ${id} ${task} (${target.identity.occurrence}).`);
+      } finally { await runtime.close(); }
+    },
+    workflowCancel: async (context, id, task, occurrence) => {
+      const repository = { id: context.config.project.name || path.resolve(context.projectRoot).split("/").pop() || "project", root: context.projectRoot };
+      const candidates = (await context.store.listWorkflowRuns(repository))
+        .filter((run) => run.identity.workflowId === id && run.identity.itemId.toLowerCase() === task.toLowerCase() && run.status === "running")
+        .filter((run) => !occurrence || run.identity.occurrence === occurrence)
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+      const target = candidates[0];
+      if (!target) throw new Error(`No open run of workflow '${id}' found for '${task}'.`);
+      if (!context.config.workflows[id]) throw new Error(`Unknown workflow '${id}'.`);
+      const runtime = await composeRuntime(context, { trigger: id, readOnly: true });
+      try {
+        const definition = runtime.workflows.find((workflow) => workflow.id === id) ?? target.definition;
+        if (!definition) throw new Error(`Current workflow '${id}' could not be validated.`);
+        const outcome = await runtime.relay.cancelWorkflowRun(definition, target.identity, "Cancelled by user.");
+        if (!outcome) throw new Error(`Run ${target.identity.occurrence} of '${id}' is no longer open.`);
+        if (!outcome.cancelled) throw new Error(`Run ${target.identity.occurrence} of '${id}' could not be verified as cancelled; it needs attention instead.`);
+        context.write(`Cancelled ${id} for ${task} (${target.identity.occurrence}).`);
       } finally { await runtime.close(); }
     },
     workflowActionTest: async (context, workflowId, actionId, options): Promise<WorkflowActionTestResult> => {
@@ -494,7 +560,6 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
       let targetContext = context;
       let candidates = (await targetContext.store.listRuns())
         .filter((run) => run.worker && (run.id === target || run.worker.id === target || run.item.id.toLowerCase() === target.toLowerCase()))
-        .filter((run) => Object.keys(asRecord(run.worker?.metadata?.tmux)).length > 0)
         .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
       if (candidates.length === 0) {
         const record = chooseRegistryCandidate(registryCandidates(registry, target), target);
@@ -502,14 +567,34 @@ export function createRuntimeHandlers(): RelayCommandHandlers {
           targetContext = await contextForRegistryRecord(context, record);
           candidates = (await targetContext.store.listRuns())
             .filter((run) => run.worker && (run.id === record.runId || run.worker.id === record.id || run.item.id.toLowerCase() === record.itemId.toLowerCase()))
-            .filter((run) => Object.keys(asRecord(run.worker?.metadata?.tmux)).length > 0)
             .sort((left, right) => right.claimedAt.localeCompare(left.claimedAt));
           if (candidates.length === 0 && record.snapshot.worker) candidates = [record.snapshot];
         }
       }
-      if (candidates.length === 0) throw new Error(`No attachable tmux worker found for '${target}'.`);
+      if (candidates.length === 0) throw new Error(`No attachable worker found for '${target}'.`);
       const active = candidates.find((run) => ["claimed", "provisioning", "launching", "running"].includes(run.status));
-      const run = active ?? candidates[0];
+      const run = active ?? candidates[0]!;
+
+      // A worker already handed off to the Claude app has no tmux pane left to
+      // attach to; open the desktop app's link instead. A relay-owned Claude
+      // session that has NOT been handed off yet is headless by design and has
+      // no attachable terminal of its own, so point the user at `relay handoff`.
+      const outputs = asRecord(run.worker?.metadata?.outputs);
+      const link = stringValue(asRecord(outputs.claudeSession).link);
+      if (link) {
+        const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : undefined;
+        if (!opener) throw new Error("Opening the Claude app needs macOS or Windows.");
+        const { execa } = await import("execa");
+        await execa(opener, process.platform === "win32" ? ["", link] : [link], { reject: false, ...(process.platform === "win32" ? { shell: true } : {}) });
+        context.write(`${run.item.id}: opened the Claude app — ${link}`);
+        return;
+      }
+      if (run.worker?.metadata?.claudeSession) {
+        context.write(`${run.item.id}: this worker is a headless Claude Code session with no attachable terminal. Run 'relay handoff ${target} --force' to open it in the Claude app.`);
+        return;
+      }
+
+      if (Object.keys(asRecord(run.worker?.metadata?.tmux)).length === 0) throw new Error(`No attachable tmux worker found for '${target}'.`);
       const registered = registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
       addIssueToLegacyTmuxMetadata(run, registered.id);
       registry.syncRun(run, { repository: { id: targetContext.repositoryIdentity!.id, root: targetContext.repositoryIdentity!.root } });
@@ -596,7 +681,8 @@ function isCodexAppServerWorker(worker: WorkerHandle): boolean {
 async function composeRuntime(context: RelayCommandContext, filters: { trigger?: string; task?: string; scheduled?: boolean; readOnly?: boolean } = {}): Promise<RuntimeComposition> {
   const { registry, repository, registryRepository } = await ensureRegistryContext(context);
   const codexAppServer = sharedCodexAppServer(context.projectRoot);
-  const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger, codexAppServer);
+  const claudeSession = sharedClaudeSession(context.projectRoot);
+  const plugins = await pluginRegistry(context.config, context.projectRoot, filters.trigger, codexAppServer, claudeSession, relayLogger(context.logger, repository.id));
   const triggers = context.config.triggers
     .filter((trigger) => !filters.trigger || trigger.id === filters.trigger)
     .map((trigger) => domainTrigger(context.config, trigger, repository));
@@ -640,6 +726,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const commandLauncher = new CommandAgentLauncher({ profiles: harnessProfiles(context.config), executor, windowNameTemplate: context.config.execution.tmuxWindowName, repositoryIdentity: registryRepository.id });
   const harnessPlugins = [
     { id: CODEX_APP_SERVER_HARNESS_ID, plugin: codexAppServer, config: plugins.parseHarnessConfig(CODEX_APP_SERVER_HARNESS_ID, {}) },
+    { id: CLAUDE_SESSION_HARNESS_ID, plugin: claudeSession, config: plugins.parseHarnessConfig(CLAUDE_SESSION_HARNESS_ID, {}) },
     { id: TMUX_WINDOW_HARNESS_ID, plugin: new TmuxWindowHarness(tmuxWindowExecutor), config: plugins.parseHarnessConfig(TMUX_WINDOW_HARNESS_ID, {}) },
     ...pluginHarnesses(context.config, plugins),
   ];
@@ -648,7 +735,7 @@ async function composeRuntime(context: RelayCommandContext, filters: { trigger?:
   const configuredWorkspace = context.config.workspace.adapter === "git-worktree"
     ? new GitWorktreeProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) })
     : new WtWorkspaceProvider({ baseBranch: context.config.workspace.baseBranch, branchTemplate: context.config.workspace.branchTemplate, worktreeRoot: path.resolve(context.projectRoot, context.config.workspace.directory) });
-  const workspace = new RegistryWorkspaceProvider(configuredWorkspace, registry, registryRepository);
+  const workspace = new RegistryWorkspaceProvider(ProjectWorkspaceProvider(configuredWorkspace, context.projectRoot), registry, registryRepository);
   const eventStore = new EventingRunStore(context.store, context.logger, repository.id, registry, registryRepository);
   const triggerProvider: TriggerProvider = { list: async () => triggers };
   const workflowRegistry = context.workflowRegistry ?? new GlobalWorkflowRegistry();
@@ -836,7 +923,7 @@ function resolveActions(config: RelayConfigV2, references: readonly RelayActionR
  * `workers.launch` gets exactly the same errors as the built-in `launch`.
  */
 export function validateLaunchRequest(config: RelayConfigV2, request: Pick<LaunchWorkerActionRequest, "harness" | "mode">, subject: string): void {
-  if (request.harness === CODEX_APP_SERVER_HARNESS_ID || request.harness === TMUX_WINDOW_HARNESS_ID) return;
+  if (request.harness === CODEX_APP_SERVER_HARNESS_ID || request.harness === CLAUDE_SESSION_HARNESS_ID || request.harness === TMUX_WINDOW_HARNESS_ID) return;
   if (!request.harness) throw new Error(`${subject} requires 'with.harness'.`);
   const harness = config.harnesses[request.harness];
   if (!harness) {
@@ -869,7 +956,7 @@ export function harnessProfiles(config: RelayConfigV2): CommandAgentProfile[] {
 /** Harness plugins bound to their validated configuration, in declaration order. */
 function pluginHarnesses(config: RelayConfigV2, plugins: RelayPluginRegistry): ConfiguredHarnessPlugin[] {
   return Object.entries(config.harnesses)
-    .filter(([id, definition]) => id !== CODEX_APP_SERVER_HARNESS_ID && id !== TMUX_WINDOW_HARNESS_ID && !isCommandHarness(definition))
+    .filter(([id, definition]) => id !== CODEX_APP_SERVER_HARNESS_ID && id !== CLAUDE_SESSION_HARNESS_ID && id !== TMUX_WINDOW_HARNESS_ID && !isCommandHarness(definition))
     .map(([id, definition]) => {
       const plugin = plugins.harness(definition.use);
       if (!plugin) throw new Error(`Harness '${id}' uses unknown harness plugin '${definition.use}'.`);
@@ -906,17 +993,21 @@ export function agentProfiles(config: RelayConfigV2 | LegacyRelayConfig): Comman
  * names a plugin that is not installed. Harnesses stay unscoped, because any
  * action may launch any of them.
  */
-async function pluginRegistry(config: RelayConfigV2, projectRoot: string, selected?: string, codexAppServer?: CodexAppServerHarness): Promise<RelayPluginRegistry> {
+async function pluginRegistry(config: RelayConfigV2, projectRoot: string, selected?: string, codexAppServer?: CodexAppServerHarness, claudeSession?: ClaudeSessionHarness, logger?: RelayLogger): Promise<RelayPluginRegistry> {
   const registry = new RelayPluginRegistry();
   if (codexAppServer) registry.registerHarness(codexAppServer);
+  if (claudeSession) registry.registerHarness(claudeSession);
   registry.registerHarness(new TmuxWindowHarness(new TmuxExecutionAdapter({ session: "task-relay" })));
-  for (const plugin of builtInActionPlugins({ codexAppServer })) registry.register(plugin);
+  // Phase 2B's claude.* actions add the `claudeSession` parameter to
+  // `builtInActionPlugins`; until that lands this call only wires Codex.
+  for (const plugin of builtInActionPlugins({ codexAppServer, claudeSession })) registry.register(plugin);
   for (const plugin of builtInSourcePlugins({
     commandInvocation: (value) => invocation(value, projectRoot),
     connectLinear: async (_sourceId, value) => {
       const mcp = requiredRecord(value, "sources.*.with.mcp");
       return await SdkMcpToolClient.connect({ clientName: "task-relay", clientVersion: "0.2.0", transport: mcpTransport(mcp, projectRoot) });
     },
+    logger,
   })) registry.register(plugin);
   const externalUses = new Set<string>();
 
@@ -1033,6 +1124,18 @@ class RegistryAgentLauncher implements AgentLauncher {
   launch(spec: Parameters<AgentLauncher["launch"]>[0]): Promise<WorkerHandle> { return this.launcher.launch(spec); }
   wait(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined> { return this.launcher.wait?.(worker, run) ?? Promise.resolve(undefined); }
   reconcile(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined> { return this.launcher.reconcile?.(worker, run) ?? Promise.resolve(undefined); }
+  sendPrompt(worker: WorkerHandle, run: RunRecord, spec: WorkerPromptSpec): Promise<WorkerTurn> {
+    if (!this.launcher.sendPrompt) throw new Error("The configured agent launcher cannot send a prompt to a worker.");
+    return this.launcher.sendPrompt(worker, run, spec);
+  }
+  turn(worker: WorkerHandle, run: RunRecord, turnId: string): Promise<WorkerTurn> {
+    if (!this.launcher.turn) throw new Error("The configured agent launcher cannot read a worker turn.");
+    return this.launcher.turn(worker, run, turnId);
+  }
+  handoff(worker: WorkerHandle, run: RunRecord, spec?: WorkerHandoffSpec): Promise<WorkerHandoffResult> {
+    if (!this.launcher.handoff) throw new Error("The configured agent launcher cannot hand off a worker.");
+    return this.launcher.handoff(worker, run, spec);
+  }
   async stop(worker: WorkerHandle, run: RunRecord): Promise<void> {
     const record = this.registry.syncRun(run, { repository: this.repository });
     updateRegistryStatus(this.registry, record.id, "stopping");

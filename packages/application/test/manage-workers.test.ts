@@ -68,12 +68,13 @@ class WorkerStore implements RunStore {
     return next;
   }
 
-  async findWorkerTargets(query: { repository: typeof repository; sourceId?: string; itemId?: string; workerIds?: readonly string[] }): Promise<readonly RunRecord[]> {
+  async findWorkerTargets(query: { repository: typeof repository; sourceId?: string; itemId?: string; workerIds?: readonly string[]; includeCleaned?: boolean }): Promise<readonly RunRecord[]> {
     const ids = new Set(query.workerIds ?? []);
     return [...this.runs.values()].filter((run) => run.identity.repository.id === query.repository.id
       && (!query.sourceId || run.identity.sourceId === query.sourceId)
       && (!query.itemId || run.identity.itemId === query.itemId)
-      && (!ids.size || ids.has(run.worker?.id ?? "")));
+      && (!ids.size || ids.has(run.worker?.id ?? ""))
+      && (query.includeCleaned || !run.workspaceCleanedAt));
   }
 
   async findRunsForItem(query: { repository: typeof repository; sourceId: string; itemId: string }): Promise<readonly RunRecord[]> {
@@ -146,5 +147,132 @@ describe("ManageWorkers", () => {
     expect(cleanup).toHaveBeenCalledWith(run.workspace, run);
     expect(report).toHaveBeenCalledWith(expect.objectContaining({ type: "stopped", run: expect.objectContaining({ id: run.id }) }));
     expect(store.runs.get(run.id)).toMatchObject({ status: "stopped", workspaceCleanedAt: "2026-09-06T12:00:00.000Z" });
+  });
+
+  describe("prompt, turn, and handoff", () => {
+    const runtime: WorkerRuntime = { capabilities: { children: true, input: true, capture: true }, open: vi.fn(), sendInput: vi.fn(), capture: vi.fn(), exists: vi.fn(), closeChild: vi.fn() };
+
+    it("starts a turn through the agent launcher for exactly one resolved worker", async () => {
+      const store = new WorkerStore();
+      store.runs.set(workerRun().id, workerRun());
+      const sendPrompt = vi.fn(async () => ({ workerId: "worker-1", turnId: "turn-1", status: "running" as const }));
+      const workers = subject({ store, runtime, launcher: { sendPrompt } });
+
+      await expect(workers.prompt(trigger, item, {}, { workerId: "worker-1" }, { prompt: "continue" }))
+        .resolves.toEqual({ workerId: "worker-1", turnId: "turn-1", status: "running" });
+      expect(sendPrompt).toHaveBeenCalledWith(expect.objectContaining({ id: "worker-1" }), expect.objectContaining({ id: workerRun().id }), { prompt: "continue" });
+    });
+
+    it("throws when the launcher cannot send a prompt", async () => {
+      const store = new WorkerStore();
+      store.runs.set(workerRun().id, workerRun());
+      const workers = subject({ store, runtime });
+
+      await expect(workers.prompt(trigger, item, {}, { workerId: "worker-1" }, { prompt: "continue" }))
+        .rejects.toThrow(/cannot send a prompt/);
+    });
+
+    it("throws when the reference does not resolve to exactly one worker", async () => {
+      const store = new WorkerStore();
+      const workers = subject({ store, runtime, launcher: { sendPrompt: vi.fn() } });
+
+      await expect(workers.prompt(trigger, item, {}, { workerId: "missing" }, { prompt: "continue" }))
+        .rejects.toThrow(/exactly one worker/);
+    });
+
+    it("reads a turn's state for a worker whose run is still active", async () => {
+      const store = new WorkerStore();
+      const run = workerRun();
+      store.runs.set(run.id, run);
+      expect(run.status).toBe("running");
+      const turn = vi.fn(async () => ({ workerId: "worker-1", turnId: "turn-1", status: "succeeded" as const, result: "done" }));
+      const workers = subject({ store, runtime, launcher: { turn } });
+
+      await expect(workers.turn(trigger, item, {}, { workerId: "worker-1" }, "turn-1"))
+        .resolves.toEqual({ workerId: "worker-1", turnId: "turn-1", status: "succeeded", result: "done" });
+      expect(turn).toHaveBeenCalledWith(expect.objectContaining({ id: "worker-1" }), expect.objectContaining({ id: run.id }), "turn-1");
+    });
+
+    it("throws when the launcher cannot read a worker turn", async () => {
+      const store = new WorkerStore();
+      store.runs.set(workerRun().id, workerRun());
+      const workers = subject({ store, runtime });
+
+      await expect(workers.turn(trigger, item, {}, { workerId: "worker-1" }, "turn-1")).rejects.toThrow(/cannot read a worker turn/);
+    });
+
+    it("settles a turn as failed instead of throwing when the worker no longer resolves", async () => {
+      const store = new WorkerStore();
+      const workers = subject({ store, runtime, launcher: { turn: vi.fn() } });
+
+      await expect(workers.turn(trigger, item, {}, { workerId: "worker-1" }, "turn-1"))
+        .resolves.toEqual({ workerId: "worker-1", turnId: "turn-1", status: "failed", error: "The session worker is no longer running." });
+    });
+
+    it("settles a turn as failed instead of asking the launcher when the run is no longer active", async () => {
+      const store = new WorkerStore();
+      const run = { ...workerRun(), status: "stopped" as const };
+      store.runs.set(run.id, run);
+      const turn = vi.fn();
+      const workers = subject({ store, runtime, launcher: { turn } });
+
+      await expect(workers.turn(trigger, item, {}, { workerId: "worker-1" }, "turn-1"))
+        .resolves.toEqual({ workerId: "worker-1", turnId: "turn-1", status: "failed", error: "The session worker is no longer running." });
+      expect(turn).not.toHaveBeenCalled();
+    });
+
+    it("records handoff outputs and finishes an active run as succeeded", async () => {
+      const store = new WorkerStore();
+      const run = workerRun();
+      store.runs.set(run.id, run);
+      const report = vi.fn(async () => {});
+      const source: WorkSource = { id: item.sourceId, discover: async () => [], report };
+      const handoffResult = { target: "claude-app", handedOffAt: "2026-09-06T12:00:00.000Z", chainStatus: "succeeded" as const, link: "claude://claude.ai/epitaxy/local_1" };
+      const handoff = vi.fn(async () => handoffResult);
+      const workers = subject({ store, runtime, launcher: { handoff }, source });
+
+      await expect(workers.handoff(source, trigger, item, {}, { workerId: "worker-1" })).resolves.toEqual(handoffResult);
+
+      expect(handoff).toHaveBeenCalledWith(expect.objectContaining({ id: "worker-1" }), expect.objectContaining({ id: run.id }), undefined);
+      expect(store.runs.get(run.id)?.worker?.metadata?.outputs).toMatchObject({ claudeSession: handoffResult });
+      expect(store.runs.get(run.id)?.status).toBe("succeeded");
+      expect(report).toHaveBeenCalledWith(expect.objectContaining({ type: "succeeded", run: expect.objectContaining({ id: run.id }) }));
+    });
+
+    it("finishes an active run as failed when the handoff chain failed", async () => {
+      const store = new WorkerStore();
+      const run = workerRun();
+      store.runs.set(run.id, run);
+      const source: WorkSource = { id: item.sourceId, discover: async () => [], report: async () => {} };
+      const handoffResult = { target: "claude-app", handedOffAt: "2026-09-06T12:00:00.000Z", chainStatus: "failed" as const };
+      const workers = subject({ store, runtime, launcher: { handoff: vi.fn(async () => handoffResult) }, source });
+
+      await expect(workers.handoff(source, trigger, item, {}, { workerId: "worker-1" })).resolves.toEqual(handoffResult);
+      expect(store.runs.get(run.id)?.status).toBe("failed");
+    });
+
+    it("does not re-finish a run that has already reached a terminal status", async () => {
+      const store = new WorkerStore();
+      const run = { ...workerRun(), status: "succeeded" as const, completedAt: "2026-09-06T11:00:00.000Z" };
+      store.runs.set(run.id, run);
+      const report = vi.fn(async () => {});
+      const source: WorkSource = { id: item.sourceId, discover: async () => [], report };
+      const handoffResult = { target: "claude-app", handedOffAt: "2026-09-06T12:00:00.000Z", chainStatus: "succeeded" as const };
+      const workers = subject({ store, runtime, launcher: { handoff: vi.fn(async () => handoffResult) }, source });
+
+      await workers.handoff(source, trigger, item, {}, { workerId: "worker-1" });
+
+      expect(report).not.toHaveBeenCalled();
+      expect(store.runs.get(run.id)?.completedAt).toBe("2026-09-06T11:00:00.000Z");
+    });
+
+    it("throws when the launcher cannot hand off a worker", async () => {
+      const store = new WorkerStore();
+      store.runs.set(workerRun().id, workerRun());
+      const source: WorkSource = { id: item.sourceId, discover: async () => [], report: async () => {} };
+      const workers = subject({ store, runtime, source });
+
+      await expect(workers.handoff(source, trigger, item, {}, { workerId: "worker-1" })).rejects.toThrow(/cannot hand off/);
+    });
   });
 });

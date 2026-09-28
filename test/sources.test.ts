@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { builtInSourcePlugins } from "../src/sources/builtins.js";
 import { parseCommandItems } from "../src/sources/command-source.js";
 import { LinearMcpSource, isLinearTriggerSelector, parseLinearTriggerSelector } from "../src/sources/linear-mcp-source.js";
 import type { McpToolClient, McpToolResult } from "../src/sources/mcp-tool-client.js";
@@ -189,6 +190,62 @@ describe("Linear source identity and lifecycle reporting", () => {
     await source.report({ type: "claimed", sourceId: "linear", run: runFor(item, trigger), occurredAt: "now" });
 
     expect(calls).toEqual([{ name: "save_issue", args: { id: "uuid-123", state: "In Progress" } }]);
+  });
+});
+
+describe("built-in Linear source plugin reporting", () => {
+  it("forwards report() to the cached LinearMcpSource created by discover(), applying reporting config", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const client: McpToolClient = {
+      async callTool(name, args): Promise<McpToolResult> {
+        calls.push({ name, args });
+        if (name === "list_issues") return { structuredContent: [{ id: "uuid-123", identifier: "ENG-123", title: "Keep labels", labels: [] }] };
+        if (name === "get_issue") return { structuredContent: { id: "uuid-123", labels: [] } };
+        return { structuredContent: {} };
+      },
+    };
+    const connectLinear = vi.fn(async () => client);
+    const plugins = builtInSourcePlugins({
+      commandInvocation: (value) => value as never,
+      connectLinear,
+    });
+    const linear = plugins.find((plugin) => plugin.use === "linear")!;
+    const config = { mcp: {}, reporting: { runningLabel: "relay:running" } };
+    const trigger = linearTrigger();
+    const context = { sourceId: "linear", repository: trigger.repository, config, match: {}, signal: undefined } as never;
+
+    const items = await linear.discover(context);
+    expect(connectLinear).toHaveBeenCalledTimes(1);
+
+    const run = runFor(items[0]!, trigger);
+    await linear.report!({ type: "claimed", sourceId: "linear", run, occurredAt: "now" }, config);
+
+    // Same cached LinearMcpSource is reused (connectLinear not called again),
+    // and its report() actually ran the configured labeling against the MCP client.
+    expect(connectLinear).toHaveBeenCalledTimes(1);
+    expect(calls.at(-1)).toEqual({ name: "save_issue", args: { id: "uuid-123", labels: ["relay:running"] } });
+  });
+
+  it("creates a LinearMcpSource on demand when report() runs before any discover() in this process", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const client: McpToolClient = {
+      async callTool(name, args): Promise<McpToolResult> {
+        calls.push({ name, args });
+        if (name === "get_issue") return { structuredContent: { id: "uuid-123", labels: [] } };
+        return { structuredContent: {} };
+      },
+    };
+    const connectLinear = vi.fn(async () => client);
+    const plugins = builtInSourcePlugins({ commandInvocation: (value) => value as never, connectLinear });
+    const linear = plugins.find((plugin) => plugin.use === "linear")!;
+    const config = { mcp: {}, reporting: { doneLabel: "relay:done" } };
+    const trigger = linearTrigger();
+    const item = { sourceId: "linear", id: "ENG-123", title: "Keep labels", metadata: { linearIssueId: "uuid-123" } };
+
+    await linear.report!({ type: "succeeded", sourceId: "linear", run: runFor(item, trigger), occurredAt: "now" }, config);
+
+    expect(connectLinear).toHaveBeenCalledTimes(1);
+    expect(calls.at(-1)).toEqual({ name: "save_issue", args: { id: "uuid-123", labels: ["relay:done"] } });
   });
 });
 

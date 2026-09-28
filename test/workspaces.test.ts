@@ -7,6 +7,7 @@ vi.mock("execa", () => ({ execa: vi.fn() }));
 vi.mock("node:fs/promises", () => ({ lstat: vi.fn(), mkdir: vi.fn(), writeFile: vi.fn() }));
 
 import { GitWorktreeProvider } from "../src/workspaces/git-worktree-provider.js";
+import { ProjectWorkspaceProvider } from "../src/workspaces/project-workspace-provider.js";
 import { WtWorkspaceProvider } from "../src/workspaces/wt-workspace-provider.js";
 import { isWithinWorkspaceRoot } from "../src/workspaces/worktree-utils.js";
 
@@ -200,6 +201,52 @@ describe("WtWorkspaceProvider cleanup ownership", () => {
     mockLstat.mockResolvedValue({} as never);
 
     await expect(provider.cleanup(space, run())).rejects.toThrow(/still in use/);
+  });
+});
+
+describe("ProjectWorkspaceProvider", () => {
+  function projectRun(): RunRecord {
+    const base = run();
+    return { ...base, trigger: { ...base.trigger, metadata: { ...base.trigger.metadata, workspaceMode: "project" } } };
+  }
+
+  it("hands over the repository root without provisioning when the trigger asks for the project workspace", async () => {
+    const inner = { provision: vi.fn(), cleanup: vi.fn() };
+    const provider = ProjectWorkspaceProvider(inner, repository);
+
+    const space = await provider.provision(projectRun());
+
+    expect(space).toEqual({ path: repository, metadata: { provider: "project", taskRelay: { createdWorkspace: false, createdBranch: false } } });
+    expect(inner.provision).not.toHaveBeenCalled();
+  });
+
+  it("delegates provisioning when the trigger does not ask for the project workspace", async () => {
+    const workspace: Workspace = { path: "/repo/project/.task-relay/workspaces/relay-ENG-123" };
+    const inner = { provision: vi.fn(async () => workspace), cleanup: vi.fn() };
+    const provider = ProjectWorkspaceProvider(inner, repository);
+
+    await expect(provider.provision(run())).resolves.toBe(workspace);
+    expect(inner.provision).toHaveBeenCalledWith(run(), undefined);
+  });
+
+  it("does not clean up a project workspace", async () => {
+    const inner = { provision: vi.fn(), cleanup: vi.fn() };
+    const provider = ProjectWorkspaceProvider(inner, repository);
+    const space: Workspace = { path: repository, metadata: { provider: "project", taskRelay: { createdWorkspace: false, createdBranch: false } } };
+
+    await provider.cleanup?.(space, projectRun());
+
+    expect(inner.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("delegates cleanup for a workspace it did not provide", async () => {
+    const inner = { provision: vi.fn(), cleanup: vi.fn(async () => {}) };
+    const provider = ProjectWorkspaceProvider(inner, repository);
+    const space: Workspace = { path: "/repo/project/.task-relay/workspaces/relay-ENG-123", metadata: { provider: "git-worktree" } };
+
+    await provider.cleanup?.(space, run());
+
+    expect(inner.cleanup).toHaveBeenCalledWith(space, run());
   });
 });
 

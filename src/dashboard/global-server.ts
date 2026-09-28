@@ -251,6 +251,11 @@ export class GlobalDashboardServer {
       ? this.workerAction(workerAction[1] ? decodeURIComponent(workerAction[1]) : undefined, decodeURIComponent(workerAction[2]!), workerAction[3] as "send" | "exec", request, response)
       : this.methodNotAllowed(response);
 
+    const workerHandoff = /^\/api\/projects\/([^/]+)\/workers\/([^/]+)\/handoff$/.exec(url.pathname);
+    if (workerHandoff) return method === "POST"
+      ? this.workerHandoff(decodeURIComponent(workerHandoff[1]!), decodeURIComponent(workerHandoff[2]!), request, response)
+      : this.methodNotAllowed(response);
+
     this.json(response, { error: "Not found" }, 404);
   }
 
@@ -455,6 +460,20 @@ export class GlobalDashboardServer {
       return this.json(response, { error: `${action === "send" ? "text" : "command"} is required.` }, 400);
     }
     this.json(response, { ok: true, message: await this.handlers.workerControl(context, workerId, command) });
+  }
+
+  private async workerHandoff(projectId: string, workerId: string, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+    if (!this.handlers.handoff) return this.json(response, { error: "Handoff is not available." }, 501);
+    const worker = this.projects.workers.get(workerId);
+    if (!worker) return this.json(response, { error: "Worker not found" }, 404);
+    const folder = await this.requireProject(projectId);
+    if (folder.repository.id !== worker.repository.id || folder.repository.root !== worker.repository.root) {
+      return this.json(response, { error: "Worker does not belong to the selected project folder." }, 409);
+    }
+    const context = await this.projects.context(folder.id);
+    const body = await optionalJsonBody(request);
+    const result = await this.handlers.handoff(context, workerId, { force: body.force === true });
+    this.json(response, { link: result.link, chainStatus: result.chainStatus, handedOffAt: result.handedOffAt });
   }
 
   private async projectConfig(projectId: string, kind: string, method: string, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {

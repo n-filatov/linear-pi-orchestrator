@@ -20,7 +20,11 @@ import type {
   ActionResult,
   LaunchWorkerActionRequest,
   ResolvedWorker,
+  WorkerHandoffResult,
+  WorkerHandoffSpec,
+  WorkerPromptSpec,
   WorkerRef,
+  WorkerTurn,
 } from "@task-relay/plugin-sdk";
 
 export interface ManageWorkersDependencies {
@@ -186,7 +190,7 @@ export class ManageWorkers {
       agent: { id: request.harness, model: request.model, promptTemplate: request.prompt,
         metadata: { modelProfile: request.modelProfile, reasoningEffort: request.reasoningEffort, harnessInput: request.harnessInput } },
       promptDelivery: request.mode === "interactive" ? "interactive" : undefined,
-      metadata: { ...trigger.metadata, ...workspace },
+      metadata: { ...trigger.metadata, ...workspace, ...(request.workspaceMode ? { workspaceMode: request.workspaceMode } : {}) },
     };
     const dispatch = await this.dispatch(source, derived, item, { sidecar: request.sidecar === true });
     if (!dispatch.launched) return { result: { status: "skipped", message: dispatch.reason ?? dispatch.run?.error ?? "Worker was not launched." }, dispatch, trigger: derived };
@@ -310,6 +314,58 @@ export class ManageWorkers {
     return { status: "succeeded", output: { workerIds: targets.map(({ worker }) => worker.id), outputs: values } };
   }
 
+  /** Start a turn against a persistent worker's existing session. */
+  public async prompt(trigger: TriggerDefinition, item: WorkItem, outputs: Readonly<Record<string, ActionResult>>, ref: WorkerRef, spec: WorkerPromptSpec): Promise<WorkerTurn> {
+    const { worker, run } = await this.resolveExactlyOne(trigger, item, outputs, ref);
+    if (!this.dependencies.agentLauncher.sendPrompt) throw new Error("The configured agent launcher cannot send a prompt to a worker.");
+    return this.dependencies.agentLauncher.sendPrompt(worker, run, spec);
+  }
+
+  /** Read a previously started turn's current state. */
+  public async turn(trigger: TriggerDefinition, item: WorkItem, outputs: Readonly<Record<string, ActionResult>>, ref: WorkerRef, turnId: string): Promise<WorkerTurn> {
+    const workerIdHint = "workerId" in ref ? ref.workerId : undefined;
+    let resolved: readonly ResolvedWorker[];
+    try {
+      resolved = await this.resolve(trigger, item, outputs, ref);
+    } catch {
+      resolved = [];
+    }
+    if (resolved.length !== 1) {
+      // The worker's session (e.g. its run) was cleaned, stopped, or otherwise no longer
+      // resolves. Settle the turn as failed instead of throwing, so a stale reference does
+      // not surface as needsAttention and block later runs for the same item.
+      return { workerId: workerIdHint ?? "unknown", turnId, status: "failed", error: "The session worker is no longer running." };
+    }
+    const { worker, run } = resolved[0];
+    if (!isActiveRun(run.status)) {
+      // The run is no longer active (stopped/cleaned/etc). Its harness turn state, if any,
+      // can no longer be trusted, so treat it as failed rather than asking the launcher.
+      return { workerId: worker.id, turnId, status: "failed", error: "The session worker is no longer running." };
+    }
+    if (!this.dependencies.agentLauncher.turn) throw new Error("The configured agent launcher cannot read a worker turn.");
+    return this.dependencies.agentLauncher.turn(worker, run, turnId);
+  }
+
+  /** Hand a persistent worker's session off to an external, human-driven surface. */
+  public async handoff(source: WorkSource, trigger: TriggerDefinition, item: WorkItem, outputs: Readonly<Record<string, ActionResult>>, ref: WorkerRef, spec?: WorkerHandoffSpec): Promise<WorkerHandoffResult> {
+    const { worker, run } = await this.resolveExactlyOne(trigger, item, outputs, ref);
+    if (!this.dependencies.agentLauncher.handoff) throw new Error("The configured agent launcher cannot hand off a worker.");
+    const result = await this.dependencies.agentLauncher.handoff(worker, run, spec);
+    const at = this.now().toISOString();
+    const recorded = await this.dependencies.runStore.recordWorkerOutputs?.(run.identity, run.claimedAt, { claudeSession: result }, at);
+    if (recorded === undefined && !this.dependencies.runStore.recordWorkerOutputs) {
+      const previous = run.worker?.metadata?.outputs;
+      const oldOutputs = previous !== null && typeof previous === "object" && !Array.isArray(previous) ? previous as Record<string, unknown> : {};
+      if (run.worker) {
+        run.worker = { ...run.worker, metadata: { ...run.worker.metadata, outputs: { ...oldOutputs, claudeSession: result } } };
+        run.updatedAt = at;
+        await this.dependencies.runStore.update(run);
+      }
+    }
+    if (isActiveRun(run.status)) await this.finishObservedRun(source, run, result.chainStatus === "failed" ? "failed" : "succeeded");
+    return result;
+  }
+
   public async reconcilePersistedRuns(triggers: readonly TriggerDefinition[]): Promise<void> {
     if (!this.dependencies.runStore.listActive) return;
     const repositories = new Map<string, RepositoryScope>();
@@ -341,7 +397,16 @@ export class ManageWorkers {
   private async workerTargets(trigger: TriggerDefinition, item: WorkItem, explicitWorkerIds?: readonly string[], selection?: "latest" | "active" | "all"): Promise<readonly RunRecord[]> {
     if (!this.dependencies.runStore.findWorkerTargets) throw new Error("The configured run store cannot resolve worker action targets.");
     const selector = trigger.targets?.workers;
-    return this.dependencies.runStore.findWorkerTargets({ repository: trigger.repository, sourceId: item.sourceId, itemId: item.id, selection: selection ?? selector?.runs ?? "all", workerIds: explicitWorkerIds ?? selector?.workerIds });
+    const workerIds = explicitWorkerIds ?? selector?.workerIds;
+    // A caller naming an exact worker id wants that specific generation, even if its
+    // workspace has since been cleaned up (e.g. the worker was stopped mid-turn).
+    return this.dependencies.runStore.findWorkerTargets({ repository: trigger.repository, sourceId: item.sourceId, itemId: item.id, selection: selection ?? selector?.runs ?? "all", workerIds, includeCleaned: Boolean(workerIds?.length) });
+  }
+
+  private async resolveExactlyOne(trigger: TriggerDefinition, item: WorkItem, outputs: Readonly<Record<string, ActionResult>>, ref: WorkerRef): Promise<ResolvedWorker> {
+    const resolved = await this.resolve(trigger, item, outputs, ref);
+    if (resolved.length !== 1) throw new Error(`Expected exactly one worker for this reference, found ${resolved.length}.`);
+    return resolved[0];
   }
 
   private requireRuntime(verb: string): WorkerRuntime {

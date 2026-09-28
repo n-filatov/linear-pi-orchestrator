@@ -543,6 +543,47 @@ describe("workflow runs end to end", () => {
     expect(workflowRun.status).toBe("succeeded");
   });
 
+  it("cancels an open run on request: stops the active worker and omits every pending job", async () => {
+    const root = await project({
+      one: echo("unused"),
+      two: { ...echo("reviewing"), needs: "one" },
+    });
+    const projectRoot = (await loadRelayConfig(root)).projectRoot;
+    const repository = { id: "workflow-test", root: projectRoot };
+    const store = new RepositoryStateStore(projectRoot);
+
+    // Stand in for a launch: a live worker whose workflow job is `started`.
+    const identity = { repository, sourceId: "queue", itemId: "ENG-1", triggerId: "feature:one" };
+    const claimed = await store.claim({
+      id: "unused", identity, item, agent: { agentId: "codex" }, claimedAt: "2026-08-19T09:00:00.000Z", maxConcurrent: 1,
+      trigger: { id: "feature:one", sourceId: "queue", repository, enabled: true },
+    });
+    claimed!.status = "running";
+    // A pid that cannot possibly exist: cancel's stop path must tolerate a
+    // process it cannot find, and must never touch this test's own pid.
+    claimed!.worker = { id: "ENG-1:codex", startedAt: "2026-08-19T09:00:00.000Z", metadata: { workspace: projectRoot, pid: 999_999_999 } };
+    await store.update(claimed!);
+    const workflowIdentity = { repository, workflowId: "feature", sourceId: "queue", itemId: "ENG-1", occurrence: "item" };
+    await store.openWorkflowRun({ identity: workflowIdentity, item, startedAt: "2026-08-19T09:00:00.000Z" });
+    await store.updateWorkflowJob(workflowIdentity, "one", { status: "started", runId: claimed!.id, workerId: "ENG-1:codex", at: "2026-08-19T09:00:00.000Z" });
+
+    const cancelled = await run(root, "workflow", "cancel", "feature", "ENG-1");
+    expect(cancelled.errors).toBe("");
+    expect(cancelled.output).toContain("Cancelled feature for ENG-1");
+
+    const [workflowRun] = await store.listWorkflowRuns(repository);
+    expect(workflowRun.status).toBe("failed");
+    expect(workflowRun.jobs.one).toMatchObject({ status: "omitted", message: "Cancelled by user.", needsAttention: false });
+    expect(workflowRun.jobs.two).toMatchObject({ status: "omitted", message: "Cancelled by user." });
+    // The worker the run launched was stopped rather than left running.
+    const [stoppedRun] = await store.listRuns();
+    expect(stoppedRun.status).toBe("stopped");
+
+    // A terminal run cannot be cancelled again.
+    await expect(run(root, "workflow", "cancel", "feature", "ENG-1"))
+      .rejects.toThrow(/No open run of workflow 'feature' found for 'ENG-1'/);
+  });
+
   it("holds a concurrency group, then cancels the older run when told to", async () => {
     async function grouped(cancelInProgress: boolean) {
       const root = await mkdtemp(join(tmpdir(), "task-relay-group-"));

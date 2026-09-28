@@ -72,4 +72,34 @@ describe("workflow engine", () => {
     expect(value).toBeUndefined();
     expect(old.record?.identity.itemId).toBe(item.id);
   });
+
+  it("never stops a persistent worker that has not opted in, even once nothing else depends on it", async () => {
+    // A `started` launch job with a workerId (e.g. `claude.start-session`,
+    // or a tmux window a person keeps using) with no other job left to run
+    // is exactly the situation `stopAbandonedSessionWorkers` sweeps. Without
+    // `shouldStopWithRun` opting the worker in, it must be left alone: a
+    // tmux window the user is still driving must never be torn down just
+    // because the launching workflow run has nothing further to do.
+    const runs = store({ jobs: { deploy: { status: "started", attempts: 1, workerId: "worker-1" } } });
+    const stopCalls: string[] = [];
+    const enginePorts: WorkflowEnginePorts = {
+      ...ports(runs, decisions),
+      stopWorker: async ({ state }) => { stopCalls.push(state.workerId!); },
+      shouldStopWithRun: async () => false,
+    };
+    await new AdvanceWorkflow(enginePorts).execute({ workflow, item, result: result(), run: runs.record! });
+    expect(stopCalls).toEqual([]);
+  });
+
+  it("stops a worker that opted in once nothing else depends on it", async () => {
+    const runs = store({ jobs: { deploy: { status: "started", attempts: 1, workerId: "worker-2" } } });
+    const stopCalls: string[] = [];
+    const enginePorts: WorkflowEnginePorts = {
+      ...ports(runs, decisions),
+      stopWorker: async ({ state }) => { stopCalls.push(state.workerId!); },
+      shouldStopWithRun: async () => true,
+    };
+    await new AdvanceWorkflow(enginePorts).execute({ workflow, item, result: result(), run: runs.record! });
+    expect(stopCalls).toEqual(["worker-2"]);
+  });
 });

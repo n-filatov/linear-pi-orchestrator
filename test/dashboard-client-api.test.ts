@@ -7,6 +7,7 @@ import {
   getPlugins,
   getProjects,
   getPrompts,
+  handoffWorker,
   testWorkflowDraft,
   getWatcherStatuses,
   getWorkers,
@@ -38,6 +39,7 @@ describe("dashboard API error contracts", () => {
     ["scoped plugins", () => getPlugins(project), "/api/projects/repo-1/plugins"],
     ["scoped prompts", () => getPrompts(project), "/api/projects/repo-1/prompts"],
     ["scoped config", () => getConfig(project), "/api/projects/repo-1/config/json"],
+    ["worker handoff", () => handoffWorker("worker-1", project, { force: true }), "/api/projects/repo-1/workers/worker-1/handoff"],
   ])("preserves a 401 instead of returning a fake empty %s", async (_name, call, path) => {
     failing(401, "session expired");
     await expect(call()).rejects.toMatchObject({ status: 401, path, message: "session expired" });
@@ -126,6 +128,21 @@ describe("dashboard API error contracts", () => {
       expect(error).toBeInstanceOf(ApiError);
       expect(error).toBeInstanceOf(Error);
     }
+  });
+
+  it("posts a forced handoff to the project-scoped worker endpoint and returns the link", async () => {
+    const body = { link: "claude://claude.ai/epitaxy/local_abc", chainStatus: "succeeded", handedOffAt: "2026-09-28T00:00:00.000Z" };
+    fetchMock.mockResolvedValue(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await handoffWorker("worker-1", project, { force: true });
+
+    expect(result).toEqual(body);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toContain("/api/projects/repo-1/workers/worker-1/handoff");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({ force: true });
   });
 });
 

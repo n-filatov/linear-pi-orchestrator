@@ -406,6 +406,40 @@ export interface WorkerCompletion {
   error?: string;
 }
 
+/** What to ask a persistent worker to do next, distinct from the initial launch prompt. */
+export interface WorkerPromptSpec {
+  prompt: string;
+  model?: string;
+  effort?: string;
+  jsonSchema?: Record<string, unknown>;
+}
+
+/** One turn of a persistent worker's conversation, identified independently of the worker itself. */
+export interface WorkerTurn {
+  workerId: string;
+  turnId: string;
+  status: "running" | "succeeded" | "failed";
+  result?: string;
+  structuredOutput?: unknown;
+  costUsd?: number;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface WorkerHandoffSpec {
+  target?: string;
+  force?: boolean;
+}
+
+export interface WorkerHandoffResult {
+  target: string;
+  handedOffAt: string;
+  chainStatus: "succeeded" | "failed";
+  link?: string;
+  appSessionId?: string;
+  lastResult?: string;
+}
+
 /** Durable lifecycle state for a dispatched work item. */
 export interface RunRecord {
   /** Deterministic serialized form of `identity`; generated with createRunKey. */
@@ -535,6 +569,12 @@ export interface AgentLauncher {
   /** Check a persisted worker after a relay process has restarted. */
   reconcile?(worker: WorkerHandle, run: RunRecord): Promise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle, run: RunRecord): Promise<void>;
+  /** Start a turn on a persistent worker's existing session. Undefined when the launcher has no such worker. */
+  sendPrompt?(worker: WorkerHandle, run: RunRecord, spec: WorkerPromptSpec): Promise<WorkerTurn>;
+  /** Read a previously started turn's current state. */
+  turn?(worker: WorkerHandle, run: RunRecord, turnId: string): Promise<WorkerTurn>;
+  /** Hand a persistent worker's session off to an external, human-driven surface. */
+  handoff?(worker: WorkerHandle, run: RunRecord, spec?: WorkerHandoffSpec): Promise<WorkerHandoffResult>;
 }
 
 export interface WorkspaceProvider {

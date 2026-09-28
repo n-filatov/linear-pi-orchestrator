@@ -56,11 +56,11 @@ describe("CodexAppServerHarness", () => {
     expect(worker.metadata?.codexAppServer).toMatchObject({ threadId: "thread-1", turnId: "turn-1", transport: "stdio", effort: "high" });
     expect(process.messages).toContainEqual(expect.objectContaining({ method: "thread/start", params: expect.objectContaining({ approvalPolicy: "never", sandbox: "workspace-write" }) }));
 
-    await expect(harness.sendPrompt(worker, { prompt: "Do it now", delivery: "immediate", timeoutMs: 1_000 }))
+    await expect(harness.sendCodexPrompt(worker, { prompt: "Do it now", delivery: "immediate", timeoutMs: 1_000 }))
       .resolves.toMatchObject({ threadId: "thread-1", turnId: "turn-1", delivery: "immediate" });
     expect(process.messages).toContainEqual(expect.objectContaining({ method: "turn/steer", params: expect.objectContaining({ expectedTurnId: "turn-1" }) }));
 
-    const idle = harness.sendPrompt(worker, { prompt: "Then test", model: "gpt-5.6-sol", effort: "high", delivery: "idle", timeoutMs: 1_000 });
+    const idle = harness.sendCodexPrompt(worker, { prompt: "Then test", model: "gpt-5.6-sol", effort: "high", delivery: "idle", timeoutMs: 1_000 });
     process.notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
     await expect(idle).resolves.toMatchObject({ threadId: "thread-1", turnId: "turn-2", delivery: "idle" });
     expect(process.messages).toContainEqual(expect.objectContaining({ method: "turn/start", params: expect.objectContaining({ model: "gpt-5.6-sol", effort: "high" }) }));
@@ -111,7 +111,7 @@ describe("CodexAppServerHarness", () => {
       },
     } as const;
 
-    await expect(harness.sendPrompt(worker, { prompt: "Continue after restart", delivery: "idle", timeoutMs: 1_000 }))
+    await expect(harness.sendCodexPrompt(worker, { prompt: "Continue after restart", delivery: "idle", timeoutMs: 1_000 }))
       .resolves.toMatchObject({ threadId: "thread-1", turnId: "turn-1", delivery: "idle" });
     expect(process.messages).toContainEqual(expect.objectContaining({
       method: "thread/resume",
@@ -134,7 +134,7 @@ describe("CodexAppServerHarness", () => {
       config: { args: [] },
     });
 
-    const sent = harness.sendPrompt(worker, {
+    const sent = harness.sendCodexPrompt(worker, {
       prompt: "Finish this turn",
       delivery: "immediate",
       waitForCompletion: true,
@@ -160,13 +160,13 @@ describe("CodexAppServerHarness", () => {
     const initial = process.messages.find((entry) => entry.method === "thread/start")!.params;
     const initialTurn = process.messages.find((entry) => entry.method === "turn/start")!.params as Record<string, unknown>;
     process.notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
-    await harness.sendPrompt(worker, { prompt: "Follow up", delivery: "idle", timeoutMs: 1_000 });
+    await harness.sendCodexPrompt(worker, { prompt: "Follow up", delivery: "idle", timeoutMs: 1_000 });
     expect(process.messages.filter((entry) => entry.method === "turn/start").at(-1)?.params).toMatchObject({ sandboxPolicy: initialTurn.sandboxPolicy, approvalPolicy: permissions.approvals });
     await harness.closeAll();
     const resumedProcess = new FakeAppServer() as FakeAppServer & CodexAppServerProcess;
     vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(new CodexAppServerClient(resumedProcess));
     const resumedHarness = new CodexAppServerHarness();
-    await resumedHarness.sendPrompt(JSON.parse(JSON.stringify(worker)), { prompt: "After restart", delivery: "idle", timeoutMs: 1_000 });
+    await resumedHarness.sendCodexPrompt(JSON.parse(JSON.stringify(worker)), { prompt: "After restart", delivery: "idle", timeoutMs: 1_000 });
     expect(resumedProcess.messages.find((entry) => entry.method === "thread/resume")!.params).toMatchObject(initial as object);
     expect(resumedProcess.messages.find((entry) => entry.method === "turn/start")!.params).toMatchObject({ sandboxPolicy: initialTurn.sandboxPolicy });
     await resumedHarness.closeAll();
@@ -181,7 +181,7 @@ it('creates an idle session and starts the first turn only when send-prompt arri
   const worker = await harness.launch({ workerId: 'idle', repository: { id: 'repo', root: '/repo' }, item: { sourceId: 'linear', id: 'REL-1', title: 'Relay' }, workspace: { path: '/repo/work' }, prompt: '', config: { args: [] }, harnessInput: { startOnly: true, permissions: { sandbox: 'danger-full-access', approvals: 'never' } } });
   expect(process.messages.filter((message) => message.method === 'turn/start')).toHaveLength(0);
   expect((worker.metadata?.codexAppServer as any).turnId).toBeUndefined();
-  await expect(harness.sendPrompt(worker, { prompt: 'Implement the task', delivery: 'idle', timeoutMs: 1000 })).resolves.toMatchObject({ turnId: 'turn-1' });
+  await expect(harness.sendCodexPrompt(worker, { prompt: 'Implement the task', delivery: 'idle', timeoutMs: 1000 })).resolves.toMatchObject({ turnId: 'turn-1' });
   expect(process.messages.find((message) => message.method === 'turn/start')?.params).toMatchObject({ sandboxPolicy: { type: 'dangerFullAccess' }, input: [{ type: 'text', text: 'Implement the task' }] });
   await harness.closeAll();
 });

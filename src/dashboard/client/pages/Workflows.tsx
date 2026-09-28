@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Zap, Terminal, Bot, Send, BrushCleaning, Plus, ArrowLeft, ArrowRight, Ellipsis, FlaskConical, Search, Save } from "lucide-react";
+import { Zap, Terminal, Bot, Send, BrushCleaning, ExternalLink, Plus, ArrowLeft, ArrowRight, Ellipsis, FlaskConical, Search, Save } from "lucide-react";
 import {
   ActionIcon,
   Alert,
@@ -54,25 +54,20 @@ import {
   autoLayout,
   findDanglingActionReferences,
   findDanglingEdges,
+  groupCatalogActionsByCategory,
   graphToWorkflow,
   setActionReference,
   syncActionReferenceEdge,
   upstreamReferenceNodes,
   wouldCycle,
   workflowToGraph,
+  type CatalogActionGroup,
   type GraphNode,
   type GraphNodeData,
 } from "../graph";
 import { CodexPermissions } from "../components/CodexPermissions";
-import { setPromptInput, templateFor } from "../workflow-templates";
+import { setPromptInput, templateFor, type WorkflowTemplateKind } from "../workflow-templates";
 
-const CANVAS_ACTION_USES = [
-  "tmux.create-window",
-  "codex.start-session",
-  "codex.send-prompt",
-  "cleanup",
-] as const;
-const canvasActionUses = new Set<string>(CANVAS_ACTION_USES);
 type CatalogEntry = {
   kind?: string;
   use?: string;
@@ -127,6 +122,9 @@ function labelFor(use = "action") {
         "codex.start-session": "Start Codex session",
         "codex.send-prompt": "Send Codex prompt",
         cleanup: "Cleanup",
+        "claude.start-session": "Start Claude session",
+        "claude.send-prompt": "Send Claude prompt",
+        "claude.open-in-app": "Open in Claude app",
       } as Record<string, string>
     )[use] ?? use
   );
@@ -135,6 +133,12 @@ function entryLabel(entry: CatalogEntry) {
   return entry.presentation?.name && entry.presentation.name !== entry.use
     ? entry.presentation.name
     : labelFor(entry.use);
+}
+/** Unique action-catalog entries (one per `use`), for the palette and dropdown. */
+function actionCatalogEntries(schemas: Record<string, CatalogEntry>): CatalogEntry[] {
+  return Object.entries(schemas)
+    .filter(([key]) => key.startsWith("action:"))
+    .map(([, entry]) => entry);
 }
 const statusClass = (status?: string) =>
   `status status-${String(status ?? "unknown")
@@ -151,8 +155,19 @@ function TriggerNode({ data, selected }: NodeProps<GraphNode>) {
     </div>
   );
 }
+function iconFor(use?: string) {
+  return (
+    {
+      "tmux.create-window": Terminal,
+      cleanup: BrushCleaning,
+      "codex.send-prompt": Send,
+      "claude.send-prompt": Send,
+      "claude.open-in-app": ExternalLink,
+    } as Record<string, typeof Bot>
+  )[use ?? ""] ?? Bot;
+}
 function ActionNode({ data, selected }: NodeProps<GraphNode>) {
-  const Icon = data.use === "tmux.create-window" ? Terminal : data.use === "cleanup" ? BrushCleaning : data.use === "codex.send-prompt" ? Send : Bot;
+  const Icon = iconFor(data.use);
   return (
     <div className={`flow-node action-node ${selected ? "selected" : ""}`}>
       <Handle type="target" position={Position.Left} />
@@ -198,9 +213,7 @@ export function Workflows(props: WorkflowsProps) {
     [onBusyChange],
   );
   const [createOpen, setCreateOpen] = useState(false);
-  const [template, setTemplate] = useState<"agent" | "cleanup" | "blank">(
-    "agent",
-  );
+  const [template, setTemplate] = useState<WorkflowTemplateKind>("agent");
   const [newName, setNewName] = useState("agent-task");
   const [createError, setCreateError] = useState("");
   const dirty = Object.values(drafts).some((draft) => draft.dirty);
@@ -391,6 +404,10 @@ export function Workflows(props: WorkflowsProps) {
                 value: "cleanup",
                 label: "Cleanup — stop owned workers for completed work",
               },
+              {
+                value: "claude-review",
+                label: "Prepare with Claude, review in the app",
+              },
               { value: "blank", label: "Blank — source trigger only" },
             ]}
             value={template}
@@ -464,14 +481,6 @@ function WorkflowEditor({
         if (!(entry.use in values) || entry.kind === "action")
           values[entry.use] = value;
       }
-    for (const use of CANVAS_ACTION_USES)
-      if (!values[`action:${use}`])
-        values[`action:${use}`] = {
-          use,
-          kind: "action",
-          schema: { type: "object", properties: {} },
-          presentation: { name: labelFor(use) },
-        };
     for (const [sourceId, source] of Object.entries(
       config.sources ?? {},
     ) as Array<[string, any]>) {
@@ -1515,23 +1524,28 @@ function NodePalette({
   schemas: Record<string, CatalogEntry>;
   onAdd: (use: string) => void;
 }) {
-  const entries = CANVAS_ACTION_USES.map(
-    (use) => schemas[`action:${use}`] ?? schemas[use],
-  ).filter((entry): entry is CatalogEntry => Boolean(entry?.use));
+  const groups = groupCatalogActionsByCategory(actionCatalogEntries(schemas));
   return (
     <div className="node-palette">
       <Text size="xs" fw={700}>
         NODE CATALOG
       </Text>
-      {entries.map((entry) => (
-        <Button
-          key={entry.use}
-          variant="subtle"
-          justify="flex-start"
-          onClick={() => onAdd(entry.use!)}
-        >
-          {entryLabel(entry)}
-        </Button>
+      {groups.map((group) => (
+        <div key={group.category} className="node-palette-group">
+          <Text size="xs" c="dimmed" fw={600} className="node-palette-group-label">
+            {group.category.toUpperCase()}
+          </Text>
+          {group.entries.map((entry) => (
+            <Button
+              key={entry.use}
+              variant="subtle"
+              justify="flex-start"
+              onClick={() => onAdd(entry.use!)}
+            >
+              {entryLabel(entry)}
+            </Button>
+          ))}
+        </div>
       ))}
     </div>
   );
@@ -1608,13 +1622,17 @@ function PropertyPanel({
         ...(ref.alternateUpstreamUses ?? []),
       ])
     : [];
+  const paletteActionUses = useMemo(
+    () => new Set(actionCatalogEntries(schemas).map((entry) => entry.use)),
+    [schemas],
+  );
   const entries = Object.values(schemas).filter(
     (entry, index, all) =>
       entry.kind === kind &&
       entry.use &&
       (kind !== "source" || entry.configured) &&
       (kind !== "action" ||
-        canvasActionUses.has(entry.use) ||
+        paletteActionUses.has(entry.use) ||
         entry.use === node.data.use) &&
       all.findIndex(
         (candidate) =>
