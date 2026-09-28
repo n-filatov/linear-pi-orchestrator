@@ -4,7 +4,7 @@ import type { ActionContext, ActionPlugin } from "@task-relay/plugin-sdk";
 
 /** Small injected seam; the action does not own an App Server implementation. */
 export interface CodexPromptClient {
-  sendPrompt(worker: NonNullable<ActionContext["worker"]>, options: {
+  sendCodexPrompt(worker: NonNullable<ActionContext["worker"]>, options: {
     prompt: string; model?: string; effort?: string; delivery: "idle" | "immediate"; waitForCompletion?: boolean; timeoutMs: number;
   }): Promise<{ threadId: string; turnId: string; delivery: "idle" | "immediate"; turnStatus?: string }>;
 }
@@ -63,7 +63,7 @@ export function createCodexSendPromptAction(options: CodexSendPromptDependencies
       const targets = await context.workers.resolve(config.codex);
       if (targets.length === 0) return { status: "skipped", message: `Action '${config.codex.action}' has no live worker.` };
       const prompts = await Promise.all(targets.map(async ({ worker }) => {
-        const sent = await options.codexAppServer!.sendPrompt(worker, {
+        const sent = await options.codexAppServer!.sendCodexPrompt(worker, {
           prompt: render(config.prompt ?? await options.readPromptFile(context.repository.root, config.promptFile!)),
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),

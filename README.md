@@ -547,6 +547,17 @@ Retry clears settled jobs back to `pending` and reopens the run. A job whose
 worker is still live keeps its state, so a retry never launches a second agent
 beside a running one.
 
+```bash
+relay workflow cancel feature ENG-123
+relay workflow cancel feature ENG-123 --occurrence run-2
+```
+
+Cancel stops an open run outright: it stops any active worker its jobs
+launched, marks every non-terminal job `omitted` with "Cancelled by user.",
+and finishes the run as `failed`. Unlike retry, a cancelled run does not
+restart on the next poll; start a new run (or retry a different occurrence)
+if the ticket needs another attempt.
+
 ### Inspecting a run
 
 ```bash
@@ -691,6 +702,113 @@ independent interactive shell or other worker actions.
 
 Jobs are also reusable: a job's `uses` may name an entry in `actions:`, in which
 case that action's `with` is the base and the job's `with` overrides it.
+
+### Claude app mode
+
+Claude app mode runs a headless `claude -p` session on its own worktree, lets a
+workflow drive it through several turns, and finishes by hanging the session
+off to the Claude desktop app so a human can review, chat, and keep going in
+a normal Claude Code window. Unlike Codex App Server, there is nothing to add
+under `harnesses:` — `claude.start-session`, `claude.send-prompt`, and
+`claude.open-in-app` are always available.
+
+The flow:
+
+1. `claude.start-session` starts the session on a dedicated worktree and
+   returns a worker with no prompt sent yet.
+2. One or more `claude.send-prompt` jobs send turns to it — implement, then
+   verify, then self-review — each waiting for the previous turn to finish.
+3. `claude.open-in-app` hands the session off. This unlocks its worktree,
+   opens the Claude desktop app to the same conversation, and finishes the
+   workflow's chain as `succeeded` or `failed` depending on whether every
+   turn up to that point succeeded.
+
+```yaml
+workflows:
+  implement-with-claude:
+    on:
+      source: linear
+      match: { labels: { all: [relay:implement] } }
+    jobs:
+      session:
+        use: claude.start-session
+        with: { model: claude-opus-5, permissionMode: acceptEdits }
+      implement:
+        needs: session.Started
+        use: claude.send-prompt
+        with: { session: { action: session }, promptFile: .task-relay/prompts/implement.md }
+      verify:
+        needs: implement
+        use: claude.send-prompt
+        with: { session: { action: session }, promptFile: .task-relay/prompts/verify.md }
+      self-review:
+        needs: verify
+        use: claude.send-prompt
+        with: { session: { action: session }, promptFile: .task-relay/prompts/self-review.md }
+      pull-request:
+        needs: self-review
+        use: claude.send-prompt
+        with: { session: { action: session }, promptFile: .task-relay/prompts/pull-request.md }
+      brief:
+        needs: pull-request
+        use: claude.send-prompt
+        with: { session: { action: session }, promptFile: .task-relay/prompts/review-brief.md }
+      open-in-app:
+        needs: brief
+        if: ${{ always() }}
+        use: claude.open-in-app
+        with: { session: { action: session } }
+```
+
+Prompt files are Handlebars templates (`{{item.id}}`, `{{item.title}}`). Inline values under a workflow job's `with:` are resolved first, so write `${{ item.id }}` there; a bare `{{item.id}}` in `with.prompt` or `with.name` is rejected.
+
+`if: ${{ always() }}` on the last job matters: the session should be handed
+off for human review even when an earlier turn failed, not left stranded on a
+locked worktree. `claude.open-in-app` records its result (`link`,
+`chainStatus`, `appSessionId`, `lastResult`) as the job's output, and the same
+result is what the dashboard's Workers page and the Linear reporting options
+below read.
+
+Prerequisites:
+
+- `claude auth login` on the machine that runs Relay. `relay doctor` reports
+  **Claude CLI login** and, on macOS, whether the **Claude app** is installed.
+- The Claude desktop app, on macOS or Windows — the handoff opens `claude://`,
+  which only those platforms handle.
+- In the Claude app, turn on **Settings → Claude Code → "Auto-archive after PR
+  merge or close"** so handed-off sessions do not pile up once their pull
+  request is done.
+
+A Linear source can report the handoff back to the issue:
+
+```yaml
+sources:
+  linear:
+    use: linear
+    with:
+      reporting:
+        commentOnHandoff: true      # default; set false to opt out
+        doneState: "In Review"      # move the issue once the chain succeeds
+```
+
+`commentOnHandoff` posts a comment with the session link and, when the last
+turn produced one, a review brief; `doneState` moves the issue to that Linear
+state on a succeeded handoff (a failed one is commented on but not moved).
+
+Handoff also works outside a workflow: `relay handoff <task-or-worker>
+[--force]` hands off any relay-owned Claude session by issue key, run id, or
+worker id, the same way `relay signal` reports an ad-hoc result. `--force`
+cancels an in-progress turn instead of refusing the handoff. `relay attach`
+recognizes a Claude session too: once it has been handed off, `attach` opens
+the Claude app link instead of looking for a tmux pane; before handoff, it
+tells you the session is headless and suggests `relay handoff <task>
+--force`.
+
+`claude://resume?session=<id>` is what the handoff actually opens; it is an
+undocumented URL scheme. `/desktop` inside a `claude -p` conversation is
+Anthropic's documented, supported way to move a CLI session to the desktop
+app — prefer it interactively. Relay uses `claude://resume` because a
+headless session has no terminal to type `/desktop` into.
 
 ### Reusing a whole workflow
 
@@ -934,6 +1052,7 @@ relay workflow test feature       # preview a workflow's job graph
 relay workflow runs               # persisted workflow runs and job states
 relay workflow inspect feature ENG-123
 relay workflow retry feature ENG-123
+relay workflow cancel feature ENG-123
 relay signal ENG-123 done --output changed=true
 relay once --trigger implement-linear-issue
 relay watch --trigger implement-linear-issue

@@ -69,6 +69,15 @@ export interface WorkflowEnginePorts {
   executeJob(input: WorkflowJobExecution): Promise<WorkflowRunRecord | undefined>;
   refreshJobs?(input: { workflow: WorkflowDefinition; run: WorkflowRunRecord }): Promise<WorkflowRunRecord | undefined>;
   stopWorker?(input: { workflow: WorkflowDefinition; item: WorkItem; state: WorkflowJobState }): Promise<void>;
+  /**
+   * Only a worker that opts in should be stopped just because its workflow
+   * run finished or has nothing left to depend on it: a tmux window the user
+   * keeps working in, or any other persistent worker meant to outlive its
+   * launching run, must never be swept this way. The host decides what "opts
+   * in" means (e.g. a `stopWithWorkflowRun` worker metadata flag); this
+   * package stays free of any specific harness's conventions.
+   */
+  shouldStopWithRun?(input: { workflow: WorkflowDefinition; item: WorkItem; state: WorkflowJobState }): Promise<boolean>;
   now(): Date;
   signal?: AbortSignal;
   logger: { info(message: string, fields?: Record<string, unknown>): void; warn(message: string, fields?: Record<string, unknown>): void; error(message: string, fields?: Record<string, unknown>): void };
@@ -203,9 +212,72 @@ export class AdvanceWorkflow {
       }
       run = await this.ports.executeJob({ workflow, source, item, job, identity: run.identity, run, outputs, result: input.result }) ?? run;
     }
+    await this.stopAbandonedSessionWorkers(workflow, run);
     const outcome = this.ports.decisions.runOutcome(workflow.jobs, run.jobs);
-    if (outcome.done) run = await this.ports.runs.finishWorkflowRun(run.identity, outcome.status, this.ports.now().toISOString()) ?? run;
+    if (outcome.done) {
+      run = await this.ports.runs.finishWorkflowRun(run.identity, outcome.status, this.ports.now().toISOString()) ?? run;
+      await stopWorkersLeftByJobs(this.ports, workflow, run);
+    }
     return run;
+  }
+
+  /**
+   * A launch job (e.g. `claude.start-session`) intentionally stays `started`
+   * for as long as its worker is persistent: some later job may still depend
+   * on it, and `runOutcome` deliberately holds the run open for that reason.
+   * But once every *other* declared job has reached a terminal state — nothing
+   * left pending, nothing left that could still run or depend on this one —
+   * no future tick will ever act on that worker again either. Left alone, the
+   * run would stay "running" forever (blocking `oneWorkerPerItem`) because
+   * `runOutcome` never sees every job terminal, and nothing else would ever
+   * call `stopWorker`. Detecting that dead end here and stopping the worker
+   * lets `refreshJobs` observe its terminal status next tick, so the job (and
+   * then the run) can finish through the normal path.
+   */
+  private async stopAbandonedSessionWorkers(workflow: WorkflowDefinition, run: WorkflowRunRecord): Promise<void> {
+    if (!this.ports.stopWorker) return;
+    const stillOpen = workflow.jobs.filter((job) => run.jobs[job.id]?.status === "started" && run.jobs[job.id]?.workerId);
+    if (stillOpen.length === 0) return;
+    const openIds = new Set(stillOpen.map((job) => job.id));
+    const nothingElsePending = workflow.jobs.every((job) => openIds.has(job.id) || isTerminalJobStatus(run.jobs[job.id]?.status ?? "pending"));
+    if (!nothingElsePending) return;
+    for (const job of stillOpen) {
+      const state = run.jobs[job.id]!;
+      try {
+        if (!(await this.ports.shouldStopWithRun?.({ workflow, item: run.item, state }))) continue;
+        await this.ports.stopWorker({ workflow, item: run.item, state });
+      } catch (error) {
+        this.ports.logger.warn("Could not stop an abandoned session worker with no remaining dependent job", {
+          workflowId: workflow.id, jobId: job.id, workerId: state.workerId, error: messageOf(error),
+        });
+      }
+    }
+  }
+}
+
+/**
+ * A job (e.g. a persistent session launch) can finish successfully while the
+ * worker it launched keeps running, waiting for a later step that never
+ * happens because the run ended failed, timed out, or was cancelled short of
+ * a handoff. Once a run is terminal, nothing else will ever stop that
+ * worker, so sweep every job's recorded workerId whenever a run finishes.
+ * This is generic, not launch-action-specific: `stopWorker` is a no-op for
+ * any worker that is already terminal, including one a successful handoff
+ * already finished.
+ */
+async function stopWorkersLeftByJobs(ports: WorkflowEnginePorts, workflow: WorkflowDefinition, run: WorkflowRunRecord): Promise<void> {
+  if (!ports.stopWorker) return;
+  for (const job of workflow.jobs) {
+    const state = run.jobs[job.id];
+    if (!state?.workerId) continue;
+    try {
+      if (!(await ports.shouldStopWithRun?.({ workflow, item: run.item, state }))) continue;
+      await ports.stopWorker({ workflow, item: run.item, state });
+    } catch (error) {
+      ports.logger.warn("Could not stop a worker left running after its workflow run finished", {
+        workflowId: workflow.id, jobId: job.id, workerId: state.workerId, error: messageOf(error),
+      });
+    }
   }
 }
 
@@ -267,18 +339,32 @@ export class ReconcileWorkflowOperations {
 export class CancelWorkflow {
   public constructor(private readonly ports: WorkflowEnginePorts) {}
   public async execute(input: { workflow: WorkflowDefinition; run: WorkflowRunRecord; result: WorkflowEngineResult }): Promise<boolean> {
+    return this.cancel({ ...input, reason: "Superseded by a newer run in the same concurrency group.",
+      message: `Cancelled: superseded in concurrency group '${input.run.concurrencyGroup}'.`, emitStatus: "skipped" });
+  }
+  /**
+   * Cancels every non-terminal job of a running workflow run and, once every
+   * cancellation is verified, finishes the run as failed. Shared by the
+   * concurrency-group supersede path above and by an operator-initiated
+   * `relay workflow cancel`.
+   */
+  public async cancel(input: { workflow: WorkflowDefinition; run: WorkflowRunRecord; result: WorkflowEngineResult; reason: string; message?: string; emitStatus?: "skipped" | "failed" }): Promise<boolean> {
     const recorded = input.run.definition ?? input.workflow;
     let uncertain = false;
     for (const job of recorded.jobs) {
       const state = input.run.jobs[job.id];
-      if (!state || isTerminalJobStatus(state.status)) continue;
-      const verified = await this.cancelJob({ workflow: recorded, run: input.run, job, state, result: input.result, reason: "Superseded by a newer run in the same concurrency group." });
+      // A job that never even started is still `pending`, not terminal: an
+      // operator cancelling the run wants it marked `omitted` too, not left
+      // dangling forever after the run itself finishes as failed.
+      if (state && isTerminalJobStatus(state.status)) continue;
+      const verified = await this.cancelJob({ workflow: recorded, run: input.run, job, state, result: input.result, reason: input.reason });
       uncertain ||= !verified;
     }
     if (uncertain) return false;
     await this.ports.runs.finishWorkflowRun(input.run.identity, "failed", this.ports.now().toISOString());
+    await stopWorkersLeftByJobs(this.ports, recorded, input.run);
     input.result.skipped += 1;
-    this.ports.emit(input.result, workflowTrigger(input.workflow), input.run.item, "skipped", `Cancelled: superseded in concurrency group '${input.run.concurrencyGroup}'.`);
+    this.ports.emit(input.result, workflowTrigger(input.workflow), input.run.item, input.emitStatus ?? "failed", input.message ?? input.reason);
     return true;
   }
   public async expire(input: { workflow: WorkflowDefinition; run: WorkflowRunRecord; result: WorkflowEngineResult }): Promise<void> {
@@ -290,12 +376,16 @@ export class CancelWorkflow {
     }
     if (uncertain) return;
     await this.ports.runs.finishWorkflowRun(input.run.identity, "failed", this.ports.now().toISOString());
+    await stopWorkersLeftByJobs(this.ports, input.workflow, input.run);
     input.result.skipped += 1;
     this.ports.emit(input.result, workflowTrigger(input.workflow), input.run.item, "failed", "Workflow run timed out.");
   }
   public async cancelJob(input: { workflow: WorkflowDefinition; run: WorkflowRunRecord; job: WorkflowJobDefinition; state?: WorkflowJobState; result: WorkflowEngineResult; reason: string; terminalStatus?: "omitted" | "failed" }): Promise<boolean> {
-    const state = input.state ?? input.run.jobs[input.job.id];
-    if (!state || isTerminalJobStatus(state.status)) return true;
+    // A job with no recorded state has never run; treat it as `pending` (as
+    // the rest of the engine does) so it can still be settled below, rather
+    // than silently reporting success without touching the run at all.
+    const state = input.state ?? input.run.jobs[input.job.id] ?? { status: "pending" as const, attempts: 0 };
+    if (isTerminalJobStatus(state.status)) return true;
     let uncertain = false;
     if (state.status === "started" && state.workerId) {
       if (!this.ports.stopWorker) uncertain = true;
@@ -312,7 +402,9 @@ export class CancelWorkflow {
     }
     await this.ports.runs.updateWorkflowJob(input.run.identity, input.job.id, uncertain
       ? { status: "started", needsAttention: true, message: `${input.reason} Cancellation could not be verified; inspect before retrying.`, at: this.ports.now().toISOString(), expectedAttemptId: state.attemptId }
-      : { status: input.terminalStatus ?? "omitted", message: input.reason, error: input.terminalStatus === "failed" ? input.reason : undefined, at: this.ports.now().toISOString(), expectedAttemptId: state.attemptId });
+      // A verified cancellation settles the job, so any earlier needsAttention
+      // flag (e.g. from a stale reconcile) no longer applies.
+      : { status: input.terminalStatus ?? "omitted", message: input.reason, error: input.terminalStatus === "failed" ? input.reason : undefined, needsAttention: false, at: this.ports.now().toISOString(), expectedAttemptId: state.attemptId });
     return !uncertain;
   }
 }

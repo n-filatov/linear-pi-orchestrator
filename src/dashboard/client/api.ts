@@ -123,6 +123,16 @@ export interface RetryResult {
   retryEligibility?: RetryEligibility;
   [key: string]: any;
 }
+/** Session details recorded on a worker launched through `claude.start-session`. */
+export interface ClaudeSessionInfo {
+  sessionId: string;
+  worktree?: string;
+  name?: string;
+  permissionMode?: string;
+  model?: string;
+  effort?: string;
+  cwd: string;
+}
 export interface Worker {
   id: string;
   status?: string;
@@ -130,6 +140,11 @@ export interface Worker {
   title?: string;
   workspace?: { path?: string };
   [key: string]: any;
+}
+export interface WorkerHandoffResponse {
+  link: string;
+  chainStatus: "succeeded" | "failed";
+  handedOffAt: string;
 }
 export interface ActionTestMatch {
   id?: string;
@@ -734,6 +749,18 @@ export async function controlWorker(
       ? `/api/projects/${idFor(project)}/workers/${encodeURIComponent(id)}/${action}`
       : `/api/workers/${encodeURIComponent(id)}/${action}`,
     { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Hands a headless Claude Code worker off to the desktop app for human review. */
+export async function handoffWorker(
+  id: string,
+  project: ProjectFolder,
+  options: { force?: boolean } = {},
+): Promise<WorkerHandoffResponse> {
+  return request<WorkerHandoffResponse>(
+    `/api/projects/${idFor(project)}/workers/${encodeURIComponent(id)}/handoff`,
+    { method: "POST", body: JSON.stringify({ force: options.force ?? false }) },
   );
 }
 

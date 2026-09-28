@@ -41,6 +41,23 @@ export const ACTION_REFERENCES = {
     label: "Codex session",
     value: "action",
   },
+  // Claude turns are sent to the same persistent session throughout the
+  // chain, so both the prompt and the handoff reference the session starter
+  // directly rather than the previous prompt.
+  "claude.send-prompt": {
+    path: "session",
+    upstreamUse: "claude.start-session",
+    alternateUpstreamUses: [],
+    label: "Claude session",
+    value: "action",
+  },
+  "claude.open-in-app": {
+    path: "session",
+    upstreamUse: "claude.start-session",
+    alternateUpstreamUses: [],
+    label: "Claude session",
+    value: "action",
+  },
 } as const;
 
 export type ActionReferencePath =
@@ -48,6 +65,53 @@ export type ActionReferencePath =
 
 export function actionReferenceFor(use: string) {
   return ACTION_REFERENCES[use as keyof typeof ACTION_REFERENCES];
+}
+
+/** Minimal shape the palette needs from a catalog entry to be grouped. */
+export type CategorizedCatalogEntry = {
+  use?: string;
+  presentation?: { name?: string; description?: string; category?: string };
+};
+
+export type CatalogActionGroup<T extends CategorizedCatalogEntry> = {
+  category: string;
+  entries: T[];
+};
+
+/**
+ * Categories the canvas already surfaced before the palette was driven by
+ * the catalog. Keeping their relative order avoids reshuffling the palette
+ * for existing users; every other category is newer and sorts alphabetically
+ * after them.
+ */
+const STABLE_CATALOG_CATEGORY_ORDER = ["Automation", "Workers"] as const;
+
+/**
+ * Groups catalog action entries by `presentation.category` for the node
+ * palette and the action dropdown. Entries without a `presentation` are
+ * dropped: they have nothing to label themselves with on the canvas.
+ */
+export function groupCatalogActionsByCategory<T extends CategorizedCatalogEntry>(
+  entries: readonly T[],
+): CatalogActionGroup<T>[] {
+  const byCategory = new Map<string, T[]>();
+  for (const entry of entries) {
+    if (!entry.use || !entry.presentation) continue;
+    const category = entry.presentation.category || "Other";
+    const group = byCategory.get(category);
+    if (group) group.push(entry);
+    else byCategory.set(category, [entry]);
+  }
+  const known = STABLE_CATALOG_CATEGORY_ORDER.filter((category) =>
+    byCategory.has(category),
+  );
+  const rest = [...byCategory.keys()]
+    .filter((category) => !(STABLE_CATALOG_CATEGORY_ORDER as readonly string[]).includes(category))
+    .sort((left, right) => left.localeCompare(right));
+  return [...known, ...rest].map((category) => ({
+    category,
+    entries: byCategory.get(category)!,
+  }));
 }
 
 function pathValue(value: unknown, path: string): unknown {

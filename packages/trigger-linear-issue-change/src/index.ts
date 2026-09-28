@@ -1,5 +1,6 @@
 import type {
   DiscoverWorkOptions,
+  RelayLogger,
   SourceEvent,
   WorkItem,
   WorkSource,
@@ -35,6 +36,8 @@ export interface LinearTriggerSelector {
 export interface LinearMcpSourceConfig {
   id: string;
   client: McpToolClient;
+  /** Optional structured logging. Falls back to swallowing warnings when omitted. */
+  logger?: RelayLogger;
   /** Linear MCP tool names are owned by this adapter and can vary by server. */
   tools?: {
     listIssues?: string;
@@ -45,6 +48,8 @@ export interface LinearMcpSourceConfig {
     getIssue?: string;
     saveIssue?: string;
     saveComment?: string;
+    /** Tool used to create a workspace or team label that does not exist yet. */
+    createLabel?: string;
   };
   /** Optional Linear lifecycle updates performed when the relay reports events. */
   reporting?: {
@@ -54,6 +59,12 @@ export interface LinearMcpSourceConfig {
     inProgressState?: string;
     commentOnLaunch?: boolean;
     commentOnFailure?: boolean;
+    /** Post a comment with the Claude session link when a run succeeds or fails. */
+    commentOnHandoff?: boolean;
+    /** Optional workflow state to move the issue to when a run succeeds. */
+    doneState?: string;
+    /** Create a configured label when it does not already exist in the workspace/team. Defaults to true. */
+    createMissingLabels?: boolean;
   };
 }
 
@@ -81,6 +92,10 @@ type LinearIssue = {
 export class LinearMcpSource implements WorkSource {
   public readonly id: string;
   private readonly tools: Required<NonNullable<LinearMcpSourceConfig["tools"]>>;
+  /** Labels confirmed to exist (or just created), so repeated reports don't re-check every poll. */
+  private readonly knownLabels = new Set<string>();
+  /** Labels this source has already warned about, so a persistently broken label warns once. */
+  private readonly warnedLabels = new Set<string>();
 
   public constructor(private readonly config: LinearMcpSourceConfig) {
     this.id = config.id;
@@ -93,6 +108,7 @@ export class LinearMcpSource implements WorkSource {
       getIssue: config.tools?.getIssue ?? "get_issue",
       saveIssue: config.tools?.saveIssue ?? "save_issue",
       saveComment: config.tools?.saveComment ?? "save_comment",
+      createLabel: config.tools?.createLabel ?? "create_issue_label",
     };
   }
 
@@ -191,6 +207,10 @@ export class LinearMcpSource implements WorkSource {
     }
     if (event.type === "succeeded") {
       await this.markSucceeded(issueId);
+      await this.handleHandoff(issueId, event, "succeeded");
+      if (this.config.reporting?.doneState) {
+        await this.saveIssue({ id: issueId, state: this.config.reporting.doneState }, "move to done state");
+      }
       return;
     }
     if (event.type === "failed") {
@@ -201,6 +221,7 @@ export class LinearMcpSource implements WorkSource {
           body: `Task Relay run failed.\n\n${event.error ?? "Unknown error"}`,
         });
       }
+      await this.handleHandoff(issueId, event, "failed");
       return;
     }
     if (event.type === "stopped") await this.clearRunning(issueId);
@@ -210,44 +231,160 @@ export class LinearMcpSource implements WorkSource {
     await this.config.client.close?.();
   }
 
+  private async handleHandoff(issueId: string, event: SourceEvent, eventType: "succeeded" | "failed"): Promise<void> {
+    const shouldComment = this.config.reporting?.commentOnHandoff !== false;
+    if (!shouldComment) return;
+
+    const outputs = event.run.worker?.metadata?.outputs;
+    if (!isRecord(outputs)) return;
+
+    const claudeSession = outputs.claudeSession;
+    if (!isRecord(claudeSession)) return;
+
+    const link = readOptionalString(claudeSession.link);
+    if (!link) return;
+
+    const lastResult = readOptionalString(claudeSession.lastResult);
+
+    const header = eventType === "succeeded"
+      ? "Ready for review in the Claude app."
+      : "Relay stopped at a failed step. Continue in the Claude app.";
+
+    let body = `${header}\n\nOpen the session: ${link}`;
+
+    if (lastResult) {
+      body += `\n\n## Review brief\n\n${lastResult.substring(0, 4000)}`;
+    }
+
+    await this.config.client.callTool(this.tools.saveComment, {
+      issueId,
+      body,
+    });
+  }
+
   private async markRunning(issueId: string): Promise<void> {
     const reporting = this.config.reporting;
     if (!reporting?.runningLabel && !reporting?.inProgressState) return;
     const args: Record<string, unknown> = { id: issueId };
     if (reporting.runningLabel) {
+      await this.ensureLabel(issueId, reporting.runningLabel);
       const oldLabels = await this.currentLabels(issueId);
       args.labels = [...new Set([...oldLabels, reporting.runningLabel])];
     }
     if (reporting.inProgressState) args.state = reporting.inProgressState;
-    await this.config.client.callTool(this.tools.saveIssue, args);
+    await this.saveIssue(args, "mark running");
   }
 
   private async markFailed(issueId: string): Promise<void> {
     const reporting = this.config.reporting;
     if (!reporting?.runningLabel && !reporting?.blockedLabel) return;
+    if (reporting?.blockedLabel) await this.ensureLabel(issueId, reporting.blockedLabel);
     const labels = (await this.currentLabels(issueId)).filter((label) => label !== reporting?.runningLabel);
     if (reporting?.blockedLabel) labels.push(reporting.blockedLabel);
-    await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
+    await this.saveIssue({ id: issueId, labels: [...new Set(labels)] }, "mark blocked");
   }
 
   private async markSucceeded(issueId: string): Promise<void> {
     const reporting = this.config.reporting;
     if (!reporting?.runningLabel && !reporting?.doneLabel) return;
+    if (reporting?.doneLabel) await this.ensureLabel(issueId, reporting.doneLabel);
     const labels = (await this.currentLabels(issueId)).filter((label) => label !== reporting?.runningLabel);
     if (reporting?.doneLabel) labels.push(reporting.doneLabel);
-    await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
+    await this.saveIssue({ id: issueId, labels: [...new Set(labels)] }, "mark done");
   }
 
   private async clearRunning(issueId: string): Promise<void> {
     if (!this.config.reporting?.runningLabel) return;
     const labels = (await this.currentLabels(issueId)).filter((label) => label !== this.config.reporting?.runningLabel);
-    await this.config.client.callTool(this.tools.saveIssue, { id: issueId, labels: [...new Set(labels)] });
+    await this.saveIssue({ id: issueId, labels: [...new Set(labels)] }, "clear running label");
   }
 
   private async currentLabels(issueId: string): Promise<string[]> {
     const response = await this.config.client.callTool(this.tools.getIssue, { id: issueId });
     return normaliseLabels(readIssue(readMcpJson(response)).labels);
   }
+
+  /**
+   * Linear silently ignores (or the MCP server rejects) a `labels` value that
+   * names a label the workspace/team does not have, so a run can finish
+   * successfully while its lifecycle label never lands. Confirm the label
+   * exists first, creating it when `createMissingLabels` allows it, so the
+   * subsequent `save_issue` call has something real to attach.
+   */
+  private async ensureLabel(issueId: string, label: string): Promise<void> {
+    if (this.knownLabels.has(label)) return;
+    try {
+      const teamId = await this.teamIdForIssue(issueId);
+
+      // When the issue's team is known, list labels with the team filter.
+      // Prefer querying by name for the specific label first.
+      let found = false;
+      if (teamId) {
+        const byName = await this.listAll(this.tools.listLabels, { limit: 250, team: teamId, name: label });
+        const names = new Set(mergeNames(byName.map(optionNames)));
+        if (names.has(label)) {
+          this.knownLabels.add(label);
+          return;
+        }
+      }
+
+      // Fall back to listing all labels without team filter.
+      const existing = await this.listAll(this.tools.listLabels, { limit: 250 });
+      const names = new Set(mergeNames(existing.map(optionNames)));
+      if (names.has(label)) {
+        this.knownLabels.add(label);
+        return;
+      }
+
+      if (this.config.reporting?.createMissingLabels === false) {
+        this.warnLabelOnce(label, `Label '${label}' does not exist in Linear and createMissingLabels is disabled; it will not be applied to ${issueId}.`);
+        return;
+      }
+      const response = await this.config.client.callTool(this.tools.createLabel, teamId ? { name: label, teamId } : { name: label });
+      if (response.isError) {
+        // If the label already exists, treat it as success and cache it.
+        const errorMessage = JSON.stringify(response);
+        if (errorMessage.includes("already exists")) {
+          this.knownLabels.add(label);
+          return;
+        }
+        this.warnLabelOnce(label, `Creating Linear label '${label}' failed: ${errorMessage}`);
+        return;
+      }
+      this.knownLabels.add(label);
+    } catch (error) {
+      this.warnLabelOnce(label, `Could not confirm or create Linear label '${label}': ${messageOf(error)}`);
+    }
+  }
+
+  private async teamIdForIssue(issueId: string): Promise<string | undefined> {
+    try {
+      const response = await this.config.client.callTool(this.tools.getIssue, { id: issueId });
+      const issue = readIssue(readMcpJson(response));
+      const team = isRecord(issue.team) ? issue.team : undefined;
+      return readOptionalString(issue.teamId) ?? readOptionalString(team?.id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async saveIssue(args: Record<string, unknown>, action: string): Promise<void> {
+    const response = await this.config.client.callTool(this.tools.saveIssue, args);
+    if (response.isError) {
+      this.config.logger?.warn(`Linear ${action} failed`, { issueId: args.id, error: JSON.stringify(response) });
+    }
+  }
+
+  private warnLabelOnce(label: string, message: string): void {
+    if (this.warnedLabels.has(label)) return;
+    this.warnedLabels.add(label);
+    if (this.config.logger) this.config.logger.warn(message, { label });
+    else throw new Error(message);
+  }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**

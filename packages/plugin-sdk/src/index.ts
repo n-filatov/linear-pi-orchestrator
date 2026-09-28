@@ -6,10 +6,16 @@ import type {
   WorkerChildSpec,
   WorkerCompletion,
   WorkerHandle,
+  WorkerHandoffResult,
+  WorkerHandoffSpec,
   WorkerInputSpec,
+  WorkerPromptSpec,
+  WorkerTurn,
   RunRecord,
   Workspace,
 } from "@task-relay/domain";
+
+export type { WorkerHandoffResult, WorkerHandoffSpec, WorkerPromptSpec, WorkerTurn } from "@task-relay/domain";
 
 /**
  * A Relay extension is deliberately named by configuration, rather than by a
@@ -146,6 +152,12 @@ export interface WorkerActions {
   stop(ref: WorkerRef): Promise<ActionResult>;
   /** Persist data produced by an action against the selected worker generation. */
   recordOutputs(ref: WorkerRef, outputs: Record<string, unknown>): Promise<ActionResult>;
+  /** Start a turn against a persistent worker's existing session; returns at once. */
+  prompt(ref: WorkerRef, spec: WorkerPromptSpec): Promise<WorkerTurn>;
+  /** Read a previously started turn's current state. */
+  turn(ref: WorkerRef, turnId: string): Promise<WorkerTurn>;
+  /** Hand a persistent worker's session off to an external, human-driven surface. */
+  handoff(ref: WorkerRef, spec?: WorkerHandoffSpec): Promise<WorkerHandoffResult>;
 }
 
 export interface ActionContext {
@@ -191,6 +203,8 @@ export interface LaunchWorkerActionRequest {
   sidecar?: boolean;
   /** Harness-specific launch data that is not part of the generic worker contract. */
   harnessInput?: Record<string, unknown>;
+  /** `project` runs the harness in the repository root: no workspace is created, and none is cleaned up. */
+  workspaceMode?: "managed" | "project";
 }
 
 /** JSON-compatible output persisted by the generic action engine. */
@@ -255,6 +269,12 @@ export interface HarnessPlugin<Config = unknown> {
   wait?(worker: WorkerHandle): MaybePromise<WorkerCompletion | undefined>;
   reconcile?(worker: WorkerHandle): MaybePromise<WorkerCompletion | undefined>;
   stop?(worker: WorkerHandle): MaybePromise<void>;
+  /** Start a turn on a persistent worker's existing session. */
+  sendPrompt?(worker: WorkerHandle, spec: WorkerPromptSpec): MaybePromise<WorkerTurn>;
+  /** Read a previously started turn's current state. */
+  turn?(worker: WorkerHandle, turnId: string): MaybePromise<WorkerTurn>;
+  /** Hand a persistent worker's session off to an external, human-driven surface. */
+  handoff?(worker: WorkerHandle, spec?: WorkerHandoffSpec): MaybePromise<WorkerHandoffResult>;
 }
 
 export type RelayPlugin = SourcePlugin | TriggerPlugin | AnyActionPlugin | HarnessPlugin;

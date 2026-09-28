@@ -3,6 +3,7 @@ import {
   actionReferenceFor,
   findDanglingActionReferences,
   findDanglingEdges,
+  groupCatalogActionsByCategory,
   graphToWorkflow,
   setActionReference,
   syncActionReferenceEdge,
@@ -75,6 +76,60 @@ describe("dashboard modular action references", () => {
     expect(actionReferenceFor("worker-send")).toMatchObject({ path: "worker", upstreamUse: "tmux.create-window" });
     expect(actionReferenceFor("codex.start-session")).toMatchObject({ path: "tmux", upstreamUse: "tmux.create-window" });
     expect(actionReferenceFor("codex.send-prompt")).toMatchObject({ path: "codex", upstreamUse: "codex.start-session", label: "Codex session" });
+  });
+
+  it("describes Claude prompt and handoff references, pointing at the session starter", () => {
+    expect(actionReferenceFor("claude.send-prompt")).toMatchObject({ path: "session", upstreamUse: "claude.start-session", label: "Claude session" });
+    expect(actionReferenceFor("claude.open-in-app")).toMatchObject({ path: "session", upstreamUse: "claude.start-session", label: "Claude session" });
+  });
+
+  it("draws the implied edge and needs default from a Claude prompt to its session starter", () => {
+    const nodes = [
+      { id: "trigger", type: "trigger", position: { x: 0, y: 0 }, data: { label: "On queue", use: "queue", kind: "trigger", config: {} } },
+      action("session", "claude.start-session"),
+      action("implement", "claude.send-prompt"),
+    ] as GraphNode[];
+    const edges = [{ id: "trigger-implement", source: "trigger", target: "implement", label: "matched" }];
+    const config = setActionReference({ use: "claude.send-prompt", with: { promptFile: "task.md" } }, "session", "session");
+    const nextEdges = syncActionReferenceEdge(edges, "implement", "session", undefined, "session");
+    const workflow = graphToWorkflow(
+      { nodes: nodes.map((node) => node.id === "implement" ? { ...node, data: { ...node.data, config } } : node), edges: nextEdges },
+      { id: "demo", on: { source: "queue" }, jobs: {} },
+    );
+    expect(nextEdges.find((edge) => edge.source === "session" && edge.target === "implement")).toMatchObject({ label: "then" });
+    expect((workflow.jobs as Record<string, any>).implement).toMatchObject({
+      with: { promptFile: "task.md", session: { action: "session" } },
+      needs: "session.started",
+    });
+  });
+
+  it("references the session starter (not the previous prompt) when handing a Claude worker off", () => {
+    const node = action("open-in-app", "claude.open-in-app", { with: { session: { action: "session" } } });
+    expect(findDanglingActionReferences([node])).toEqual([{ nodeId: "open-in-app", path: "session", actionId: "session" }]);
+    expect(findDanglingActionReferences([node, action("session", "claude.start-session")])).toHaveLength(0);
+  });
+
+  it("groups catalog actions by category, keeping stable categories first and sorting the rest alphabetically", () => {
+    const entries = [
+      { use: "cleanup", presentation: { category: "Workers" } },
+      { use: "tmux.create-window", presentation: { category: "Automation" } },
+      { use: "claude.send-prompt", presentation: { category: "Claude" } },
+      { use: "codex.send-prompt", presentation: { category: "Workers" } },
+      { use: "no-presentation" },
+      { use: "zzz.action", presentation: { category: "Zzz" } },
+    ];
+    expect(groupCatalogActionsByCategory(entries).map((group) => group.category)).toEqual([
+      "Automation",
+      "Workers",
+      "Claude",
+      "Zzz",
+    ]);
+    expect(
+      groupCatalogActionsByCategory(entries).find((group) => group.category === "Workers")?.entries.map((entry) => entry.use),
+    ).toEqual(["cleanup", "codex.send-prompt"]);
+    expect(groupCatalogActionsByCategory(entries).flatMap((group) => group.entries)).not.toContainEqual(
+      expect.objectContaining({ use: "no-presentation" }),
+    );
   });
 
   it("binds Codex start-session to the selected tmux action and preserves workspace fields", () => {

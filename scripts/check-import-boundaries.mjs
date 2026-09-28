@@ -23,6 +23,9 @@ const packageRules = {
   "action-tmux-create-window": ["plugin-sdk"],
   "action-codex-start-session": ["plugin-sdk"],
   "action-codex-send-prompt": ["plugin-sdk"],
+  "action-claude-start-session": ["plugin-sdk"],
+  "action-claude-send-prompt": ["plugin-sdk"],
+  "action-claude-open-in-app": ["plugin-sdk"],
 };
 const violations = [];
 

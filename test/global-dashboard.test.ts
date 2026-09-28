@@ -233,4 +233,76 @@ logging: { level: silent }
       projects.close();
     }
   });
+
+  it("hands a worker off through POST /api/projects/:id/workers/:workerId/handoff", async () => {
+    const root = await mkdtemp(join(tmpdir(), "relay-global-dashboard-handoff-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-global-dashboard-handoff-state-"));
+    process.env.XDG_STATE_HOME = stateHome;
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2, project: { name: "handoff-test" }, sources: { queue: { use: "command" } }, logging: { level: "silent" },
+    }));
+    const projects = new ProjectManager({ stateHome });
+    const project = await projects.register(root);
+    const workerRecord = {
+      id: "run-ENG-9", identity: { repository: project.repository, sourceId: "queue", itemId: "ENG-9", triggerId: "implement" },
+      item: { sourceId: "queue", id: "ENG-9", title: "Handoff test" },
+      trigger: { id: "implement", sourceId: "queue", repository: project.repository, enabled: true },
+      agent: { agentId: "claude", model: "claude-opus-5" }, status: "running" as const,
+      claimedAt: "2026-09-28T00:00:00.000Z", updatedAt: "2026-09-28T00:00:00.000Z",
+      worker: { id: "worker-9", startedAt: "2026-09-28T00:00:00.000Z", metadata: { claudeSession: { sessionId: "sess-9" } } },
+    };
+    const stored = projects.workers.upsertRun(workerRecord, { repository: project.repository });
+
+    let received: { target: string; options: { force?: boolean } } | undefined;
+    const server = new GlobalDashboardServer(projects, {
+      handoff: async (_context, target, options) => {
+        received = { target, options };
+        return { target: "claude-app", handedOffAt: "2026-09-28T00:01:00.000Z", chainStatus: "succeeded", link: "claude://claude.ai/epitaxy/local_9" };
+      },
+    });
+    const authenticated = new URL(await server.start(0));
+    const request = async (path: string, init?: RequestInit) => fetch(new URL(`${path}${path.includes("?") ? "&" : "?"}token=${authenticated.searchParams.get("token")}`, authenticated), init);
+    try {
+      const response = await request(`/api/projects/${project.id}/workers/${stored.id}/handoff`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: true }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ link: "claude://claude.ai/epitaxy/local_9", chainStatus: "succeeded", handedOffAt: "2026-09-28T00:01:00.000Z" });
+      expect(received).toEqual({ target: stored.id, options: { force: true } });
+
+      expect((await request(`/api/projects/${project.id}/workers/${stored.id}/handoff`, { method: "GET" })).status).toBe(405);
+      expect((await request(`/api/projects/${project.id}/workers/missing-worker/handoff`, { method: "POST" })).status).toBe(404);
+    } finally {
+      await server.stop();
+      projects.close();
+    }
+  });
+
+  it("reports 501 when no handoff handler is configured", async () => {
+    const root = await mkdtemp(join(tmpdir(), "relay-global-dashboard-nohandoff-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "relay-global-dashboard-nohandoff-state-"));
+    process.env.XDG_STATE_HOME = stateHome;
+    await writeFile(join(root, ".task-relay.yaml"), stringify({
+      version: 2, project: { name: "no-handoff-test" }, sources: { queue: { use: "command" } }, logging: { level: "silent" },
+    }));
+    const projects = new ProjectManager({ stateHome });
+    const project = await projects.register(root);
+    const stored = projects.workers.upsertRun({
+      id: "run-ENG-2", identity: { repository: project.repository, sourceId: "queue", itemId: "ENG-2", triggerId: "implement" },
+      item: { sourceId: "queue", id: "ENG-2", title: "No handler" },
+      trigger: { id: "implement", sourceId: "queue", repository: project.repository, enabled: true },
+      agent: { agentId: "claude" }, status: "running" as const,
+      claimedAt: "2026-09-28T00:00:00.000Z", updatedAt: "2026-09-28T00:00:00.000Z",
+      worker: { id: "worker-2", startedAt: "2026-09-28T00:00:00.000Z" },
+    }, { repository: project.repository });
+    const server = new GlobalDashboardServer(projects, {});
+    const authenticated = new URL(await server.start(0));
+    try {
+      const response = await fetch(new URL(`/api/projects/${project.id}/workers/${stored.id}/handoff?token=${authenticated.searchParams.get("token")}`, authenticated), { method: "POST" });
+      expect(response.status).toBe(501);
+    } finally {
+      await server.stop();
+      projects.close();
+    }
+  });
 });

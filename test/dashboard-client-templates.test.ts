@@ -5,6 +5,9 @@ import { codexStartSessionConfigSchema } from "../packages/action-codex-start-se
 import { codexSendPromptConfigSchema } from "../packages/action-codex-send-prompt/src/index.js";
 import { tmuxCreateWindowConfigSchema } from "../packages/action-tmux-create-window/src/index.js";
 import { cleanupConfigSchema } from "../packages/action-cleanup/src/index.js";
+import { claudeStartSessionConfigSchema } from "../packages/action-claude-start-session/src/index.js";
+import { claudeSendPromptInputSchema } from "../packages/action-claude-send-prompt/src/index.js";
+import { claudeOpenInAppConfigSchema } from "../packages/action-claude-open-in-app/src/index.js";
 
 describe("dashboard workflow templates use real plugin contracts", () => {
   const config = { sources: { issues: { use: "linear" } } };
@@ -38,5 +41,29 @@ describe("dashboard workflow templates use real plugin contracts", () => {
 
   it("does not invent a source for an unconfigured repository", () => {
     expect(templateFor("agent", "delivery", {})).toBeUndefined();
+  });
+
+  it("creates a Claude review chain whose workflow and all action inputs are valid", () => {
+    const { id, source, ...definition } = templateFor("claude-review", "review", config)!;
+    const parsed = workflowSchema.parse(definition);
+    const jobs = parsed.jobs!;
+    expect(claudeStartSessionConfigSchema.safeParse(jobs.session.with).success).toBe(true);
+    for (const jobId of ["implement", "verify", "self-review", "pull-request", "brief"]) {
+      expect(claudeSendPromptInputSchema.safeParse(jobs[jobId]!.with).success).toBe(true);
+      expect((jobs[jobId]!.with as { session?: { action?: string } }).session).toEqual({ action: "session" });
+    }
+    expect(claudeOpenInAppConfigSchema.safeParse(jobs["open-in-app"].with).success).toBe(true);
+
+    // Every prompt job runs on the one persistent session, chained in order.
+    expect(jobs.implement.needs).toEqual(["session.started"]);
+    expect(jobs.verify.needs).toEqual(["implement.succeeded"]);
+    expect(jobs["self-review"].needs).toEqual(["verify.succeeded"]);
+    expect(jobs["pull-request"].needs).toEqual(["self-review.succeeded"]);
+    expect(jobs.brief.needs).toEqual(["pull-request.succeeded"]);
+
+    // The handoff runs even after a failed review step, but only once the
+    // chain has reached the brief.
+    expect(jobs["open-in-app"].needs).toEqual(["brief"]);
+    expect(jobs["open-in-app"].if).toBe("${{ always() }}");
   });
 });

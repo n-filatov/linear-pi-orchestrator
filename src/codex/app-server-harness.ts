@@ -110,7 +110,10 @@ export class CodexAppServerHarness implements HarnessPlugin<z.infer<typeof harne
     }
   }
 
-  async sendPrompt(worker: WorkerHandle, options: CodexAppServerPromptOptions): Promise<{ threadId: string; turnId: string; delivery: "idle" | "immediate"; turnStatus?: CodexTurnStatus }> {
+  // Named distinctly from the generic `HarnessPlugin.sendPrompt` contract: this
+  // Codex-specific call takes App Server delivery options and returns an App
+  // Server turn shape, not the harness-neutral `WorkerTurn`.
+  async sendCodexPrompt(worker: WorkerHandle, options: CodexAppServerPromptOptions): Promise<{ threadId: string; turnId: string; delivery: "idle" | "immediate"; turnStatus?: CodexTurnStatus }> {
     const session = await this.requireSession(worker);
     const lifecycle = session.client.lifecycle(session.threadId);
     const lastTurn = lifecycle?.lastTurn;

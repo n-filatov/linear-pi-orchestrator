@@ -31,8 +31,8 @@ export const sourceSchema = z.discriminatedUnion("type", [
     enabled: z.boolean().default(true),
     pollIntervalMs: z.number().int().positive().default(30_000),
     mcp: mcpTransportSchema.optional(),
-    tools: z.object({ listIssues: z.string().optional(), getIssue: z.string().optional(), saveIssue: z.string().optional(), saveComment: z.string().optional() }).strict().default({}),
-    reporting: z.object({ runningLabel: z.string().optional(), blockedLabel: z.string().optional(), doneLabel: z.string().optional(), inProgressState: z.string().optional(), commentOnLaunch: z.boolean().default(true), commentOnFailure: z.boolean().default(true) }).strict().default({}),
+    tools: z.object({ listIssues: z.string().optional(), listLabels: z.string().optional(), getIssue: z.string().optional(), saveIssue: z.string().optional(), saveComment: z.string().optional(), createLabel: z.string().optional() }).strict().default({}),
+    reporting: z.object({ runningLabel: z.string().optional(), blockedLabel: z.string().optional(), doneLabel: z.string().optional(), inProgressState: z.string().optional(), commentOnLaunch: z.boolean().default(true), commentOnFailure: z.boolean().default(true), commentOnHandoff: z.boolean().default(true), doneState: z.string().optional(), createMissingLabels: z.boolean().default(true) }).strict().default({}),
   }).strict(),
   z.object({
     type: z.literal("command"),

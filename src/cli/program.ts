@@ -1,9 +1,10 @@
 import { inspectWorkflowRun, redactExecution } from "../application/execution-inspection.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, watch } from "node:fs";
+import { homedir } from "node:os";
 import { Command } from "commander";
 import { confirm, input, number, select } from "@inquirer/prompts";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { renderRelayConfig, findProjectRoot, loadRelayConfig, CONFIG_FILE, LOCAL_CONFIG_FILE } from "../config/load.js";
 import { relayConfigV2Schema, type RelayConfigV2, type RelayTriggerV2 } from "../config/schema.js";
 import { createEventLogger, eventLogPath, logEvent, readEvents, stateDirectory } from "../logging/events.js";
@@ -13,7 +14,7 @@ import { GlobalWorkerRegistry, type GlobalWorkerRecord, type GlobalWorkflowRegis
 import { getRepositoryIdentity, type RepositoryIdentity } from "../state/repository-identity.js";
 import { writeFile } from "node:fs/promises";
 import { addPluginCommands } from "./plugin-commands.js";
-import type { WorkflowJobStatus } from "../domain/index.js";
+import type { WorkerHandoffResult, WorkflowJobStatus } from "../domain/index.js";
 import type { RelayWorkflowV2 } from "../config/v2.js";
 
 export type RelayCommandContext = {
@@ -91,8 +92,12 @@ export type RelayCommandHandlers = {
   cleanup?: (context: RelayCommandContext, target: string) => Promise<void>;
   attach?: (context: RelayCommandContext, target: string) => Promise<void>;
   signal?: (context: RelayCommandContext, target: string, outcome: "done" | "failed", options: { outputs: Record<string, string>; message?: string }) => Promise<void>;
+  /** Hand a headless Claude Code session off to the desktop app from outside a workflow. */
+  handoff?: (context: RelayCommandContext, target: string, options: { force?: boolean }) => Promise<WorkerHandoffResult>;
   workflowTest?: (context: RelayCommandContext, id: string) => Promise<void>;
   workflowAdopt?: (context: RelayCommandContext, id: string, task: string, occurrence?: string) => Promise<void>;
+  /** Stop any active worker, omit every non-terminal job, and fail the open run for this item. */
+  workflowCancel?: (context: RelayCommandContext, id: string, task: string, occurrence?: string) => Promise<void>;
   /** Read-only eligibility preview for one workflow action/job. */
   workflowActionTest?: (
     context: RelayCommandContext,
@@ -125,6 +130,30 @@ function harnessChoices(): { name: string; value: typeof BUILT_IN_HARNESSES[numb
   return BUILT_IN_HARNESSES.map((harness) => ({ name: `${harness[0].toUpperCase()}${harness.slice(1)}${executable(harness) ? " (found)" : " (not found)"}`, value: harness }));
 }
 function harnessAvailabilityRows(): [string, string][] { return BUILT_IN_HARNESSES.map((harness) => [harness, executable(harness) ? "available" : "not found"]); }
+
+/**
+ * Parses `claude auth status` for `relay doctor`. Injectable so tests never
+ * spawn the real `claude` CLI: a fake `run` returns canned stdout or throws
+ * to simulate the command being missing or failing.
+ */
+export async function claudeAuthStatusRow(
+  run: (command: string, args: string[]) => string = (command, args) => execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }),
+): Promise<string> {
+  let output: string;
+  try { output = run("claude", ["auth", "status"]); }
+  catch { return "claude not found"; }
+  try {
+    const parsed = JSON.parse(output) as { loggedIn?: boolean };
+    return parsed.loggedIn ? "logged in" : "not logged in — run 'claude auth login'";
+  } catch {
+    return "claude not found";
+  }
+}
+
+/** Injectable so tests never depend on the real filesystem's Applications folder. */
+export function claudeAppInstalled(exists: (path: string) => boolean = existsSync): boolean {
+  return exists("/Applications/Claude.app") || exists(join(homedir(), "Applications", "Claude.app"));
+}
 export function defaultConfig(options: Required<Pick<InitOptions, "source" | "harness" | "label" | "maxConcurrent" | "mode" | "prompt">> & Pick<InitOptions, "model">, projectName: string, branch: string): RelayConfigV2 {
   const actionId = "implement";
   const cleanupActionId = "cleanup-completed-worker";
@@ -343,6 +372,8 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
     try { loaded = await loadRelayConfig(root); configuration = "valid"; } catch (cause) { configuration = cause instanceof Error ? cause.message : "invalid"; }
     const { pluginDirectory } = await import("../plugins/store.js");
     const rows: [string, string | number][] = [["Project root", root], ["Configuration", configuration], ...harnessAvailabilityRows(), ["wt", executable("wt") ? "available" : "not found"], ["tmux", executable("tmux") ? "available" : "not found"], ["State directory", stateDirectory(root)], ["Plugin directory", pluginDirectory()]];
+    rows.push(["Claude CLI login", await claudeAuthStatusRow()]);
+    if (process.platform === "darwin") rows.push(["Claude app", claudeAppInstalled() ? "installed" : "not found"]);
     // A configured plugin that is missing or altered must be reported before a
     // worker is launched, not when the first tick tries to import it.
     for (const [use, health] of await pluginHealth(loaded?.config)) rows.push([`Plugin ${use}`, health]);
@@ -442,6 +473,15 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       if (!options.handlers?.signal) noHandler("signal");
       await options.handlers.signal(context, target, outcome, { outputs, message: flags.message });
     });
+  program.command("handoff <task-or-worker>")
+    .description("Hand a headless Claude Code session off to the Claude desktop app.")
+    .option("--force", "cancel an in-progress turn instead of refusing the handoff")
+    .action(async (target: string, flags: { force?: boolean }) => {
+      const context = await resolveWorkerContext(cwd, print, target);
+      if (!options.handlers?.handoff) noHandler("handoff");
+      const result = await options.handlers.handoff(context, target, { force: flags.force });
+      print(result.link ? `Handed off to the Claude app: ${result.link}` : `Handed off to the Claude app (${result.chainStatus}).`);
+    });
   const config = program.command("config").description("Inspect and describe this repository's configuration.");
   config.command("schema")
     .description(`Emit a JSON Schema for ${CONFIG_FILE}, for editor completion and validation.`)
@@ -480,6 +520,14 @@ export function createRelayProgram(options: RelayCliOptions = {}): Command {
       const context = await resolveContext(cwd, print);
       if (!options.handlers?.workflowAdopt) noHandler("workflow adoption");
       await options.handlers.workflowAdopt(context, id, task, flags.occurrence);
+    });
+  workflow.command("cancel <id> <task>")
+    .description("Stop an open workflow run: stops any active worker, omits every pending job, and fails the run.")
+    .option("--occurrence <name>", "target a specific run; defaults to the most recent open one")
+    .action(async (id: string, task: string, flags: { occurrence?: string }) => {
+      const context = await resolveContext(cwd, print);
+      if (!options.handlers?.workflowCancel) noHandler("workflow cancellation");
+      await options.handlers.workflowCancel(context, id, task, flags.occurrence);
     });
   workflow.command("retry <id> <task>")
     .description("Clear settled jobs so a workflow run advances again on the next poll.")

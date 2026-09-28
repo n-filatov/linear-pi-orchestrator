@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Search, Terminal, Send } from "lucide-react";
+import { Search, Terminal, Send, Bot, ExternalLink } from "lucide-react";
 import {
   Alert,
   Button,
@@ -16,13 +16,18 @@ import {
   Title,
 } from "@mantine/core";
 import * as api from "../api";
-import type { ProjectFolder, Worker } from "../api";
+import type { ClaudeSessionInfo, ProjectFolder, Worker, WorkerHandoffResponse } from "../api";
 import {
   DetailBlock,
   EmptyState,
   repositoryName,
   StatusBadge,
 } from "../components/shared";
+
+/** A worker's Claude session is recorded on the harness's worker metadata at launch. */
+function claudeSessionOf(worker: Worker): ClaudeSessionInfo | undefined {
+  return worker.snapshot?.worker?.metadata?.claudeSession;
+}
 
 export function Workers({
   workers,
@@ -47,6 +52,9 @@ export function Workers({
   const [open, setOpen] = useState("pane");
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<{ error: boolean; text: string }>();
+  const [confirmingHandoff, setConfirmingHandoff] = useState<string>();
+  const [handingOff, setHandingOff] = useState<string>();
+  const [handoffs, setHandoffs] = useState<Record<string, WorkerHandoffResponse>>({});
   const owner = (worker: Worker) =>
     projects.find(
       (candidate) =>
@@ -109,6 +117,37 @@ export function Workers({
       });
     } finally {
       setBusy(false);
+    }
+  };
+  const takeOver = async (worker: Worker) => {
+    const destination = owner(worker) || project;
+    if (!destination) {
+      setFeedback({
+        error: true,
+        text: "This worker's repository is not registered. Register it before interacting.",
+      });
+      setConfirmingHandoff(undefined);
+      return;
+    }
+    setHandingOff(worker.id);
+    setFeedback(undefined);
+    try {
+      const result = await api.handoffWorker(worker.id, destination, {
+        force: true,
+      });
+      setHandoffs((current) => ({ ...current, [worker.id]: result }));
+      setFeedback({
+        error: false,
+        text: `Worker ${worker.id} was handed off to the Claude app.`,
+      });
+    } catch (error) {
+      setFeedback({
+        error: true,
+        text: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setConfirmingHandoff(undefined);
+      setHandingOff(undefined);
     }
   };
   return (
@@ -178,46 +217,102 @@ export function Workers({
                     label="Session identifiers"
                     value={worker.runtime || worker.snapshot?.harness}
                   />
+                  {claudeSessionOf(worker) && (
+                    <DetailBlock
+                      label="Claude session"
+                      value={{
+                        name: claudeSessionOf(worker)!.name,
+                        worktree: claudeSessionOf(worker)!.worktree,
+                      }}
+                    />
+                  )}
                 </Table.Td>
                 <Table.Td>
                   <StatusBadge status={worker.status} />
                 </Table.Td>
                 <Table.Td>
-                  <Stack gap="xs">
-                    <Group gap="xs">
-                      <Button
-                        size="xs"
-                        variant="light"
-                        leftSection={<Send size={14} aria-hidden />}
-                        disabled={!canControl(worker)}
-                        onClick={() => {
-                          setTarget({ worker, action: "send" });
-                          setText("");
-                          setFeedback(undefined);
-                        }}
-                      >
-                        Send terminal text
-                      </Button>
-                      <Button
-                        size="xs"
-                        variant="default"
-                        leftSection={<Terminal size={14} aria-hidden />}
-                        disabled={!canControl(worker)}
-                        onClick={() => {
-                          setTarget({ worker, action: "exec" });
-                          setText("");
-                          setFeedback(undefined);
-                        }}
-                      >
-                        Execute command
-                      </Button>
-                    </Group>
-                    {!canControl(worker) && (
-                      <Text size="xs" c="dimmed">
-                        No active terminal capability recorded.
-                      </Text>
-                    )}
-                  </Stack>
+                  {claudeSessionOf(worker) ? (
+                    <Stack gap="xs">
+                      {handoffs[worker.id] ? (
+                        <Button
+                          size="xs"
+                          variant="light"
+                          component="a"
+                          href={handoffs[worker.id]!.link}
+                          leftSection={<ExternalLink size={14} aria-hidden />}
+                        >
+                          Open in Claude
+                        </Button>
+                      ) : confirmingHandoff === worker.id ? (
+                        <Group gap="xs">
+                          <Text size="xs" c="dimmed">
+                            Take over this Claude session now?
+                          </Text>
+                          <Button
+                            size="xs"
+                            color="orange"
+                            loading={handingOff === worker.id}
+                            onClick={() => void takeOver(worker)}
+                          >
+                            Confirm
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="default"
+                            disabled={handingOff === worker.id}
+                            onClick={() => setConfirmingHandoff(undefined)}
+                          >
+                            Cancel
+                          </Button>
+                        </Group>
+                      ) : (
+                        <Button
+                          size="xs"
+                          variant="light"
+                          leftSection={<Bot size={14} aria-hidden />}
+                          onClick={() => setConfirmingHandoff(worker.id)}
+                        >
+                          Take over now
+                        </Button>
+                      )}
+                    </Stack>
+                  ) : (
+                    <Stack gap="xs">
+                      <Group gap="xs">
+                        <Button
+                          size="xs"
+                          variant="light"
+                          leftSection={<Send size={14} aria-hidden />}
+                          disabled={!canControl(worker)}
+                          onClick={() => {
+                            setTarget({ worker, action: "send" });
+                            setText("");
+                            setFeedback(undefined);
+                          }}
+                        >
+                          Send terminal text
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="default"
+                          leftSection={<Terminal size={14} aria-hidden />}
+                          disabled={!canControl(worker)}
+                          onClick={() => {
+                            setTarget({ worker, action: "exec" });
+                            setText("");
+                            setFeedback(undefined);
+                          }}
+                        >
+                          Execute command
+                        </Button>
+                      </Group>
+                      {!canControl(worker) && (
+                        <Text size="xs" c="dimmed">
+                          No active terminal capability recorded.
+                        </Text>
+                      )}
+                    </Stack>
+                  )}
                 </Table.Td>
               </Table.Tr>
             ))}

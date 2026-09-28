@@ -1,8 +1,10 @@
 import type { Json, WorkflowSummary } from "./api.js";
 
+export type WorkflowTemplateKind = "agent" | "cleanup" | "claude-review" | "blank";
+
 /** Ready-to-edit templates use the same plugin inputs as repository workflows. */
 export function templateFor(
-  kind: "agent" | "cleanup" | "blank",
+  kind: WorkflowTemplateKind,
   id: string,
   config: Json,
 ): WorkflowSummary | undefined {
@@ -55,6 +57,41 @@ export function templateFor(
         },
       },
     };
+  if (kind === "claude-review") {
+    // Every turn runs on the one persistent session, so each send-prompt job
+    // references the session starter directly rather than the previous
+    // prompt; jobs are still chained through `needs` so the turns run in
+    // order on that same session.
+    const claudePrompt = (needsJob: string, promptFile: string) => ({
+      use: "claude.send-prompt",
+      needs: [`${needsJob}.succeeded`],
+      with: { session: { action: "session" }, promptFile: `.task-relay/prompts/${promptFile}` },
+    });
+    return {
+      ...base,
+      jobs: {
+        session: { use: "claude.start-session", with: {} },
+        implement: {
+          use: "claude.send-prompt",
+          needs: ["session.started"],
+          with: {
+            session: { action: "session" },
+            promptFile: ".task-relay/prompts/implement.md",
+          },
+        },
+        verify: claudePrompt("implement", "verify.md"),
+        "self-review": claudePrompt("verify", "self-review.md"),
+        "pull-request": claudePrompt("self-review", "pull-request.md"),
+        brief: claudePrompt("pull-request", "review-brief.md"),
+        "open-in-app": {
+          use: "claude.open-in-app",
+          needs: ["brief"],
+          if: "${{ always() }}",
+          with: { session: { action: "session" } },
+        },
+      },
+    };
+  }
   return base;
 }
 

@@ -1,5 +1,5 @@
 import PQueue from "p-queue";
-import { ExecuteJob, ManageWorkers, WorkflowEngine, legacyPipelineToWorkflow, type ExplicitJobOutcome, type TargetJobResult } from "@task-relay/application";
+import { CancelWorkflow, ExecuteJob, ManageWorkers, WorkflowEngine, legacyPipelineToWorkflow, type ExplicitJobOutcome, type TargetJobResult, type WorkflowEnginePorts } from "@task-relay/application";
 import { jobOutcome, type JobOutcome } from "../application/action-outcome.js";
 import { resolveWorkflowInputs } from "../workflows/input-resolver.js";
 import { expressionContexts } from "../workflows/reconciler.js";
@@ -188,6 +188,23 @@ export class TaskRelay {
     await Promise.all([...this.sources.values()].map(async (source) => source.close?.()));
   }
 
+  /**
+   * Operator-initiated cancellation of an open workflow run: stops any active
+   * worker its jobs launched, marks every non-terminal job `omitted`, and
+   * finishes the run as `failed`. Returns `undefined` when the run is not
+   * open, so a CLI caller can report exactly why nothing happened.
+   */
+  public async cancelWorkflowRun(workflow: WorkflowDefinition, identity: WorkflowRunRecord["identity"], reason: string): Promise<{ cancelled: boolean; run?: WorkflowRunRecord } | undefined> {
+    const run = await this.workflowRunStore.findWorkflowRun(identity);
+    if (!run || run.status !== "running") return undefined;
+    const result: TickResult = { triggersVisited: 0, itemsDiscovered: 0, runsClaimed: 0, runsLaunched: 0, skipped: 0, actionsExecuted: 0, actionsFailed: 0, items: [] };
+    const cancelled = await new CancelWorkflow(this.workflowEnginePorts(result)).cancel({
+      workflow: run.definition ?? workflow, run, result, reason, emitStatus: "failed",
+    });
+    const updated = await this.workflowRunStore.findWorkflowRun(identity);
+    return { cancelled, run: updated };
+  }
+
   // ── Workflows ─────────────────────────────────────────────────────────────
 
   private async runWorkflow(workflow: WorkflowDefinition, result: TickResult): Promise<void> {
@@ -230,9 +247,13 @@ export class TaskRelay {
 
   /** Composition adapter: application owns workflow decisions, host owns runtime effects. */
   private workflowEngine(result: TickResult): WorkflowEngine {
+    return new WorkflowEngine(this.workflowEnginePorts(result));
+  }
+
+  private workflowEnginePorts(result: TickResult): WorkflowEnginePorts {
     const actions = this.dependencies.actionPlugins;
     const runs = this.workflowRunStore;
-    return new WorkflowEngine({
+    return {
       runs,
       source: (sourceId) => this.sources.get(sourceId),
       actions: actions ? {
@@ -251,12 +272,25 @@ export class TaskRelay {
         this.executeWorkflowJob(workflow, source, item, job, identity, runs, outputs as Record<string, ActionResult>, result),
       refreshJobs: ({ workflow, run }) => this.refreshWorkflowJobs(workflow, run, runs),
       stopWorker: async ({ workflow, item, state }) => { await this.workers.stopWorker(workflowAsTrigger(workflow), item, {}, { workerId: state.workerId! }); },
+      // A worker only gets swept just because its workflow run finished, or
+      // has nothing left depending on it, when it opts in via its own
+      // `stopWithWorkflowRun` metadata flag. Without that flag a persistent
+      // worker (a tmux window the user keeps working in, say) is left alone.
+      // This lookup is host-specific (it reads the run store directly) so
+      // `packages/application` never needs to know what "opts in" means.
+      shouldStopWithRun: async ({ workflow, item, state }) => {
+        if (!state.workerId || !this.dependencies.runStore.findWorkerTargets) return false;
+        const targets = await this.dependencies.runStore.findWorkerTargets({
+          repository: workflow.repository, sourceId: item.sourceId, itemId: item.id, selection: "all", workerIds: [state.workerId], includeCleaned: true,
+        });
+        return targets.some((run) => run.worker?.id === state.workerId && run.worker?.metadata?.stopWithWorkflowRun === true);
+      },
       now: this.now,
       signal: this.stopController.signal,
       logger: this.dependencies.logger,
       emit: (target, trigger, item, status, reason, workerId) => this.recordItemOutcome(target as TickResult, trigger, item, status, reason, workerId),
       decisions: { decideJob, jobInstances, jobTimedOut, runOutcome, timedOut },
-    });
+    };
   }
 
   private async markExpiredAttempts(): Promise<void> {
@@ -639,6 +673,9 @@ export class TaskRelay {
         capture: (ref, options) => this.workers.capture(trigger, item, outputs, ref, options),
         stop: (ref) => this.workers.stopWorker(trigger, item, outputs, ref),
         recordOutputs: (ref, values) => this.workers.recordOutputs(trigger, item, outputs, ref, values),
+        prompt: (ref, spec) => this.workers.prompt(trigger, item, outputs, ref, spec),
+        turn: (ref, turnId) => this.workers.turn(trigger, item, outputs, ref, turnId),
+        handoff: (ref, spec) => this.workers.handoff(source, trigger, item, outputs, ref, spec),
       },
     };
   }
